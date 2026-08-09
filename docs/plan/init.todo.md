@@ -1,0 +1,436 @@
+# Todo List
+
+## Locked decisions
+
+- `fccli <instrument> <timeframe>` renders one snapshot and exits; `-i` / `--interactive` starts the interactive TUI.
+- The default provider is `binance`; v1 supports Binance Spot only and does not support Binance Futures.
+- Bare assets default to USDT: `btc` and `binance:btc` resolve to `BTCUSDT`; `btc/usdc`, `btc-usdt`, and `BTCUSDT` are accepted explicit forms.
+- Supported timeframes are exactly `1s`, `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, and `1M`; parsing is case-sensitive.
+- The chart contains a two-line source/symbol/OHLCV header, main candlestick pane, right-side price axis, volume pane, UTC time axis, and an interactive shortcut/status footer.
+- Candles use filled Unicode bodies with green bullish candles and red bearish candles. `NO_COLOR` uses distinct monochrome glyphs instead of losing direction information.
+- Snapshot output uses the current terminal dimensions minus one shell row. Non-TTY output uses 120×36 and contains no ANSI escapes.
+- Layouts smaller than 60×18 are unsupported: snapshot mode exits with a clear error; interactive mode remains running and displays a resize instruction.
+- Interactive startup loads the latest 500 candles. Near the left history boundary, one serialized request loads up to 1000 older candles with `endTime = oldest_open_time - 1`.
+- Binance history uses REST; Binance live updates use WebSocket. Both are exposed to the application through provider-neutral candle and status events.
+- WebSocket reconnect delays are 1, 2, 4, 8, 16, then 30 seconds. Reconnect performs REST gap synchronization before normal streaming resumes.
+- Live-follow starts enabled. Moving left pauses it; `End` returns to the latest candle and resumes it. `r` resets X zoom, Y auto-scale, latest position, and live-follow.
+- Keyboard controls are locked: `A/←` older, `D/→` newer, `W/↑` price window up, `S/↓` price window down, `h` X zoom in, `H` X zoom out, `v` Y zoom in, `V` Y zoom out, `q/Esc/Ctrl-C` quit.
+- Keyboard X pan is 5% of visible bars with a one-bar minimum; Y pan is 10% of price span; zoom-in multiplies the visible range by `0.8`; zoom-out multiplies it by `1.25`.
+- Interactive mode initially renders approximately one candle per two terminal columns. Zoom-out stops at one real candle per column; the renderer never merges candles into synthetic display candles.
+- Mouse behavior is locked: plot drag pans X and Y, right price-axis drag scales Y, bottom time-axis drag scales X, and hover displays a crosshair plus the nearest candle’s UTC OHLCV.
+- Right-axis upward drag and bottom-axis rightward drag zoom in. Dragging suppresses the crosshair until release.
+- Snapshot and interactive modes share the same domain models, view state, layout calculation, and custom Ratatui Buffer renderer.
+- Rust baseline is Edition 2024 with `rust-version = "1.96"`. Supported platforms are Linux, macOS, and Windows.
+- Automated tests must use local REST/WS mocks and must not contact Binance. Real Binance access is reserved for explicit smoke tests.
+- V1 excludes indicators, drawing tools, trading, image export, persistent configuration, disk caching, multiple charts, and additional providers.
+
+## Implementation tasks
+
+- [ ] Initialize the Cargo application and module tree
+  - What to change:
+    - Create a binary package named `fccli` using Rust Edition 2024 and `rust-version = "1.96"`.
+    - Add production dependencies pinned to the approved families: `ratatui 0.30.2`, `crossterm 0.29.0`, `clap 4.6.6`, `tokio 1.53.1`, `reqwest 0.13.4`, `tokio-tungstenite 0.30.0`, `futures-util 0.3.33`, `serde 1.0.229`, `serde_json 1.0.151`, `time 0.3.55`, `thiserror 2.0.20`, and `anyhow 1.0.104`.
+    - Enable only the required features: Ratatui Crossterm 0.29 backend; Crossterm `event-stream`; Clap `derive`; Tokio `macros`, `rt-multi-thread`, `sync`, `time`, and `net`; Reqwest `json` and `query`; Tokio Tungstenite `connect` and `rustls-tls-native-roots`; Time `formatting` and `macros`.
+    - Add `wiremock 0.6.5` and `assert_cmd 2.2.2` as development dependencies.
+    - Create the module declarations and the source/test directory structure from the plan.
+  - Where:
+    - `Cargo.toml`
+    - `Cargo.lock`
+    - `src/main.rs`
+    - `src/lib.rs`
+    - `src/provider/mod.rs`
+    - `src/chart/mod.rs`
+    - `tests/fixtures/`
+  - Definition of done:
+    - `cargo check` succeeds with an otherwise empty application skeleton.
+    - `main.rs` contains only bootstrap, CLI invocation, runtime startup, top-level error reporting, and process exit behavior.
+    - `Cargo.lock` is generated and retained.
+
+- [ ] Implement the CLI and instrument parser
+  - What to change:
+    - Define positional `instrument` and `timeframe` arguments plus `-i` / `--interactive`.
+    - Parse `provider:symbol` at the first colon and default to `binance` when no prefix exists.
+    - Normalize Binance symbols using the locked rules: `/` or `-` separates base/quote; separator-free `*USDT` is treated as a full pair; every other separator-free token receives a `USDT` suffix.
+    - Reject missing base/quote components, additional separators, whitespace, and non-ASCII-alphanumeric symbol components.
+    - Implement a closed, case-sensitive timeframe enum for all 16 approved Binance intervals.
+    - Produce actionable Clap errors for malformed symbols, unknown providers, and unsupported intervals.
+  - Where:
+    - `src/cli.rs`
+    - `src/main.rs`
+    - `src/model.rs`
+    - `tests/cli.rs`
+  - Definition of done:
+    - The command forms in Locked decisions parse into the expected provider, pair, timeframe, and mode.
+    - `1m` and `1M` produce distinct enum values.
+    - Invalid input exits nonzero before any network or terminal operation.
+
+- [ ] Define provider-neutral market models and invariants
+  - What to change:
+    - Add `ProviderId`, `Market`, `Instrument`, `Timeframe`, `Candle`, `HistoryRequest`, `MarketEvent`, and connection/status types.
+    - Store candle open/close timestamps, OHLC, base volume, and open/closed state.
+    - Validate finite numeric fields, nonnegative volume, `open_time < close_time`, `low <= min(open, close)`, and `high >= max(open, close)`.
+    - Use `f64` for chart data and keep Binance DTOs out of public chart/application types.
+    - Define typed application, provider, payload, HTTP, rate-limit, and terminal errors.
+  - Where:
+    - `src/model.rs`
+    - `src/error.rs`
+  - Definition of done:
+    - Invalid candles cannot enter `CandleSeries` without returning a typed error.
+    - Domain types contain no Binance-specific JSON field names or endpoint assumptions.
+    - Errors preserve enough context to identify provider, symbol, timeframe, operation, and underlying cause.
+
+- [ ] Add the provider interface and registry
+  - What to change:
+    - Define an object-safe `MarketDataProvider: Send + Sync` interface.
+    - Return boxed futures for instrument resolution/history requests and a boxed stream for live market events.
+    - Add a provider registry that maps `ProviderId::Binance` to one shared `BinanceProvider` instance.
+    - Keep the interface capable of supporting a future REST-polling live stream without implementing unused polling code in v1.
+  - Where:
+    - `src/provider/mod.rs`
+    - `src/lib.rs`
+  - Definition of done:
+    - Application and chart modules can fetch history and receive live events through the trait without importing `BinanceProvider` or Binance DTOs.
+    - Adding a future provider requires a new provider implementation and registry entry, not changes to chart state or rendering APIs.
+
+- [ ] Implement Binance REST Kline history
+  - What to change:
+    - Build `BinanceProvider` with injectable REST and WebSocket base URLs; production REST defaults to `https://data-api.binance.vision`.
+    - Add a reusable Reqwest client with a 10-second timeout and an identifying user agent.
+    - Implement `/api/v3/klines` requests for latest history, older history, and reconnect gap ranges.
+    - Deserialize each 12-element Binance Kline array through a typed tuple/newtype rather than untyped JSON indexing.
+    - Parse price/volume strings with field-specific error context and convert them to validated domain candles.
+    - Mark REST candles closed by comparing `close_time` to current UTC time.
+    - Decode Binance error JSON and distinguish invalid symbol, rate-limit, client, server, timeout, transport, and malformed-payload failures.
+    - Preserve `Retry-After` for HTTP 429 responses.
+  - Where:
+    - `src/provider/binance.rs`
+    - `tests/binance_rest.rs`
+    - `tests/fixtures/binance_klines.json`
+  - Definition of done:
+    - Initial requests use `limit=500`.
+    - Older requests use `limit=1000` and `endTime=oldest_open_time - 1`.
+    - Reconnect range requests can start from the last known candle open time.
+    - Valid fixtures become ordered domain candles; malformed fixtures return typed errors without panic.
+
+- [ ] Implement Binance WebSocket decoding and supervision
+  - What to change:
+    - Connect to `wss://data-stream.binance.vision/ws/<lowercase-symbol>@kline_<timeframe>` using injected base URL support for tests.
+    - Deserialize Binance Kline stream payloads into provider-neutral candles and status events.
+    - Upsert updates sharing an `open_time`; append only when a new interval begins.
+    - Reply explicitly to ping frames with pong frames.
+    - Treat close frames, transport failures, 24-hour expiry, and `serverShutdown` as reconnect conditions.
+    - Emit `Connected`, `Reconnecting`, `Disconnected`, and provider error events.
+    - Implement reconnect delays of 1, 2, 4, 8, 16, and then 30 seconds.
+    - During reconnect, begin receiving WS messages, fetch REST from the last known candle, merge the gap, replay buffered WS events, then resume normal streaming.
+  - Where:
+    - `src/provider/binance.rs`
+    - `tests/binance_live.rs`
+    - `tests/fixtures/binance_kline_open.json`
+    - `tests/fixtures/binance_kline_closed.json`
+  - Definition of done:
+    - A local test WebSocket can drive current-candle mutation, closed-candle append, ping/pong, forced disconnect, reconnect status, and gap reconciliation.
+    - Overlapping REST and WS events produce one candle per `open_time` in chronological order.
+
+- [ ] Implement the candle store
+  - What to change:
+    - Add `CandleSeries` backed by `VecDeque<Candle>`.
+    - Implement initial replacement, older-page prepend, newest-candle upsert, new-candle append, indexed access, visible-range iteration, oldest/newest timestamp access, and end-of-history state.
+    - Filter duplicate/overlapping history before insertion.
+    - Return the count of actually prepended candles so view indices can be shifted without visual jumps.
+  - Where:
+    - `src/model.rs`
+    - `tests/chart_state.rs`
+  - Definition of done:
+    - The series remains strictly chronological and unique after arbitrary initial, backfill, live, and reconnect batches.
+    - Prepending overlapping pages does not duplicate or reorder existing data.
+    - Empty, one-candle, and current-open-candle cases are supported without panic.
+
+- [ ] Implement history backfill coordination
+  - What to change:
+    - Track backfill-in-flight, retry deadline, end-of-history, and last error state.
+    - Trigger a backfill when the visible left edge reaches the first 10% of loaded candles.
+    - Serialize backfill requests so only one request exists at a time.
+    - Shift the logical viewport index by the number of prepended candles.
+    - Stop future requests after an empty Binance page.
+    - On 429, defer until `Retry-After`; on other failures, keep current data visible and expose status text while allowing a later boundary-triggered retry.
+  - Where:
+    - `src/app.rs`
+    - `src/model.rs`
+    - `tests/chart_state.rs`
+  - Definition of done:
+    - Reaching the boundary requests exactly one page.
+    - Successful prepend leaves the same candles under the same screen columns.
+    - Empty, failed, and rate-limited responses do not cause request loops or terminate the TUI.
+
+- [ ] Implement chart view state and auto-scaling
+  - What to change:
+    - Add `ChartViewState` fields for rightmost logical candle index, visible candle count, price center/span, Y auto-scale, live-follow, hover state, and active drag state.
+    - Add separate snapshot and interactive initializers.
+    - Snapshot initialization fits one latest candle per plot column.
+    - Interactive initialization targets one latest candle per two plot columns.
+    - Clamp horizontal visibility between 10 candles and one candle per plot column.
+    - Auto-scale Y from visible low/high plus 5% padding; provide a magnitude-based nonzero fallback for flat prices.
+    - Implement X pan, Y pan, X/Y zoom, `End`, `r`, live append behavior, prepend index shifting, and resize re-clamping using the locked factors.
+    - Disable Y auto-scale after any manual Y pan or zoom.
+    - Disable live-follow after movement away from the latest boundary and restore it at the latest boundary.
+  - Where:
+    - `src/chart/state.rs`
+    - `tests/chart_state.rs`
+  - Definition of done:
+    - Every key transform changes the intended state by the locked amount and respects bounds.
+    - Live appends move the view only when live-follow is active.
+    - `End` and `r` have their distinct locked behaviors.
+    - All range calculations remain finite for empty, one-candle, flat, tiny-price, and very large-price data.
+
+- [ ] Implement deterministic chart layout regions
+  - What to change:
+    - Compute and retain rectangles for the two-line header, main candle plot, right price axis, volume pane, UTC time axis, and interactive footer.
+    - Allocate roughly 20% of graph height to volume with a minimum of three rows.
+    - Exclude the footer in snapshot mode without changing renderer internals.
+    - Add the 60×18 minimum-size state.
+    - Expose the plot/price-axis/time-axis rectangles for mouse hit-testing.
+  - Where:
+    - `src/chart/layout.rs`
+    - `tests/chart_render.rs`
+  - Definition of done:
+    - Layout rectangles never overlap or exceed the frame.
+    - Both 80×24 and 120×36 layouts contain every required region.
+    - Undersized frames produce only the resize/error layout, not partial chart geometry.
+
+- [ ] Implement price, volume, and UTC label formatting
+  - What to change:
+    - Calculate price tick spacing and adaptive decimal precision from the effective Y range and axis height.
+    - Prevent tiny assets from rendering all labels as `0.00`.
+    - Format volume compactly without changing the stored base volume.
+    - Select 4–8 time ticks according to plot width and visible candle count.
+    - Format intraday, daily, weekly, and monthly labels in UTC and suppress labels that would overlap.
+  - Where:
+    - `src/chart/format.rs`
+    - `tests/chart_render.rs`
+  - Definition of done:
+    - Price labels are monotonic, fit the price-axis width, and remain distinguishable for tiny and large values.
+    - UTC labels remain non-overlapping at all supported fixed test sizes and timeframe categories.
+
+- [ ] Implement the custom candlestick and volume renderer
+  - What to change:
+    - Implement a Ratatui widget that writes directly into `Buffer`; do not use `cli-candlestick-chart`, Ratatui `Canvas`, or another candlestick widget.
+    - Project high/open/close/low into rows using Unicode wick/body-edge glyphs including `│`, `┃`, `╷`, `╵`, `╻`, `╹`, `╽`, and `╿`.
+    - Center the wick in each candle slot and repeat the body across multi-column slots.
+    - Render horizontal price ticks/grid, right-axis labels, volume bars, and UTC time labels from the shared layout/state.
+    - Use Ratatui green/red colors and apply a deterministic monochrome bull/bear glyph distinction under `NO_COLOR`.
+  - Where:
+    - `src/chart/widget.rs`
+    - `src/chart/mod.rs`
+    - `tests/chart_render.rs`
+  - Definition of done:
+    - Fixed Buffer tests prove bullish/bearish bodies, wicks, volume bars, axes, colors, monochrome glyphs, and slot alignment.
+    - No renderer path aggregates multiple source candles into one display candle.
+    - Snapshot and interactive callers invoke the same widget API.
+
+- [ ] Render header, status, footer, and crosshair overlays
+  - What to change:
+    - Render source, market, normalized pair, timeframe, connection state, and latest/hovered candle UTC OHLCV in the two-line header.
+    - Use hovered candle data only while the pointer is inside the plot and no drag is active.
+    - Render the crosshair after candles/grid: vertical line at the nearest candle center, horizontal line at hovered price, time label on the X axis, and price label on the Y axis.
+    - Add the locked shortcut legend and live/backfill/reconnect/rate-limit status to the interactive footer.
+    - Suppress the crosshair during drag and restore it after release.
+  - Where:
+    - `src/chart/widget.rs`
+    - `src/chart/state.rs`
+    - `tests/chart_render.rs`
+  - Definition of done:
+    - Moving the hover point changes the header and crosshair to the nearest candle and mapped price.
+    - Leaving the plot restores latest-candle details.
+    - Status text reflects live, reconnecting, backfilling, rate-limited, and disconnected states without hiding the chart.
+
+- [ ] Implement keyboard interaction mapping
+  - What to change:
+    - Map `A/D/W/S`, arrow keys, `h/H`, `v/V`, `End`, `r`, `q`, `Esc`, and `Ctrl-C` to the locked view/application actions.
+    - Accept both lowercase and uppercase WASD as movement while preserving the case-sensitive `h/H` and `v/V` zoom controls.
+    - Process key press and repeat events; ignore key release events to prevent Windows duplicate actions.
+  - Where:
+    - `src/chart/interaction.rs`
+    - `src/app.rs`
+    - `tests/chart_state.rs`
+  - Definition of done:
+    - Synthetic Crossterm key events produce exactly one expected action.
+    - Every navigation/zoom action has the correct sign and factor.
+    - Quit actions reach the common terminal-shutdown path rather than exiting directly.
+
+- [ ] Implement mouse hover, pan, and axis scaling
+  - What to change:
+    - Map `Moved` events inside the plot to the nearest candle and price.
+    - On left-button down, capture drag region, starting coordinates, starting view state, and axis anchor.
+    - Plot drag maps column delta to candle offset and row delta to price offset, with chart content following the pointer.
+    - Price-axis drag applies `1.05^|row_delta|` around the initial cursor price; upward is zoom in.
+    - Time-axis drag applies `1.05^|column_delta|` around the initial cursor candle; rightward is zoom in.
+    - Mouse up commits the view and recomputes hover.
+    - Ignore drag events outside the retained plot/axis rectangles.
+  - Where:
+    - `src/chart/interaction.rs`
+    - `src/chart/state.rs`
+    - `tests/chart_state.rs`
+  - Definition of done:
+    - Region tests distinguish plot, price axis, time axis, and outside areas.
+    - Anchor values remain under the same cursor cell after axis scaling, subject only to clamping.
+    - Plot drag changes both X and Y and never activates axis scaling.
+
+- [ ] Implement snapshot terminal output
+  - What to change:
+    - Fetch the latest 500 candles before performing terminal rendering.
+    - For TTY stdout, calculate terminal size, reserve one shell row, render once with Ratatui `Viewport::Inline`, place the cursor below the chart, and exit.
+    - Never enable raw mode, alternate screen, hidden cursor, or mouse capture in snapshot mode.
+    - For non-TTY stdout, render the shared widget into `TestBackend` at 120×36 and serialize plain Unicode rows without style escape sequences.
+    - Return exit code 1 for provider/render failures and a clear minimum-size error for TTYs smaller than 60×18.
+  - Where:
+    - `src/snapshot.rs`
+    - `src/lib.rs`
+    - `tests/chart_render.rs`
+  - Definition of done:
+    - Successful TTY execution leaves a complete chart in scrollback and returns immediately.
+    - Non-TTY output contains exactly 36 lines, no ANSI escape bytes, and the expected normalized symbol/timeframe header.
+    - Snapshot execution does not alter terminal input mode or screen buffer.
+
+- [ ] Implement panic-safe interactive terminal lifecycle
+  - What to change:
+    - Require both stdin and stdout to be TTYs and direct non-TTY users to snapshot mode.
+    - Add an RAII `TerminalSession` that enables raw mode, enters alternate screen, enables mouse capture, and hides the cursor.
+    - Restore cursor visibility, mouse capture, alternate screen, and raw mode in reverse order on normal return, error propagation, and panic unwinding.
+    - Keep all quit inputs on the same cleanup path.
+  - Where:
+    - `src/app.rs`
+    - `src/error.rs`
+  - Definition of done:
+    - Normal exit, provider-task error, render error, `q`, `Esc`, and `Ctrl-C` all restore the terminal.
+    - No code path calls `process::exit` while the terminal session is active.
+
+- [ ] Implement the asynchronous interactive application loop
+  - What to change:
+    - Resolve the instrument and load the initial 500 candles before entering the alternate screen.
+    - Start the Binance live supervisor after the TUI session is established.
+    - Use `crossterm::event::EventStream` and `tokio::select!` for terminal events, live provider events, history results, and retry/status timers.
+    - Maintain one application state containing `CandleSeries`, `ChartViewState`, connection status, history state, and dirty/redraw state.
+    - Redraw only after data, view, hover, connection status, history status, or terminal size changes.
+    - Keep the last valid chart visible while reconnecting.
+    - Re-clamp state on resize and request older data through the history coordinator near the left boundary.
+    - Abort and join live/history tasks during shutdown.
+  - Where:
+    - `src/app.rs`
+    - `src/lib.rs`
+  - Definition of done:
+    - Live events update the chart without blocking keyboard/mouse processing.
+    - Historical inspection remains stationary while live data updates offscreen.
+    - Resize, backfill, reconnect, hover, and quit events can occur in any order without deadlock, duplicate tasks, or terminal corruption.
+
+- [ ] Finalize user-facing error and compatibility behavior
+  - What to change:
+    - Ensure provider, symbol, timeframe, HTTP status, timeout, malformed payload, WebSocket, TTY, terminal-size, and rendering errors use concise actionable messages.
+    - Preserve snapshot exit code 1 for runtime/provider failures and Clap’s argument-error exit behavior for invalid input.
+    - Honor `NO_COLOR` consistently in TTY and non-TTY output.
+    - Keep all production endpoints unauthenticated; do not add API key configuration.
+    - Exercise Crossterm press/repeat/release handling in platform-neutral tests.
+  - Where:
+    - `src/error.rs`
+    - `src/main.rs`
+    - `src/snapshot.rs`
+    - `src/app.rs`
+  - Definition of done:
+    - Every expected failure returns a stable nonzero status without panic or raw payload dumps.
+    - Error messages identify the failed operation and contain no secrets or internal debug representation.
+
+- [ ] Add deterministic fixtures and integration test seams
+  - What to change:
+    - Add representative REST history, open Kline, and closed Kline JSON fixtures.
+    - Ensure `BinanceProvider` constructors accept local REST and WS endpoints for tests without hidden production CLI flags.
+    - Add helpers for deterministic candle sets, fixed UTC timestamps, fixed terminal buffers, and synthetic Crossterm events.
+    - Keep all automated tests isolated from the public internet.
+  - Where:
+    - `tests/fixtures/binance_klines.json`
+    - `tests/fixtures/binance_kline_open.json`
+    - `tests/fixtures/binance_kline_closed.json`
+    - test support code within `tests/*.rs`
+  - Definition of done:
+    - Tests can reproduce REST pagination, WS updates/reconnect, view transforms, mouse input, and rendering without wall-clock or network nondeterminism.
+
+- [ ] Add Linux, macOS, and Windows CI
+  - What to change:
+    - Create a GitHub Actions matrix for `ubuntu-latest`, `macos-latest`, and `windows-latest` using Rust 1.96.
+    - Run `cargo test` and `cargo clippy --all-targets -- -D warnings` on every platform.
+    - Run `cargo fmt --check` on Linux.
+    - Do not provide Binance credentials or allow public network tests in CI.
+  - Where:
+    - `.github/workflows/ci.yml`
+  - Definition of done:
+    - All matrix jobs pass from a clean checkout.
+    - Windows builds use the same Crossterm/Ratatui code path and pass key-event tests.
+
+## Validation
+
+- [ ] Run CLI contract tests
+  - Execute the `tests/cli.rs` suite.
+  - Cover snapshot/interactive parsing, default/explicit provider, all symbol forms, all official timeframes, `1m` versus `1M`, unknown provider, malformed pair, and unsupported timeframe.
+  - Pass condition: every valid command parses to the exact locked model and every invalid command exits before network access.
+
+- [ ] Run Binance REST mock tests
+  - Execute `tests/binance_rest.rs` against Wiremock.
+  - Assert initial and backfill query parameters, tuple decoding, invariant validation, invalid-symbol 400, 429 with `Retry-After`, 500, timeout, and malformed JSON behavior.
+  - Pass condition: no test accesses Binance; all failures return the expected typed error and no test panics unexpectedly.
+
+- [ ] Run Binance WebSocket integration tests
+  - Execute `tests/binance_live.rs` against a local Tokio WebSocket server.
+  - Cover open-candle mutation, closed-candle append, ping/pong, forced disconnect, reconnect delays/status, REST gap fill, buffered WS replay, and overlap deduplication.
+  - Pass condition: emitted candles are chronological and unique and the stream returns to `Connected` after the simulated outage.
+
+- [ ] Run series and viewport state tests
+  - Execute `tests/chart_state.rs`.
+  - Cover prepend stability, live-follow pause/resume, `End`, `r`, WASD/arrows, `h/H`, `v/V`, all clamp boundaries, resize, empty data, one candle, flat prices, tiny prices, and large prices.
+  - Pass condition: transforms match the locked factors and all resulting indices/ranges are finite and valid.
+
+- [ ] Run mouse interaction tests
+  - Cover region hit-testing, hover selection, crosshair suppression during drag, plot X/Y pan signs, price-axis anchor stability, time-axis anchor stability, out-of-region events, and release behavior.
+  - Pass condition: every synthetic mouse sequence produces the exact intended view transition without activating the wrong interaction mode.
+
+- [ ] Run fixed Buffer rendering tests
+  - Execute `tests/chart_render.rs` at 80×24 and 120×36.
+  - Assert header content, bullish/bearish glyphs and colors, wick/body geometry, volume alignment, price labels, UTC labels, crosshair labels, status/footer text, `NO_COLOR`, and terminal-too-small output.
+  - Pass condition: rendered cells and styles match the expected deterministic buffers and labels do not overlap.
+
+- [ ] Validate snapshot TTY and non-TTY behavior
+  - Exercise TTY inline rendering and non-TTY 120×36 serialization using mocked market data.
+  - Pass condition: TTY mode leaves the chart in scrollback without entering raw/alternate mode; non-TTY output has 36 lines and no ANSI escapes.
+
+- [ ] Run formatting, linting, and full tests
+  - Run `cargo fmt --check`.
+  - Run `cargo clippy --all-targets -- -D warnings`.
+  - Run `cargo test`.
+  - Pass condition: every command exits zero and the test logs show no public network requests.
+
+- [ ] Validate the cross-platform CI matrix
+  - Run the GitHub Actions workflow on Ubuntu, macOS, and Windows.
+  - Pass condition: tests and Clippy pass on all three OS families and formatting passes on Linux.
+
+- [ ] Smoke-test a real Binance snapshot
+  - Run `cargo run -- btc 1h` in a supported TTY with public network access.
+  - Check normalized `BTC/USDT`, Binance Spot source, `1h`, UTC labels, OHLCV header, candles, volume, price axis, shell-row preservation, and zero exit status.
+  - Pass condition: exactly one chart remains in scrollback and the process exits without changing terminal mode.
+
+- [ ] Smoke-test the real interactive Binance feed
+  - Run `cargo run -- binance:btc 1m --interactive`.
+  - Check that the header reaches `LIVE` and the current candle updates within Binance’s documented stream interval.
+  - Exercise hover crosshair/OHLCV, WASD/arrows, `h/H`, `v/V`, plot drag, price-axis drag, time-axis drag, left-boundary backfill, live-follow pause, `End`, `r`, and resize.
+  - Pass condition: each interaction matches the locked direction/factor, backfill does not shift the viewed candles, and live updates continue while historical follow is paused.
+
+- [ ] Validate every terminal restoration path
+  - Exit interactive mode separately with `q`, `Esc`, and `Ctrl-C`; also induce a controlled provider/render error in a local test session.
+  - Pass condition: the cursor is visible, mouse capture is disabled, the alternate screen is left, raw mode is disabled, and normal shell input/echo work after every exit.
+
+- [ ] Run release-level terminal checks on each platform
+  - Linux: test a modern terminal and tmux.
+  - macOS: test Terminal.app or iTerm2.
+  - Windows: test Windows Terminal.
+  - Pass condition: keyboard navigation works everywhere; mouse hover/drag works wherever the terminal emits Crossterm mouse events; unsupported mouse reporting does not affect keyboard use or cleanup.
+
+- [ ] Review delivered scope against locked decisions
+  - Confirm that both modes share one renderer and provider-neutral domain model.
+  - Confirm that v1 contains no indicators, trading, export, persistent configuration, disk cache, multiple charts, futures market, or additional providers.
+  - Pass condition: every locked behavior is implemented and no out-of-scope feature or compatibility shim remains.
