@@ -3,27 +3,24 @@
 use std::{sync::Arc, time::Duration};
 
 use reqwest::{Client, StatusCode, Url, header::RETRY_AFTER};
+use serde::de::{IgnoredAny, SeqAccess, Visitor};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     cli::canonicalize_binance,
-    clock::{Clock, SleepOutcome, checked_deadline, sleep_until_or_cancelled},
+    clock::{Clock, checked_deadline},
     error::{
         ErrorContext, ErrorOperation, PayloadError, ProviderError, SanitizedCause,
         SanitizedMessage, TimeoutKind,
     },
     model::{
-        Candle, HistoryRequest, Instrument, InstrumentSpec, ProcessBlocker, ProviderId,
-        RateGateState, Timeframe,
+        Candle, HistoryRequest, Instrument, InstrumentSpec, ProcessBlocker, RateGateState,
+        Timeframe,
     },
-    provider::{
-        LiveFeed, LiveRequest, MarketDataProvider, ProviderFuture, RateGateSender,
-        RateGateSnapshot, rate_gate_channel,
-    },
+    provider::{RateGateSender, RateGateSnapshot, rate_gate_channel},
 };
 
-const BINANCE_PROVIDER: &str = "binance";
 const KLINES_PATH: &str = "/api/v3/klines";
 pub const REST_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REST_BODY_LIMIT: usize = 2 * 1024 * 1024;
@@ -114,6 +111,7 @@ impl BinanceProvider {
             ));
         }
         let client = Client::builder()
+            .no_proxy()
             .timeout(request_timeout)
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("fccli/", env!("CARGO_PKG_VERSION")))
@@ -131,7 +129,7 @@ impl BinanceProvider {
         })
     }
 
-    async fn fetch_history(
+    pub async fn history(
         &self,
         instrument: &Instrument,
         timeframe: Timeframe,
@@ -188,11 +186,17 @@ impl BinanceProvider {
                 message: None,
             });
         }
-        let bytes = read_capped(response, self.body_limit, &cancellation, &context).await?;
         if status.is_client_error() {
+            let bytes = match read_capped(response, self.body_limit, &cancellation, &context).await
+            {
+                Ok(bytes) => bytes,
+                Err(error) if is_cancelled(&error) => return Err(error),
+                Err(_) => Vec::new(),
+            };
             return Err(map_http_error(status, &bytes, context));
         }
-        decode_klines(&bytes, context)
+        let bytes = read_capped(response, self.body_limit, &cancellation, &context).await?;
+        decode_klines(&bytes, request.limit(), context)
     }
 
     async fn await_gate(
@@ -200,9 +204,9 @@ impl BinanceProvider {
         cancellation: &CancellationToken,
         context: &ErrorContext,
     ) -> Result<(), ProviderError> {
+        let mut snapshot = self.gate_snapshot.clone();
         loop {
-            match self
-                .gate_snapshot
+            match snapshot
                 .current()
                 .map_err(|_| ProviderError::Invariant("rate gate closed"))?
             {
@@ -214,10 +218,13 @@ impl BinanceProvider {
                     return Ok(());
                 }
                 RateGateState::TimedUntil(deadline) => {
-                    if sleep_until_or_cancelled(self.clock.as_ref(), deadline, cancellation).await
-                        == SleepOutcome::Cancelled
-                    {
-                        return Err(cancelled(context.clone()));
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => return Err(cancelled(context.clone())),
+                        changed = snapshot.changed() => {
+                            changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?;
+                        }
+                        () = self.clock.sleep_until(deadline) => {}
                     }
                 }
             }
@@ -234,8 +241,8 @@ impl BinanceProvider {
             .headers()
             .get(RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
             .and_then(|value| value.parse::<u64>().ok())
-            .filter(|seconds| *seconds > 0)
             .and_then(|seconds| {
                 checked_deadline(self.clock.now(), Duration::from_secs(seconds)).ok()
             });
@@ -245,53 +252,39 @@ impl BinanceProvider {
         } else {
             parsed
         };
-        let Some(deadline) = deadline else {
+        if let Some(deadline) = deadline {
+            self.gate_sender
+                .publish(RateGateState::TimedUntil(deadline))
+                .map_err(|_| ProviderError::Invariant("rate gate closed"))?;
+        } else {
             self.gate_sender
                 .publish(RateGateState::ProcessBlocked(
                     ProcessBlocker::InvalidBanExpiry,
                 ))
                 .map_err(|_| ProviderError::Invariant("rate gate closed"))?;
-            return Err(ProviderError::InvalidBanExpiry);
-        };
-        self.gate_sender
-            .publish(RateGateState::TimedUntil(deadline))
+        }
+        let effective = self
+            .gate_snapshot
+            .current()
             .map_err(|_| ProviderError::Invariant("rate gate closed"))?;
+        if matches!(
+            effective,
+            RateGateState::ProcessBlocked(ProcessBlocker::InvalidBanExpiry)
+        ) {
+            return Err(ProviderError::InvalidBanExpiry);
+        }
         Err(ProviderError::RateLimited {
             context,
             status: status.as_u16(),
         })
     }
-}
-
-impl MarketDataProvider for BinanceProvider {
-    fn id(&self) -> ProviderId {
-        ProviderId::new(BINANCE_PROVIDER).expect("static Binance provider id is valid")
-    }
-
-    fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
+    pub fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
         canonicalize_binance(spec)
             .map_err(|_| ProviderError::Configuration("instrument is not valid for Binance Spot"))
     }
 
-    fn history<'a>(
-        &'a self,
-        instrument: &'a Instrument,
-        timeframe: Timeframe,
-        request: HistoryRequest,
-        cancellation: CancellationToken,
-    ) -> ProviderFuture<'a, Vec<Candle>> {
-        Box::pin(self.fetch_history(instrument, timeframe, request, cancellation))
-    }
-
-    fn open_live<'a>(&'a self, _request: LiveRequest) -> ProviderFuture<'a, LiveFeed> {
-        Box::pin(async {
-            Err(ProviderError::Configuration(
-                "Binance live transport is unavailable until the live supervisor is configured",
-            ))
-        })
-    }
-
-    fn rate_gate(&self) -> RateGateSnapshot {
+    #[must_use]
+    pub fn rate_gate(&self) -> RateGateSnapshot {
         self.gate_snapshot.clone()
     }
 }
@@ -361,14 +354,59 @@ struct RawKline(
     Value,
     Value,
 );
+struct BoundedRowsVisitor {
+    limit: usize,
+}
 
-fn decode_klines(bytes: &[u8], context: ErrorContext) -> Result<Vec<Candle>, ProviderError> {
-    let value: Value = serde_json::from_slice(bytes)
+impl<'de> Visitor<'de> for BoundedRowsVisitor {
+    type Value = Vec<Value>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded array of Binance kline rows")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut rows = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(self.limit));
+        while rows.len() < self.limit {
+            let Some(row) = sequence.next_element::<Value>()? else {
+                return Ok(rows);
+            };
+            rows.push(row);
+        }
+        if sequence.next_element::<IgnoredAny>()?.is_some() {
+            return Err(serde::de::Error::custom("kline row limit exceeded"));
+        }
+        Ok(rows)
+    }
+}
+fn decode_klines(
+    bytes: &[u8],
+    requested_limit: u16,
+    context: ErrorContext,
+) -> Result<Vec<Candle>, ProviderError> {
+    if bytes
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        != Some(b'[')
+    {
+        return if serde_json::from_slice::<Value>(bytes).is_ok() {
+            Err(payload(&context, PayloadError::ExpectedArray))
+        } else {
+            Err(payload(&context, PayloadError::MalformedJson))
+        };
+    }
+    let limit = usize::from(requested_limit).min(1000);
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let rows =
+        serde::de::Deserializer::deserialize_seq(&mut deserializer, BoundedRowsVisitor { limit })
+            .map_err(|_| payload(&context, PayloadError::MalformedJson))?;
+    deserializer
+        .end()
         .map_err(|_| payload(&context, PayloadError::MalformedJson))?;
-    let rows = match value {
-        Value::Array(rows) => rows,
-        _ => return Err(payload(&context, PayloadError::ExpectedArray)),
-    };
     let mut candles = Vec::with_capacity(rows.len());
     for row in rows {
         let fields = match row {
@@ -416,10 +454,10 @@ fn decode_klines(bytes: &[u8], context: ErrorContext) -> Result<Vec<Candle>, Pro
 }
 
 fn validate_ignored_fields(raw: &RawKline, context: &ErrorContext) -> Result<(), ProviderError> {
-    decimal_field(&raw.7, "quote_volume", context)?;
-    integer_field(&raw.8, "trade_count", context)?;
-    decimal_field(&raw.9, "taker_buy_base_volume", context)?;
-    decimal_field(&raw.10, "taker_buy_quote_volume", context)?;
+    nonnegative_decimal_field(&raw.7, "quote_volume", context)?;
+    nonnegative_integer_field(&raw.8, "trade_count", context)?;
+    nonnegative_decimal_field(&raw.9, "taker_buy_base_volume", context)?;
+    nonnegative_decimal_field(&raw.10, "taker_buy_quote_volume", context)?;
     if !raw.11.is_string() {
         return Err(payload(
             context,
@@ -447,7 +485,32 @@ fn decimal_field(
     value
         .as_str()
         .and_then(|text| text.parse::<f64>().ok())
+        .filter(|number| number.is_finite())
         .ok_or_else(|| payload(context, PayloadError::InvalidField { field }))
+}
+
+fn nonnegative_decimal_field(
+    value: &Value,
+    field: &'static str,
+    context: &ErrorContext,
+) -> Result<f64, ProviderError> {
+    decimal_field(value, field, context).and_then(|number| {
+        (number >= 0.0)
+            .then_some(number)
+            .ok_or_else(|| payload(context, PayloadError::InvalidField { field }))
+    })
+}
+
+fn nonnegative_integer_field(
+    value: &Value,
+    field: &'static str,
+    context: &ErrorContext,
+) -> Result<i64, ProviderError> {
+    integer_field(value, field, context).and_then(|number| {
+        (number >= 0)
+            .then_some(number)
+            .ok_or_else(|| payload(context, PayloadError::InvalidField { field }))
+    })
 }
 
 fn map_http_error(status: StatusCode, bytes: &[u8], context: ErrorContext) -> ProviderError {
@@ -495,6 +558,16 @@ fn cancelled(context: ErrorContext) -> ProviderError {
         context,
         cause: SanitizedCause::Cancelled,
     }
+}
+
+fn is_cancelled(error: &ProviderError) -> bool {
+    matches!(
+        error,
+        ProviderError::Transport {
+            cause: SanitizedCause::Cancelled,
+            ..
+        }
+    )
 }
 
 #[cfg(feature = "test-transport")]

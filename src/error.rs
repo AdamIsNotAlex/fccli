@@ -364,16 +364,15 @@ impl ProviderError {
     /// Whether an older-history request may be retried under the shared gate/backoff policy.
     #[must_use]
     pub const fn is_recoverable_for_history(&self) -> bool {
-        matches!(
-            self,
-            Self::ServerStatus { .. }
-                | Self::RateLimited { .. }
-                | Self::Timeout {
-                    kind: TimeoutKind::Request,
-                    ..
-                }
-                | Self::Transport { .. }
-        )
+        match self {
+            Self::ServerStatus { .. } | Self::RateLimited { .. } => true,
+            Self::Timeout {
+                kind: TimeoutKind::Request,
+                ..
+            } => true,
+            Self::Transport { cause, .. } => !matches!(cause, SanitizedCause::Cancelled),
+            _ => false,
+        }
     }
 }
 
