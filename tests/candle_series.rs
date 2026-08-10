@@ -666,6 +666,104 @@ fn prepend_middle_and_general_batches_choose_exact_mapping_forms() {
 }
 
 #[test]
+fn multi_candle_batches_choose_mapping_from_the_actual_index_transform() {
+    let mut prepended = CandleSeries::new(Timeframe::Minute1);
+    prepended
+        .replace(vec![
+            rest(BASE + 2 * MINUTE, 12.0),
+            rest(BASE + 3 * MINUTE, 13.0),
+            rest(BASE + 4 * MINUTE, 14.0),
+        ])
+        .expect("initial replacement succeeds");
+    let prepend = prepended.prepend(vec![rest(BASE, 10.0), rest(BASE + MINUTE, 11.0)]);
+    assert!(matches!(
+        &prepend.old_to_new,
+        IndexMapping::ShiftSuffix {
+            len: 3,
+            from: 0,
+            delta: 2
+        }
+    ));
+    assert_mapping_eq(&prepend, &[2, 3, 4]);
+    assert_valid_old_to_new(&prepend, &prepended);
+    assert_eq!(
+        open_times(&prepended),
+        vec![
+            BASE,
+            BASE + MINUTE,
+            BASE + 2 * MINUTE,
+            BASE + 3 * MINUTE,
+            BASE + 4 * MINUTE,
+        ]
+    );
+
+    let mut appended_and_replaced = CandleSeries::new(Timeframe::Minute1);
+    appended_and_replaced
+        .replace(vec![
+            rest(BASE, 10.0),
+            rest(BASE + MINUTE, 11.0),
+            rest(BASE + 2 * MINUTE, 12.0),
+        ])
+        .expect("initial replacement succeeds");
+    let identity = appended_and_replaced.merge(vec![
+        ws(BASE + MINUTE, 21.0, false),
+        rest(BASE + 3 * MINUTE, 13.0),
+        rest(BASE + 4 * MINUTE, 14.0),
+    ]);
+    assert!(matches!(
+        &identity.old_to_new,
+        IndexMapping::Identity { len: 3 }
+    ));
+    assert_mapping_eq(&identity, &[0, 1, 2]);
+    assert_valid_old_to_new(&identity, &appended_and_replaced);
+    assert_eq!(
+        appended_and_replaced
+            .candle_at_open_time(BASE + MINUTE)
+            .expect("batch replacement is retained")
+            .open(),
+        21.0
+    );
+    assert_eq!(
+        open_times(&appended_and_replaced),
+        vec![
+            BASE,
+            BASE + MINUTE,
+            BASE + 2 * MINUTE,
+            BASE + 3 * MINUTE,
+            BASE + 4 * MINUTE,
+        ]
+    );
+
+    let mut nonuniform = CandleSeries::new(Timeframe::Minute1);
+    nonuniform
+        .replace(vec![
+            rest(BASE + MINUTE, 11.0),
+            rest(BASE + 3 * MINUTE, 13.0),
+            rest(BASE + 5 * MINUTE, 15.0),
+        ])
+        .expect("initial replacement succeeds");
+    let explicit = nonuniform.merge(vec![
+        rest(BASE, 10.0),
+        rest(BASE + 2 * MINUTE, 12.0),
+        rest(BASE + 4 * MINUTE, 14.0),
+    ]);
+    assert!(matches!(&explicit.old_to_new, IndexMapping::Explicit(_)));
+    assert_mapping_eq(&explicit, &[1, 3, 5]);
+    assert_valid_old_to_new(&explicit, &nonuniform);
+    assert_eq!(
+        open_times(&nonuniform),
+        vec![
+            BASE,
+            BASE + MINUTE,
+            BASE + 2 * MINUTE,
+            BASE + 3 * MINUTE,
+            BASE + 4 * MINUTE,
+            BASE + 5 * MINUTE,
+        ]
+    );
+}
+
+#[test]
 fn monthly_continuity_uses_calendar_successors_not_fixed_durations() {
     const JAN_2024: i64 = 1_704_067_200_000;
     const FEB_2024: i64 = 1_706_745_600_000;

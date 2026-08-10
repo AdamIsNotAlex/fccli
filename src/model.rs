@@ -540,6 +540,66 @@ impl IndexMapping {
     }
 }
 
+#[derive(Debug)]
+enum AdaptiveIndexMapping {
+    Identity,
+    ShiftSuffix { from: usize, delta: isize },
+    Explicit(Vec<usize>),
+}
+
+impl AdaptiveIndexMapping {
+    fn observe(&mut self, old_index: usize, new_index: usize, old_len: usize) {
+        match self {
+            Self::Identity if old_index == new_index => {}
+            Self::Identity => {
+                *self = Self::ShiftSuffix {
+                    from: old_index,
+                    delta: mapping_delta(old_index, new_index),
+                };
+            }
+            Self::ShiftSuffix { delta, .. }
+                if old_index.checked_add_signed(*delta) == Some(new_index) => {}
+            Self::ShiftSuffix { from, delta } => {
+                let mut indices = Vec::with_capacity(old_len);
+                indices.extend((0..old_index).map(|index| {
+                    if index < *from {
+                        index
+                    } else {
+                        index
+                            .checked_add_signed(*delta)
+                            .expect("observed index mapping remains in bounds")
+                    }
+                }));
+                indices.push(new_index);
+                *self = Self::Explicit(indices);
+            }
+            Self::Explicit(indices) => indices.push(new_index),
+        }
+    }
+
+    fn finish(self, old_len: usize) -> IndexMapping {
+        match self {
+            Self::Identity => IndexMapping::Identity { len: old_len },
+            Self::ShiftSuffix { from, delta } => IndexMapping::ShiftSuffix {
+                len: old_len,
+                from,
+                delta,
+            },
+            Self::Explicit(indices) => {
+                debug_assert_eq!(indices.len(), old_len);
+                IndexMapping::Explicit(indices)
+            }
+        }
+    }
+}
+
+fn mapping_delta(old_index: usize, new_index: usize) -> isize {
+    let delta = new_index
+        .checked_sub(old_index)
+        .expect("merge never moves an existing candle backward");
+    isize::try_from(delta).expect("index delta fits in isize")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MutationSummary {
     pub inserted: usize,
@@ -825,14 +885,16 @@ impl CandleSeries {
         let mut old = std::mem::take(&mut self.candles).into_iter().peekable();
         let mut incoming = input.into_iter().peekable();
         let mut merged = VecDeque::with_capacity(old_len + incoming.len());
-        let mut old_to_new = Vec::with_capacity(old_len);
+        let mut old_to_new = AdaptiveIndexMapping::Identity;
+        let mut old_index = 0;
         let mut drafts = Vec::with_capacity(incoming.len());
 
         while old.peek().is_some() || incoming.peek().is_some() {
             let final_index = merged.len();
             match (old.peek(), incoming.peek()) {
                 (Some(current), Some(candidate)) if current.open_time() < candidate.open_time() => {
-                    old_to_new.push(final_index);
+                    old_to_new.observe(old_index, final_index, old_len);
+                    old_index += 1;
                     merged.push_back(old.next().expect("peeked candle exists"));
                 }
                 (Some(current), Some(candidate))
@@ -842,7 +904,8 @@ impl CandleSeries {
                     let candidate = incoming.next().expect("peeked candle exists");
                     let open_time = candidate.open_time();
                     let result = merge_equal(&current, candidate);
-                    old_to_new.push(final_index);
+                    old_to_new.observe(old_index, final_index, old_len);
+                    old_index += 1;
                     drafts.push((open_time, final_index, Some(current)));
                     merged.push_back(result);
                 }
@@ -852,12 +915,14 @@ impl CandleSeries {
                     merged.push_back(candidate);
                 }
                 (Some(_), None) => {
-                    old_to_new.push(final_index);
+                    old_to_new.observe(old_index, final_index, old_len);
+                    old_index += 1;
                     merged.push_back(old.next().expect("peeked candle exists"));
                 }
                 (None, None) => break,
             }
         }
+        debug_assert_eq!(old_index, old_len);
 
         let mut affected = Vec::with_capacity(drafts.len().saturating_mul(2));
         affected.extend(drafts.iter().map(|(_, index, _)| *index));
@@ -911,7 +976,7 @@ impl CandleSeries {
             inserted,
             replaced,
             unchanged,
-            old_to_new: IndexMapping::Explicit(old_to_new),
+            old_to_new: old_to_new.finish(old_len),
             resolved,
             empty_input: false,
             duplicate_only: inserted == 0 && replaced == 0,
