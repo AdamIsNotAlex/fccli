@@ -1,7 +1,7 @@
 use clap::error::ErrorKind;
 use fccli::{
     cli::{CanonicalizationError, Cli, Mode, canonicalize_binance},
-    model::{Market, Timeframe},
+    model::{InstrumentSpec, Market, ProviderId, Timeframe},
 };
 
 fn parse(instrument: &str, timeframe: &str) -> Cli {
@@ -46,6 +46,41 @@ fn valid_symbol_forms_canonicalize_to_locked_binance_spot_identifiers() {
         );
         assert_eq!(instrument.provider_symbol(), provider_symbol, "{input}");
     }
+}
+
+#[test]
+fn direct_instrument_specs_are_canonicalized_independently_of_cli_preprocessing() {
+    let provider = ProviderId::new("binance").expect("valid provider");
+    let cases = [
+        ("btc", None, "BTC", "USDT", "BTCUSDT"),
+        ("bTcUsDt", None, "BTC", "USDT", "BTCUSDT"),
+        ("eTh", Some("uSdC"), "ETH", "USDC", "ETHUSDC"),
+    ];
+
+    for (base, quote, expected_base, expected_quote, expected_symbol) in cases {
+        let specification = InstrumentSpec::new(provider.clone(), base, quote)
+            .expect("valid direct instrument specification");
+        let instrument = canonicalize_binance(&specification).expect("canonical instrument");
+        assert_eq!(instrument.base(), expected_base, "{base:?}/{quote:?}");
+        assert_eq!(instrument.quote(), expected_quote, "{base:?}/{quote:?}");
+        assert_eq!(
+            instrument.display_pair(),
+            format!("{expected_base}/{expected_quote}"),
+            "{base:?}/{quote:?}"
+        );
+        assert_eq!(
+            instrument.provider_symbol(),
+            expected_symbol,
+            "{base:?}/{quote:?}"
+        );
+    }
+
+    let quote_only = InstrumentSpec::new(provider, "uSdT", None::<String>)
+        .expect("valid provider-neutral quote token");
+    assert_eq!(
+        canonicalize_binance(&quote_only),
+        Err(CanonicalizationError::QuoteOnly)
+    );
 }
 
 #[test]
@@ -108,6 +143,23 @@ fn snapshot_is_default_and_both_interactive_flags_select_interactive_mode() {
 }
 
 #[test]
+fn unknown_short_and_long_options_use_clap_unknown_argument_errors() {
+    for arguments in [
+        ["fccli", "--interactiv", "btc", "1m"],
+        ["fccli", "-x", "btc", "1m"],
+        ["fccli", "-usdt", "btc", "1m"],
+    ] {
+        let error = Cli::try_parse_from(arguments).expect_err("unknown option");
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument, "{arguments:?}");
+    }
+
+    let dashed_pair = Cli::try_parse_from(["fccli", "btc-usdt", "1m"])
+        .expect("an embedded dash remains a valid pair separator");
+    assert_eq!(dashed_pair.instrument().base(), "BTC");
+    assert_eq!(dashed_pair.instrument().quote(), Some("USDT"));
+}
+
+#[test]
 fn whitespace_non_ascii_empty_and_malformed_components_are_rejected() {
     let invalid = [
         "",
@@ -122,7 +174,6 @@ fn whitespace_non_ascii_empty_and_malformed_components_are_rejected() {
         "binance:",
         "/usdt",
         "btc/",
-        "-usdt",
         "btc-",
         "btc/usdt/eth",
         "btc-usdt-eth",
@@ -146,6 +197,70 @@ fn whitespace_non_ascii_empty_and_malformed_components_are_rejected() {
             "unexpected error for {value:?}: {rendered}"
         );
     }
+}
+
+#[test]
+fn rejected_arguments_are_bounded_and_never_echo_terminal_control_payloads() {
+    let malicious = [
+        ("btc\ninjected", "injected"),
+        ("btc\rspoofed", "spoofed"),
+        ("btc\u{1b}[31mred", "red"),
+        ("btc\u{1b}]0;owned\u{7}", "owned"),
+        ("btc\u{202e}txt", "txt"),
+        ("btc\0hidden", "hidden"),
+    ];
+
+    for (value, marker) in malicious {
+        for arguments in [["fccli", value, "1m"], ["fccli", "btc", value]] {
+            let error = Cli::try_parse_from(arguments).expect_err("unsafe argument");
+            assert_eq!(error.kind(), ErrorKind::ValueValidation, "{value:?}");
+            let rendered = error.to_string();
+            assert!(
+                !rendered.contains(value),
+                "unsafe input was echoed: {rendered:?}"
+            );
+            assert!(
+                !rendered.contains(marker),
+                "unsafe payload marker was echoed: {rendered:?}"
+            );
+            assert!(!rendered.contains('\u{1b}'), "ESC survived: {rendered:?}");
+            assert!(
+                !rendered.contains('\u{202e}'),
+                "bidi survived: {rendered:?}"
+            );
+            assert!(!rendered.contains('\0'), "NUL survived: {rendered:?}");
+        }
+    }
+
+    let oversized = "a".repeat(1_000_000);
+    for arguments in [
+        ["fccli", oversized.as_str(), "1m"],
+        ["fccli", "btc", oversized.as_str()],
+    ] {
+        let error = Cli::try_parse_from(arguments).expect_err("oversized programmatic argument");
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+        let rendered = error.to_string();
+        assert!(!rendered.contains(&oversized));
+        assert!(rendered.len() < 4_096, "error rendering was not bounded");
+    }
+}
+
+#[test]
+fn provider_symbol_length_accepts_exact_limit_and_rejects_one_over() {
+    const PROVIDER_SYMBOL_LIMIT: usize = 256;
+    const DEFAULT_QUOTE_LEN: usize = 4;
+
+    let exact = "a".repeat(PROVIDER_SYMBOL_LIMIT - DEFAULT_QUOTE_LEN);
+    let cli = Cli::try_parse_from(["fccli", exact.as_str(), "1m"])
+        .expect("exact-limit instrument specification");
+    let instrument = canonicalize_binance(cli.instrument()).expect("exact-limit canonicalization");
+    assert_eq!(instrument.provider_symbol().len(), PROVIDER_SYMBOL_LIMIT);
+
+    let one_over = "a".repeat(PROVIDER_SYMBOL_LIMIT - DEFAULT_QUOTE_LEN + 1);
+    let error = Cli::try_parse_from(["fccli", one_over.as_str(), "1m"])
+        .expect_err("one-over-limit instrument specification");
+    assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    assert!(!error.to_string().contains(&one_over));
 }
 
 #[test]

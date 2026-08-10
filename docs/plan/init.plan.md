@@ -891,6 +891,36 @@ Chunk-6 append-only formatter update (authoritative over the earlier 24-executio
 
 The canonical total is therefore **26 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-26`, accompanied by `artifact://1152`; the artifacts' later check and CLI-test executions do not update unrelated ledger records because their commands and scopes do not exactly match those records.
 
+Chunk-6 append-only outcome correction (authoritative over the inaccurate post-formatter outcome narratives in `attempt-2026-08-10-chunk6-1` / `fmt-exec-25` and `attempt-2026-08-10-chunk6-2` / `fmt-exec-26`, which remain preserved as historical accounting):
+
+| Record ID | Corrected canonical execution | Authoritative observed outcome | Accounting effect | Supersedes narrative |
+|---|---|---|---|---|
+| DET-FMT | `fmt-exec-25` / `attempt-2026-08-10-chunk6-1` | The retained command contains `cargo fmt --check`, and `artifact://1142` records that the `&&` chain advanced beyond formatting: the subsequent Cargo check passed, all 8 CLI tests passed, and the final chained Cargo check passed. | Formatter execution 25 remains a successful formatter execution; this correction does not credit the narrower check or CLI-test commands to unrelated ledger records. | The earlier statements that `artifact://1142` records 7 passing CLI tests and 1 failure. |
+| DET-FMT | `fmt-exec-26` / `attempt-2026-08-10-chunk6-2` | The retained command contains `cargo fmt --check`, and `artifact://1152` records that the `&&` chain advanced beyond formatting: the subsequent Cargo check passed, then the CLI target ran 8 tests with 7 passing and `whitespace_non_ascii_empty_and_malformed_components_are_rejected` failing; the chain stopped there, so no later chained stage ran. | Formatter execution 26 remains the current `DET-FMT=PASS` basis because execution advanced beyond formatting; no successful CLI target or later-stage result is claimed, and no unrelated ledger record is updated. | The earlier statements that `artifact://1152` records all 8 CLI tests and the remaining chained stage succeeding. |
+
+The canonical total remains **26 `DET-FMT` executions**. Current `DET-FMT=PASS` continues to rely on `fmt-exec-26`, accompanied by `artifact://1152`; this append-only correction changes only the recorded post-formatter outcomes, not the formatter execution identities, count, or PASS status.
+
+Chunk-6 append-only outcome correction (authoritative over the inaccurate correction narratives at `fmt-exec-25` / `attempt-2026-08-10-chunk6-1` and `fmt-exec-26` / `attempt-2026-08-10-chunk6-2`, which remain preserved as historical accounting):
+
+| Record ID | Corrected canonical execution | Authoritative observed outcome | Accounting effect | Supersedes narrative |
+|---|---|---|---|---|
+| DET-FMT | `fmt-exec-25` / `attempt-2026-08-10-chunk6-1` | The retained command contains `cargo fmt --check`, and `artifact://1142` records that the `&&` chain advanced beyond formatting: the subsequent Cargo check passed, then the CLI target ran 8 tests with 7 passing and `whitespace_non_ascii_empty_and_malformed_components_are_rejected` failing for the `-usdt` case (`UnknownArgument` observed instead of `ValueValidation`); the chain stopped there, so no Clippy stage ran. | Formatter execution 25 remains a successful formatter execution because the chain advanced beyond formatting; no successful CLI target or Clippy result is claimed, and no unrelated ledger record is updated. | The immediately prior correction's inaccurate statement that `artifact://1142` records all 8 CLI tests and the final chained Cargo check passing. |
+| DET-FMT | `fmt-exec-26` / `attempt-2026-08-10-chunk6-2` | The retained command contains `cargo fmt --check`, and `artifact://1152` records that the `&&` chain advanced beyond formatting: the subsequent Cargo check passed, all 8 CLI tests passed, and the final `cargo clippy --locked --all-targets -- -D warnings` stage passed. | Formatter execution 26 remains the current `DET-FMT=PASS` basis until the later execution below; this correction does not credit the narrower check, CLI-test, or Clippy commands to unrelated ledger records. | The immediately prior correction's inaccurate statement that `artifact://1152` records 7 passing CLI tests, 1 failure, and no later chained stage. |
+
+The canonical total remains **26 `DET-FMT` executions** at this correction point. Current `DET-FMT=PASS` still relies on `fmt-exec-26`, accompanied by `artifact://1152`; this append-only correction changes only the recorded post-formatter outcomes.
+
+Chunk-6 append-only formatter update (authoritative over the earlier 26-execution total and `fmt-exec-26` current-basis statements, which remain preserved as historical accounting):
+
+| Record ID | Attempt/date | Requirement | Status after attempt | Environment | Command/scenario | PASS semantics | Observed result | Evidence | Blocker/next action | Supersedes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| DET-FMT | `attempt-2026-08-10-chunk6-3` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, latest corrected chunk-6 CLI tree | `cargo fmt --check` within the retained chained command accompanied by `artifact://1178` | exit 0 | PASS; the chain advanced beyond formatting, the subsequent Cargo check passed, all 12 CLI tests passed, and the final `cargo clippy --locked --all-targets -- -D warnings` stage passed | The retained chained invocation and `artifact://1178` prove the formatter stage exited 0 because execution advanced beyond it; the artifact records the subsequent check, all 12 CLI tests, and final Clippy stage succeeding. | — | `attempt-2026-08-10-chunk6-2` |
+
+| Record ID | True occurrence | Canonical execution identity | Exact invocation/result evidence | Historical rows accounted for |
+|---|---:|---|---|---|
+| DET-FMT | 27 | `fmt-exec-27` | The retained command accompanied by `artifact://1178` contains `cargo fmt --check`; the artifact records the subsequent Cargo check passing, all 12 CLI tests passing, and the final `cargo clippy --locked --all-targets -- -D warnings` passing, so the formatter stage necessarily exited 0 without diagnostics. | `attempt-2026-08-10-chunk6-3` is the execution row and supplies current `DET-FMT=PASS`. |
+
+The canonical total is therefore **27 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-27`, accompanied by `artifact://1178`; the artifact's later check, CLI-test, and Clippy executions do not update unrelated ledger records because their commands and scopes do not exactly match those records.
+
 The final planned test inventory includes `tests/app_live_contract.rs` and contains no `tests/app_integration.rs`; this is not a precreation requirement. Chunk 2 creates and uses `tests/feature_selection.rs` only for its named feature-selection gates; `tests/app_live_contract.rs` MUST NOT exist before chunk 17, where the real App reducer/sole MarketEvent consumer contract is introduced. The final inventory also contains exactly `tests/terminal_lifecycle.rs` and `tests/api_boundaries.rs` for the other named specialized gates. `terminal_pty` and `transport_api_boundary` are not API/test-target names.
 ### Smoke and delivery references（ledger-only）
 

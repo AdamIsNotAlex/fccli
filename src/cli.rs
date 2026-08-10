@@ -1,10 +1,12 @@
 //! Command-line parsing and local, side-effect-free instrument canonicalization.
 
-use std::ffi::OsString;
+use std::{error::Error as _, ffi::OsString};
 
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser, error::ErrorKind};
 
-use crate::model::{Instrument, InstrumentSpec, Market, ProviderId, Timeframe};
+use crate::model::{
+    Instrument, InstrumentSpec, MAX_PROVIDER_SYMBOL_LEN, Market, ProviderId, Timeframe,
+};
 
 const DEFAULT_PROVIDER: &str = "binance";
 const DEFAULT_QUOTE: &str = "USDT";
@@ -26,11 +28,7 @@ pub enum Mode {
 )]
 pub struct Cli {
     /// Instrument as ASSET, BASE/QUOTE, BASE-QUOTE, or PROVIDER:INSTRUMENT
-    #[arg(
-        value_name = "INSTRUMENT",
-        value_parser = parse_instrument_spec,
-        allow_hyphen_values = true
-    )]
+    #[arg(value_name = "INSTRUMENT", value_parser = parse_instrument_spec)]
     instrument: InstrumentSpec,
 
     /// Candle interval (case-sensitive; for example 1m, 1h, or 1M)
@@ -79,7 +77,7 @@ impl Cli {
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
-        <Self as Parser>::try_parse_from(args)
+        <Self as Parser>::try_parse_from(args).map_err(sanitize_parse_error)
     }
 }
 
@@ -110,17 +108,22 @@ pub fn canonicalize_binance(
         });
     }
 
-    let (base, quote) = match specification.quote() {
-        Some(quote) => (specification.base(), quote),
+    let base = specification.base();
+    let quote = specification.quote();
+    validate_symbol_lengths(base, quote).map_err(|()| CanonicalizationError::InvalidInstrument)?;
+
+    let normalized_base = base.to_ascii_uppercase();
+    let normalized_quote = quote.map(str::to_ascii_uppercase);
+    let (base, quote) = match normalized_quote.as_deref() {
+        Some(quote) => (normalized_base.as_str(), quote),
         None => {
-            let token = specification.base();
-            if let Some(base) = token.strip_suffix(DEFAULT_QUOTE) {
+            if let Some(base) = normalized_base.strip_suffix(DEFAULT_QUOTE) {
                 if base.is_empty() {
                     return Err(CanonicalizationError::QuoteOnly);
                 }
                 (base, DEFAULT_QUOTE)
             } else {
-                (token, DEFAULT_QUOTE)
+                (normalized_base.as_str(), DEFAULT_QUOTE)
             }
         }
     };
@@ -138,22 +141,21 @@ pub fn canonicalize_binance(
 
 fn parse_timeframe(value: &str) -> Result<Timeframe, String> {
     value.parse().map_err(|_| {
-        format!(
-            "unsupported timeframe `{value}`; use one of: 1s, 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M (case-sensitive)"
-        )
+        "unsupported timeframe; use one of: 1s, 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M (case-sensitive)".to_owned()
     })
 }
 
 fn parse_instrument_spec(value: &str) -> Result<InstrumentSpec, String> {
     let (provider, pair) = split_provider(value)?;
     let (base, quote) = split_pair(pair)?;
+    validate_symbol_lengths(base, quote).map_err(|()| invalid_instrument_message())?;
 
-    InstrumentSpec::new(provider, base.to_ascii_uppercase(), quote.map(str::to_ascii_uppercase))
-        .map_err(|_| {
-            format!(
-                "invalid instrument `{value}`; components must be nonempty ASCII letters or digits (for example `btc`, `BTCUSDT`, or `binance:btc/usdt`)"
-            )
-        })
+    InstrumentSpec::new(
+        provider,
+        base.to_ascii_uppercase(),
+        quote.map(str::to_ascii_uppercase),
+    )
+    .map_err(|_| invalid_instrument_message())
 }
 
 fn split_provider(value: &str) -> Result<(ProviderId, &str), String> {
@@ -161,22 +163,23 @@ fn split_provider(value: &str) -> Result<(ProviderId, &str), String> {
     let first = parts.next().unwrap_or_default();
     let second = parts.next();
     if parts.next().is_some() {
-        return Err(format!(
-            "invalid provider prefix in `{value}`; use at most one `:` (for example `binance:btc`)"
-        ));
+        return Err(
+            "invalid provider prefix; use at most one `:` (for example `binance:btc`)".to_owned(),
+        );
     }
 
     match second {
         Some(pair) => {
+            if first.len() > MAX_PROVIDER_SYMBOL_LEN {
+                return Err("invalid provider; provider names must be at most 256 ASCII letters or digits (for example `binance`)".to_owned());
+            }
             let provider = ProviderId::new(first).map_err(|_| {
-                format!(
-                    "invalid provider `{first}`; provider names must be nonempty ASCII letters or digits (for example `binance`)"
-                )
+                "invalid provider; provider names must be nonempty ASCII letters or digits (for example `binance`)".to_owned()
             })?;
             if pair.is_empty() {
-                return Err(format!(
-                    "missing instrument after provider prefix in `{value}`; try `binance:btc`"
-                ));
+                return Err(
+                    "missing instrument after provider prefix; try `binance:btc`".to_owned(),
+                );
             }
             Ok((provider, pair))
         }
@@ -192,14 +195,14 @@ fn split_pair(value: &str) -> Result<(&str, Option<&str>), String> {
     let dash_count = value.bytes().filter(|byte| *byte == b'-').count();
 
     if slash_count > 0 && dash_count > 0 {
-        return Err(format!(
-            "invalid instrument `{value}`; do not mix `/` and `-` separators (try `btc/usdt`)"
-        ));
+        return Err(
+            "invalid instrument; do not mix `/` and `-` separators (try `btc/usdt`)".to_owned(),
+        );
     }
     if slash_count > 1 || dash_count > 1 {
-        return Err(format!(
-            "invalid instrument `{value}`; use at most one pair separator (try `btc/usdt`)"
-        ));
+        return Err(
+            "invalid instrument; use at most one pair separator (try `btc/usdt`)".to_owned(),
+        );
     }
 
     let separator = if slash_count == 1 {
@@ -221,17 +224,80 @@ fn split_pair(value: &str) -> Result<(&str, Option<&str>), String> {
     };
 
     if base.is_empty() || quote.is_some_and(str::is_empty) {
-        return Err(format!(
-            "invalid instrument `{value}`; base and quote must be nonempty (try `btc/usdt`)"
-        ));
+        return Err(
+            "invalid instrument; base and quote must be nonempty (try `btc/usdt`)".to_owned(),
+        );
     }
     if !base.bytes().all(|byte| byte.is_ascii_alphanumeric())
         || quote.is_some_and(|quote| !quote.bytes().all(|byte| byte.is_ascii_alphanumeric()))
     {
-        return Err(format!(
-            "invalid instrument `{value}`; components must contain only ASCII letters and digits (try `btc/usdt`)"
-        ));
+        return Err(
+            "invalid instrument; components must contain only ASCII letters and digits (try `btc/usdt`)".to_owned(),
+        );
     }
 
     Ok((base, quote))
+}
+
+fn validate_symbol_lengths(base: &str, quote: Option<&str>) -> Result<(), ()> {
+    if base.len() > MAX_PROVIDER_SYMBOL_LEN
+        || quote.is_some_and(|quote| quote.len() > MAX_PROVIDER_SYMBOL_LEN)
+        || base
+            .len()
+            .checked_add(quote.map_or(DEFAULT_QUOTE.len(), str::len))
+            .is_none_or(|length| length > MAX_PROVIDER_SYMBOL_LEN)
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn invalid_instrument_message() -> String {
+    "invalid instrument; components must be nonempty ASCII letters or digits and the combined symbol must be at most 256 bytes (for example `btc`, `BTCUSDT`, or `binance:btc/usdt`)".to_owned()
+}
+
+fn sanitize_parse_error(error: clap::Error) -> clap::Error {
+    let kind = error.kind();
+    if matches!(kind, ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+        return error;
+    }
+
+    let parser_message = error.source().map(ToString::to_string).unwrap_or_default();
+    let message = match kind {
+        ErrorKind::UnknownArgument => {
+            "unknown argument; use `--help` to list options (for example `--interactive`)"
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation
+            if parser_message.contains("unsupported timeframe") =>
+        {
+            "unsupported timeframe; use one of: 1s, 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M (case-sensitive)"
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation
+            if parser_message.contains("invalid provider") =>
+        {
+            "invalid provider; use nonempty ASCII letters or digits (for example `binance`)"
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation
+            if parser_message.contains("missing instrument") =>
+        {
+            "missing instrument after provider prefix; try `binance:btc`"
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation => {
+            "invalid instrument; use `btc`, `BTCUSDT`, or `binance:btc/usdt`"
+        }
+        ErrorKind::InvalidUtf8 => {
+            "argument is not valid UTF-8; use ASCII instrument and timeframe values"
+        }
+        ErrorKind::MissingRequiredArgument | ErrorKind::TooFewValues => {
+            "missing required arguments <INSTRUMENT> <TIMEFRAME>; use `fccli btc 1m`"
+        }
+        ErrorKind::ArgumentConflict => {
+            "conflicting arguments; use `--help` to list the accepted command form"
+        }
+        ErrorKind::TooManyValues | ErrorKind::WrongNumberOfValues => {
+            "unexpected extra argument; use `fccli btc 1m`"
+        }
+        _ => "invalid command line; use `fccli --help` for accepted arguments",
+    };
+    clap::Error::raw(kind, message)
 }

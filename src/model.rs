@@ -8,6 +8,8 @@ pub const CHART_PRICE_MAX: f64 = f64::MAX / 4.0;
 pub const MIN_TIMESTAMP_MS: i64 = -377_705_116_800_000;
 pub const MAX_TIMESTAMP_MS: i64 = 253_402_300_799_999;
 pub const MAX_HISTORY_LIMIT: u16 = 1_000;
+/// Maximum byte length of a provider-native instrument symbol.
+pub const MAX_PROVIDER_SYMBOL_LEN: usize = 256;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProviderId(String);
@@ -104,7 +106,7 @@ impl Instrument {
         let quote = validate_component(quote.into(), "quote")?;
         let provider_symbol = provider_symbol.into();
         if provider_symbol.is_empty()
-            || provider_symbol.len() > 256
+            || provider_symbol.len() > MAX_PROVIDER_SYMBOL_LEN
             || provider_symbol.chars().any(char::is_control)
         {
             return Err(ModelError::InvalidInstrument);
