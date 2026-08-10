@@ -1218,6 +1218,58 @@ Chunk-10 append-only formatter update (authoritative over the earlier 77-executi
 
 The canonical total is therefore **78 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-78`, accompanied by Main `artifact://2081`. The Main artifact is counted once as the next execution; subagent runs are excluded. Later check, codec-test, `binance_live`, `api_boundaries`, and Clippy outcomes document chain progression only and do not update unrelated ledger records.
 
+Chunk-11 append-only formatter update (authoritative over the earlier 78-execution total and `fmt-exec-78` current-basis statement, which remain preserved as historical accounting; only retained Main chained commands are counted, and subagent runs are excluded):
+
+| Record ID | Attempt/date | Requirement | Status after attempt | Environment | Command/scenario | PASS semantics | Observed result | Evidence | Blocker/next action | Supersedes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| DET-FMT | `attempt-2026-08-10-chunk11-1` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, first chunk-11 chart layout/format tree | `cargo fmt --check` within the retained Main chained command accompanied by `artifact://2115` | exit 0 | PASS; the chain advanced beyond formatting, then Cargo compilation failed with one parse error in `src/chart/format.rs:343` because an unparenthesized `as u32 <` expression was interpreted as generic arguments | The retained Main chain and `artifact://2115` prove the formatter stage exited 0 because execution advanced to the later compilation failure. | — | `attempt-2026-08-10-chunk10-24` |
+| DET-FMT | `attempt-2026-08-10-chunk11-2` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, final corrected chunk-11 chart layout/format tree | `cargo fmt --check` within the retained Main final-success chained command accompanied by `artifact://2118` | exit 0 | PASS; the subsequent Cargo check, all locked all-target tests in both retained feature-mode runs, and final `cargo clippy --locked --all-targets -- -D warnings` passed | The retained Main chain and `artifact://2118` prove the formatter stage exited 0 because the complete later check, test, and Clippy sequence succeeded. | — | `attempt-2026-08-10-chunk11-1` |
+
+| Record ID | True occurrence | Canonical execution identity | Exact invocation/result evidence | Historical rows accounted for |
+|---|---:|---|---|---|
+| DET-FMT | 79 | `fmt-exec-79` | The retained Main command accompanied by `artifact://2115` contains `cargo fmt --check`; the chain reached the later single-error Cargo compilation failure in `src/chart/format.rs:343`, so formatting necessarily exited 0 without diagnostics. | `attempt-2026-08-10-chunk11-1` is the execution row. |
+| DET-FMT | 80 | `fmt-exec-80` | The retained Main command accompanied by `artifact://2118` contains `cargo fmt --check`; the subsequent Cargo check, both locked all-target test runs, and final Clippy stage passed, so formatting necessarily exited 0 without diagnostics. | `attempt-2026-08-10-chunk11-2` is the execution row and supplies current `DET-FMT=PASS`. |
+
+The canonical total is therefore **80 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-80`, accompanied by Main `artifact://2118`. Main artifacts `artifact://2115` and `artifact://2118` are counted once each in true order; subagent runs are excluded. Later compilation, check, test, and Clippy outcomes document chain progression only and do not update unrelated ledger records.
+
+Chunk-11 append-only formatter update (authoritative over the earlier 80-execution total and `fmt-exec-80` current-basis statement, which remain preserved as historical accounting; only retained Main chained commands are counted, and subagent runs are excluded):
+
+| Record ID | Attempt/date | Requirement | Status after attempt | Environment | Command/scenario | PASS semantics | Observed result | Evidence | Blocker/next action | Supersedes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| DET-FMT | `attempt-2026-08-10-chunk11-3` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, next corrected chunk-11 chart layout/format tree | `cargo fmt --check` within the retained Main chained command accompanied by `artifact://2128` | exit 0 | PASS; the chain advanced beyond formatting, then Cargo compilation failed with `E0689` because `low.next_up()` had an ambiguous floating-point type in `src/chart/format.rs:337` | The retained Main chain and `artifact://2128` prove the formatter stage exited 0 because execution advanced to the later compilation failure. | — | `attempt-2026-08-10-chunk11-2` |
+| DET-FMT | `attempt-2026-08-10-chunk11-4` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, final corrected chunk-11 chart layout/format tree | `cargo fmt --check` within the retained Main final-success chained command accompanied by `artifact://2131` | exit 0 | PASS; the subsequent Cargo check, both locked all-target test runs, and final `cargo clippy --locked --all-targets -- -D warnings` stage passed | The retained Main chain and `artifact://2131` prove the formatter stage exited 0 because the complete later check, test, and Clippy sequence succeeded. | — | `attempt-2026-08-10-chunk11-3` |
+
+| Record ID | True occurrence | Canonical execution identity | Exact invocation/result evidence | Historical rows accounted for |
+|---|---:|---|---|---|
+| DET-FMT | 81 | `fmt-exec-81` | The retained Main command accompanied by `artifact://2128` contains `cargo fmt --check`; the chain reached the later single-error Cargo compilation failure `E0689` in `src/chart/format.rs:337`, so formatting necessarily exited 0 without diagnostics. | `attempt-2026-08-10-chunk11-3` is the execution row. |
+| DET-FMT | 82 | `fmt-exec-82` | The retained Main command accompanied by `artifact://2131` contains `cargo fmt --check`; the subsequent Cargo check, both locked all-target test runs, and final Clippy stage passed, so formatting necessarily exited 0 without diagnostics. | `attempt-2026-08-10-chunk11-4` is the execution row and supplies current `DET-FMT=PASS`. |
+
+The canonical total is therefore **82 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-82`, accompanied by Main `artifact://2131`. Main artifacts `artifact://2128` and `artifact://2131` are counted once each in true order; subagent runs are excluded. Later compilation, check, test, and Clippy outcomes document chain progression only and do not update unrelated ledger records.
+
+Chunk-11 append-only formatter update (authoritative over the earlier 82-execution total and `fmt-exec-82` current-basis statement, which remain preserved as historical accounting; only the retained Main chained command is counted, and subagent runs are excluded):
+
+| Record ID | Attempt/date | Requirement | Status after attempt | Environment | Command/scenario | PASS semantics | Observed result | Evidence | Blocker/next action | Supersedes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| DET-FMT | `attempt-2026-08-10-chunk11-5` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, latest corrected chunk-11 chart layout/format tree | `cargo fmt --check` within the retained Main final-success chained command accompanied by `artifact://2143` | exit 0 | PASS; the subsequent Cargo check, both locked all-target test runs, and final `cargo clippy --locked --all-targets -- -D warnings` stage passed | The retained Main chain and `artifact://2143` prove the formatter stage exited 0 because the complete later check, test, and Clippy sequence succeeded. | — | `attempt-2026-08-10-chunk11-4` |
+
+| Record ID | True occurrence | Canonical execution identity | Exact invocation/result evidence | Historical rows accounted for |
+|---|---:|---|---|---|
+| DET-FMT | 83 | `fmt-exec-83` | The retained Main command accompanied by `artifact://2143` contains `cargo fmt --check`; the subsequent Cargo check, both locked all-target test runs, and final Clippy stage passed, so formatting necessarily exited 0 without diagnostics. | `attempt-2026-08-10-chunk11-5` is the execution row and supplies current `DET-FMT=PASS`. |
+
+The canonical total is therefore **83 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-83`, accompanied by Main `artifact://2143`. The Main artifact is counted once as the next execution; subagent runs are excluded. Later check, test, and Clippy outcomes document chain progression only and do not update unrelated ledger records.
+
+Chunk-11 append-only formatter update (authoritative over the earlier 83-execution total and `fmt-exec-83` current-basis statement, which remain preserved as historical accounting; only the retained Main chained command is counted, and subagent runs are excluded):
+
+| Record ID | Attempt/date | Requirement | Status after attempt | Environment | Command/scenario | PASS semantics | Observed result | Evidence | Blocker/next action | Supersedes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| DET-FMT | `attempt-2026-08-10-chunk11-6` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, final corrected chunk-11 chart layout/format tree | `cargo fmt --check` within the retained Main final-success chained command accompanied by `artifact://2156` | exit 0 | PASS; the subsequent Cargo check, both locked all-target test runs, and final `cargo clippy --locked --all-targets -- -D warnings` stage passed | The retained Main chain and `artifact://2156` prove the formatter stage exited 0 because the complete later check, test, and Clippy sequence succeeded. | — | `attempt-2026-08-10-chunk11-5` |
+
+| Record ID | True occurrence | Canonical execution identity | Exact invocation/result evidence | Historical rows accounted for |
+|---|---:|---|---|---|
+| DET-FMT | 84 | `fmt-exec-84` | The retained Main command accompanied by `artifact://2156` contains `cargo fmt --check`; the subsequent Cargo check, both locked all-target test runs, and final Clippy stage passed, so formatting necessarily exited 0 without diagnostics. | `attempt-2026-08-10-chunk11-6` is the execution row and supplies current `DET-FMT=PASS`. |
+
+The canonical total is therefore **84 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-84`, accompanied by Main `artifact://2156`. The Main artifact is counted once as the next execution; subagent runs are excluded. Later check, test, and Clippy outcomes document chain progression only and do not update unrelated ledger records.
+
 The final planned test inventory includes `tests/app_live_contract.rs` and contains no `tests/app_integration.rs`; this is not a precreation requirement. Chunk 2 creates and uses `tests/feature_selection.rs` only for its named feature-selection gates; `tests/app_live_contract.rs` MUST NOT exist before chunk 17, where the real App reducer/sole MarketEvent consumer contract is introduced. The final inventory also contains exactly `tests/terminal_lifecycle.rs` and `tests/api_boundaries.rs` for the other named specialized gates. `terminal_pty` and `transport_api_boundary` are not API/test-target names.
 ### Smoke and delivery references（ledger-only）
 
