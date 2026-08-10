@@ -408,14 +408,20 @@ fn refresh_open_time_and_auto_y(view: &mut ChartViewport, candles: &CandleSeries
 
 #[must_use]
 pub fn auto_y_range(candles: &CandleSeries, range: Range<usize>) -> PriceRange {
-    let Some(visible) = candles.range(range) else {
+    let Some(mut visible) = candles.range(range) else {
         return PriceRange {
             low: -EPSILON_SCALE * 0.5,
             high: EPSILON_SCALE * 0.5,
         };
     };
-    let mut low = f64::INFINITY;
-    let mut high = f64::NEG_INFINITY;
+    let Some(first) = visible.next() else {
+        return PriceRange {
+            low: -EPSILON_SCALE * 0.5,
+            high: EPSILON_SCALE * 0.5,
+        };
+    };
+    let mut low = first.low();
+    let mut high = first.high();
     for candle in visible {
         low = low.min(candle.low());
         high = high.max(candle.high());
@@ -554,7 +560,10 @@ pub fn bounded_zoom_factor(base: f64, steps: usize, limit: f64) -> f64 {
         return 1.0;
     }
     if base < 1.0 {
-        return base.powf(steps as f64);
+        // A shrinking multiplier is bounded by the reciprocal limit just as a growing
+        // multiplier is bounded by `limit`. Clamping the result also prevents an
+        // enormous step count from underflowing to zero and turning zoom into a no-op.
+        return base.powf(steps as f64).max(limit.recip());
     }
 
     let requested = steps as f64;

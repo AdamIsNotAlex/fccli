@@ -817,6 +817,24 @@ Chunk-5 append-only execution update (authoritative over the earlier 17-executio
 
 The canonical total is therefore **19 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-19`, accompanied by `artifact://973`.
 
+Chunk-5 append-only attempt update (authoritative over the earlier attempt history and current-basis statement, which remain preserved as historical accounting):
+
+| Record ID | Attempt/date | Requirement | Status after attempt | Environment | Command/scenario | PASS semantics | Observed result | Evidence | Blocker/next action | Supersedes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| DET-FMT | `attempt-2026-08-10-chunk5-6` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, subsequent corrected chunk-5 chart-state tree | `cargo fmt --check` within the chained command retained with `artifact://1012` | exit 0 | PASS; the `&&` chain continued beyond formatting to the chart-state test, which later failed | The retained chained command and `artifact://1012` prove the formatter stage exited 0 because execution advanced to the later chart-state test failure. | — | `attempt-2026-08-10-chunk5-5` |
+| DET-FMT | `attempt-2026-08-10-chunk5-7` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, next corrected chunk-5 chart-state tree | `cargo fmt --check` within the chained command retained with `artifact://1025` | exit 0 | PASS; the chain continued beyond formatting and its later chart-state test and Cargo-check stages succeeded | The retained chained command and `artifact://1025` prove the formatter stage exited 0 because execution advanced through the later successful test and Cargo-check stages. | — | `attempt-2026-08-10-chunk5-6` |
+| DET-FMT | `attempt-2026-08-10-chunk5-8` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, final observed chunk-5 chart-state tree | `cargo fmt --check` within the final chained command retained with `artifact://1038` | exit 0 | PASS; the `&&` chain continued beyond formatting to a later Cargo compilation failure | The retained final chained command and `artifact://1038` prove the formatter stage exited 0 because execution advanced to the later compile failure. | — | `attempt-2026-08-10-chunk5-7` |
+
+Chunk-5 append-only execution update (authoritative over the earlier 19-execution total and `fmt-exec-19` current-basis statement, which remain preserved as historical accounting):
+
+| Record ID | True occurrence | Canonical execution identity | Exact invocation/result evidence | Historical rows accounted for |
+|---|---:|---|---|---|
+| DET-FMT | 20 | `fmt-exec-20` | The retained command associated with `artifact://1012` is a chunk-5 `&&` chain containing `cargo fmt --check`; because execution advanced to the later chart-state test failure recorded by that artifact, the formatter stage necessarily exited 0. | `attempt-2026-08-10-chunk5-6` is the execution row. |
+| DET-FMT | 21 | `fmt-exec-21` | The retained command associated with `artifact://1025` is a chunk-5 `&&` chain containing `cargo fmt --check`; the artifact records the later chart-state test and Cargo-check stages succeeding, so the formatter stage necessarily exited 0. | `attempt-2026-08-10-chunk5-7` is the execution row. |
+| DET-FMT | 22 | `fmt-exec-22` | The final retained command associated with `artifact://1038` is a chunk-5 `&&` chain containing `cargo fmt --check`; because execution advanced to the later Cargo compilation failure recorded by that artifact, the formatter stage necessarily exited 0. | `attempt-2026-08-10-chunk5-8` is the execution row and supplies current `DET-FMT=PASS`. |
+
+The canonical total is therefore **22 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-22`, accompanied by `artifact://1038`; the later failure does not invalidate the successfully completed formatter stage and does not update any unrelated ledger record.
+
 The final planned test inventory includes `tests/app_live_contract.rs` and contains no `tests/app_integration.rs`; this is not a precreation requirement. Chunk 2 creates and uses `tests/feature_selection.rs` only for its named feature-selection gates; `tests/app_live_contract.rs` MUST NOT exist before chunk 17, where the real App reducer/sole MarketEvent consumer contract is introduced. The final inventory also contains exactly `tests/terminal_lifecycle.rs` and `tests/api_boundaries.rs` for the other named specialized gates. `terminal_pty` and `transport_api_boundary` are not API/test-target names.
 ### Smoke and delivery references（ledger-only）
 

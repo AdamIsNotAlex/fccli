@@ -175,14 +175,29 @@ fn nearest_rounding_uses_ties_away_from_zero_without_mutation_escape_hatch() {
 }
 
 #[test]
-fn repeated_zoom_factor_stops_before_overflow_or_bound_crossing() {
+fn maximum_step_bounded_factor_is_positive_and_reaches_zoom_minima() {
     assert_eq!(bounded_zoom_factor(2.0, 100, 10.0), 8.0);
     assert_eq!(bounded_zoom_factor(1.25, 0, 100.0), 1.0);
     assert_eq!(bounded_zoom_factor(f64::INFINITY, 2, 100.0), 1.0);
     assert_eq!(bounded_zoom_factor(0.0, 2, 100.0), 1.0);
     assert_eq!(bounded_zoom_factor(1.0, usize::MAX, 100.0), 1.0);
-    assert!(bounded_zoom_factor(0.8, usize::MAX, 100.0).is_finite());
-    assert!(bounded_zoom_factor(1.25, usize::MAX, f64::MAX).is_finite());
+
+    let minimum_factor = bounded_zoom_factor(0.8, usize::MAX, f64::MAX);
+    assert!(minimum_factor.is_finite());
+    assert!(minimum_factor > 0.0);
+
+    let x_series = candles(100);
+    let mut x_state = ChartViewState::snapshot(&x_series, 100);
+    x_state.zoom_x_by_factor(&x_series, 100, minimum_factor);
+    assert_eq!(data(&x_state).visible_count(), 10);
+
+    let y_series = series_from(vec![candle(0, 0.0, 0.0)]);
+    let mut y_state = ChartViewState::snapshot(&y_series, 1);
+    y_state.zoom_y_by_factor(minimum_factor);
+    assert_eq!(
+        data(&y_state).y_range().span(),
+        1.0 / ((1_u64 << 40) as f64)
+    );
 }
 
 #[test]
@@ -219,7 +234,7 @@ fn invalid_y_factors_retain_a_finite_valid_range() {
     let range = data(&state).y_range();
     assert!(range.low.is_finite() && range.high.is_finite());
     assert!(range.high > range.low);
-    assert!(range.span() <= 1.10 * (2.0 * CHART_PRICE_MAX));
+    assert_eq!(range.span(), 1.10 * (2.0 * CHART_PRICE_MAX));
 }
 
 #[test]
@@ -391,6 +406,16 @@ fn resize_preserves_exact_center_for_same_width_and_even_odd_shrinks() {
 }
 
 #[test]
+fn auto_y_range_uses_canonical_epsilon_for_empty_and_zero_length_ranges() {
+    let epsilon = 1.0 / ((1_u64 << 40) as f64);
+    let empty = candles(0);
+    assert_eq!(auto_y_range(&empty, 0..0).span(), epsilon);
+
+    let series = series_from(vec![candle(0, 10.0, 20.0)]);
+    assert_eq!(auto_y_range(&series, 0..0).span(), epsilon);
+}
+
+#[test]
 fn auto_y_is_finite_for_empty_flat_subnormal_negative_and_extreme_values() {
     let empty = candles(0);
     assert_eq!(
@@ -426,25 +451,46 @@ fn auto_y_is_finite_for_empty_flat_subnormal_negative_and_extreme_values() {
 }
 
 #[test]
-fn manual_y_operations_remain_finite_at_numeric_bounds() {
-    let series = series_from(vec![candle(0, CHART_PRICE_MAX * 0.99, CHART_PRICE_MAX)]);
-    let mut state = ChartViewState::interactive(&series, 1);
-    for _ in 0..2_000 {
-        state.zoom_y_out();
-        state.pan_y_up();
-    }
-    let view = data(&state);
-    assert!(!view.auto_y());
-    assert!(view.y_range().low.is_finite() && view.y_range().high.is_finite());
-    assert!(view.y_range().high > view.y_range().low);
-    assert!(view.y_range().span() <= 1.10 * (2.0 * CHART_PRICE_MAX));
+fn manual_y_operations_clamp_to_exact_numeric_bounds() {
+    let series = series_from(vec![
+        Candle::from_rest(BASE, BASE + MINUTE - 1, 0.0, 0.5, -0.5, 0.0, 1.0)
+            .expect("symmetric non-flat candle is valid"),
+    ]);
+
+    let mut upper = ChartViewState::interactive(&series, 1);
+    upper.zoom_y_by_factor(f64::MAX);
+    let upper_range = data(&upper).y_range();
+    assert!(!data(&upper).auto_y());
+    assert!(upper_range.low.is_finite() && upper_range.high.is_finite());
+    assert_eq!(upper_range.span(), 1.10 * (2.0 * CHART_PRICE_MAX));
+
+    let mut lower = ChartViewState::interactive(&series, 1);
+    lower.zoom_y_by_factor(f64::MIN_POSITIVE);
+    let lower_range = data(&lower).y_range();
+    assert!(!data(&lower).auto_y());
+    assert!(lower_range.low.is_finite() && lower_range.high.is_finite());
+    assert_eq!(lower_range.span(), 1.0 / ((1_u64 << 40) as f64));
 }
 
 #[test]
-fn public_mutation_methods_reject_invalid_transient_state() {
+fn public_mutation_methods_accept_valid_transients_then_reject_or_clear_invalid_state() {
     let series = candles(20);
     let mut state = ChartViewState::interactive(&series, 10);
-    let valid_time = at(&series, 5).open_time();
+    let valid_time = at(&series, 15).open_time();
+    let valid_hover = CoordinateHover {
+        open_time: valid_time,
+        price: 15.5,
+    };
+    let valid_drag = ActiveDrag {
+        kind: DragKind::Plot,
+        anchor_open_time: Some(valid_time),
+        anchor_price: Some(15.5),
+    };
+
+    state.set_coordinate_hover(&series, Some(valid_hover));
+    assert_eq!(data(&state).coordinate_hover(), Some(valid_hover));
+    state.set_active_drag(&series, Some(valid_drag));
+    assert_eq!(data(&state).active_drag(), Some(valid_drag));
 
     state.set_coordinate_hover(
         &series,
@@ -454,6 +500,7 @@ fn public_mutation_methods_reject_invalid_transient_state() {
         }),
     );
     assert_eq!(data(&state).coordinate_hover(), None);
+    state.set_coordinate_hover(&series, Some(valid_hover));
     state.set_coordinate_hover(
         &series,
         Some(CoordinateHover {
@@ -472,6 +519,7 @@ fn public_mutation_methods_reject_invalid_transient_state() {
         }),
     );
     assert_eq!(data(&state).active_drag(), None);
+    state.set_active_drag(&series, Some(valid_drag));
     state.set_active_drag(
         &series,
         Some(ActiveDrag {
