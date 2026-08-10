@@ -1,5 +1,7 @@
 //! Provider-neutral market-data interfaces and ownership primitives.
 
+pub mod binance;
+
 use futures_util::Stream;
 use std::{
     future::Future,

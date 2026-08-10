@@ -104,11 +104,11 @@ Each chunk is independently reviewable and committable after its definition of d
 
 ### 8. Implement deterministic Binance REST
 
-- [ ] Build private Binance foundations with exact production REST base `https://data-api.binance.vision`, injectable literal-loopback test base, one shared Reqwest client/gate, exact REST timeout/cap, the identifying `fccli` User-Agent, and production constructor boundary.
-- [ ] Implement exact `/api/v3/klines` latest/older/gap queries and checked pagination.
-- [ ] Decode validated 12-element arrays into immutable `RestProvisionalOpen` candles only.
-- [ ] Enforce exact matrix: invalid-symbol HTTP 400 sanitized Binance code/message; every other non-418/non-429 HTTP 4xx (including non-invalid-symbol 400 and 403) maps to the sanitized typed non-retryable HTTP/client-status error; 429 valid `Retry-After` or exact 30 s invalid/missing fallback; 418 valid deadline or absorbing `InvalidBanExpiry`; generic 5xx recoverable status; typed request timeout/transport failure; typed malformed JSON/non-array/wrong-arity/invalid-field/over-budget payload failure.
-- [ ] Add independent local Wiremock cases for every matrix row, including generic non-special 4xx/client status, plus exact endpoint/query, identifying `fccli` User-Agent, isolation, redirects/public-connect negatives, and production-constructor boundary assertions.
+- [x] Build private Binance foundations with exact production REST base `https://data-api.binance.vision`, injectable literal-loopback test base, one shared Reqwest client/gate, exact REST timeout/cap, the identifying `fccli` User-Agent, and production constructor boundary.
+- [x] Implement exact `/api/v3/klines` latest/older/gap queries and checked pagination.
+- [x] Decode validated 12-element arrays into immutable `RestProvisionalOpen` candles only.
+- [x] Enforce exact matrix: invalid-symbol HTTP 400 sanitized Binance code/message; every other non-418/non-429 HTTP 4xx (including non-invalid-symbol 400 and 403) maps to the sanitized typed non-retryable HTTP/client-status error; 429 valid `Retry-After` or exact 30 s invalid/missing fallback; 418 valid deadline or absorbing `InvalidBanExpiry`; generic 5xx recoverable status; typed request timeout/transport failure; typed malformed JSON/non-array/wrong-arity/invalid-field/over-budget payload failure.
+- [x] Add independent local Wiremock cases for every matrix row, including generic non-special 4xx/client status, plus exact endpoint/query, identifying `fccli` User-Agent, isolation, redirects/public-connect negatives, and production-constructor boundary assertions.
 - Definition of done: every matrix row, exact endpoint/query, and identifying `fccli` User-Agent is independently covered; invalid-symbol 400 is distinguished from other 400 responses, generic client status is terminal/non-retryable, and no “original cases” reference is needed.
 
 ### 9. Implement the WebSocket codec and local harness
