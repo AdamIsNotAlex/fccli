@@ -2,6 +2,7 @@ use time::{OffsetDateTime, format_description::FormatItem, macros::format_descri
 
 const MIN_UTC_LABELS: usize = 4;
 const MAX_UTC_LABELS: usize = 8;
+const UTC_LABEL_GAP: usize = 1;
 const SCIENTIFIC_PRECISION_LIMIT: usize = 9;
 const MAX_PRICE_STEP_COARSENINGS: usize =
     ((f64::MAX_EXP - f64::MIN_EXP) as usize + f64::MANTISSA_DIGITS as usize + 1) * 3;
@@ -262,7 +263,136 @@ pub fn format_utc_timestamp(timestamp_ms: i64, format: UtcLabelFormat) -> Option
 }
 
 /// Selects four to eight complete, non-overlapping UTC labels when the axis can
-/// accommodate them. A label that cannot be placed whole is omitted.
+/// accommodate them, accessing only bounded candidate sets of sampled candles.
+/// Labels are packed around their ideal centers with one-cell gaps.
+#[must_use]
+pub fn select_utc_labels_indexed<T, C>(
+    count: usize,
+    mut open_time_at: T,
+    mut center_at: C,
+    axis_x: u16,
+    axis_width: u16,
+) -> Vec<UtcLabel>
+where
+    T: FnMut(usize) -> Option<i64>,
+    C: FnMut(usize) -> Option<u16>,
+{
+    if count == 0 || axis_width == 0 {
+        return Vec::new();
+    }
+    let axis_start = u32::from(axis_x);
+    let axis_end = axis_start + u32::from(axis_width);
+    if axis_end > u32::from(u16::MAX) + 1 {
+        return Vec::new();
+    }
+    let (Some(first_ms), Some(last_ms)) = (open_time_at(0), open_time_at(count - 1)) else {
+        return Vec::new();
+    };
+    let format = utc_label_format(first_ms, last_ms);
+    let sampled_count = MAX_UTC_LABELS.min(count);
+    if sampled_count < MIN_UTC_LABELS {
+        return Vec::new();
+    }
+
+    let mut indices = [0; MAX_UTC_LABELS];
+    let mut centers = [0; MAX_UTC_LABELS];
+    let mut texts: [Option<String>; MAX_UTC_LABELS] = std::array::from_fn(|_| None);
+    let mut widths = [0_u32; MAX_UTC_LABELS];
+    let mut previous_center = None;
+
+    // Sample and format the largest bounded candidate set once. Narrower
+    // selections below are evenly distributed subsets, so both callbacks and
+    // timestamp formatting remain O(1) with a hard maximum of eight.
+    for position in 0..sampled_count {
+        let intervals = sampled_count - 1;
+        let span = count - 1;
+        let index = position * (span / intervals) + position * (span % intervals) / intervals;
+        let timestamp = if index == 0 {
+            Some(first_ms)
+        } else if index == count - 1 {
+            Some(last_ms)
+        } else {
+            open_time_at(index)
+        };
+        let center = center_at(index).map(u32::from);
+        let (Some(timestamp), Some(center)) = (timestamp, center) else {
+            return Vec::new();
+        };
+        if previous_center.is_some_and(|previous| center < previous) {
+            return Vec::new();
+        }
+        let Some(text) = format_utc_timestamp(timestamp, format) else {
+            return Vec::new();
+        };
+        if !text.is_ascii() {
+            return Vec::new();
+        }
+
+        indices[position] = index;
+        centers[position] = center;
+        widths[position] = text.len() as u32;
+        texts[position] = Some(text);
+        previous_center = Some(center);
+    }
+
+    let gap = UTC_LABEL_GAP as u32;
+    let mut selected = [0; MAX_UTC_LABELS];
+    let mut starts = [0; MAX_UTC_LABELS];
+    for candidate_count in (MIN_UTC_LABELS..=sampled_count).rev() {
+        let mut occupied = gap * (candidate_count as u32 - 1);
+        for (position, slot) in selected[..candidate_count].iter_mut().enumerate() {
+            let intervals = candidate_count - 1;
+            let span = sampled_count - 1;
+            *slot = position * (span / intervals) + position * (span % intervals) / intervals;
+            occupied += widths[*slot];
+        }
+        if occupied > u32::from(axis_width) {
+            continue;
+        }
+
+        // Pass one preserves ideal positions while pushing overlaps right.
+        for position in 0..candidate_count {
+            let slot = selected[position];
+            let width = widths[slot];
+            let ideal = centers[slot]
+                .saturating_sub(width / 2)
+                .clamp(axis_start, axis_end - width);
+            starts[position] = if position == 0 {
+                ideal
+            } else {
+                ideal.max(starts[position - 1] + widths[selected[position - 1]] + gap)
+            };
+        }
+
+        // Pass two pulls any overflowing suffix left using each label's actual
+        // width. Aggregate feasibility above guarantees subtraction is safe.
+        let last = candidate_count - 1;
+        starts[last] = starts[last].min(axis_end - widths[selected[last]]);
+        for position in (0..last).rev() {
+            starts[position] =
+                starts[position].min(starts[position + 1] - widths[selected[position]] - gap);
+        }
+
+        let mut labels = Vec::with_capacity(candidate_count);
+        for position in 0..candidate_count {
+            let slot = selected[position];
+            let (Some(x), Some(text)) = (u16::try_from(starts[position]).ok(), texts[slot].take())
+            else {
+                return Vec::new();
+            };
+            labels.push(UtcLabel {
+                candle_index: indices[slot],
+                x,
+                text,
+            });
+        }
+        return labels;
+    }
+
+    Vec::new()
+}
+
+/// Slice adapter for [`select_utc_labels_indexed`].
 #[must_use]
 pub fn select_utc_labels(
     open_times_ms: &[i64],
@@ -270,43 +400,16 @@ pub fn select_utc_labels(
     axis_x: u16,
     axis_width: u16,
 ) -> Vec<UtcLabel> {
-    if open_times_ms.is_empty() || open_times_ms.len() != centers.len() || axis_width == 0 {
+    if open_times_ms.len() != centers.len() {
         return Vec::new();
     }
-    let axis_end = u32::from(axis_x) + u32::from(axis_width);
-    let format = utc_label_format(open_times_ms[0], open_times_ms[open_times_ms.len() - 1]);
-
-    for desired in (MIN_UTC_LABELS..=MAX_UTC_LABELS.min(open_times_ms.len())).rev() {
-        let mut labels = Vec::with_capacity(desired);
-        let mut previous_end = u32::from(axis_x);
-        for position in 0..desired {
-            let index = if desired == 1 {
-                0
-            } else {
-                position * (open_times_ms.len() - 1) / (desired - 1)
-            };
-            let Some(text) = format_utc_timestamp(open_times_ms[index], format) else {
-                continue;
-            };
-            let text_width = u32::try_from(text.len()).unwrap_or(u32::MAX);
-            let center = u32::from(centers[index]);
-            let start = center.saturating_sub(text_width / 2);
-            let end = start.saturating_add(text_width);
-            if start < u32::from(axis_x) || end > axis_end || start < previous_end {
-                continue;
-            }
-            labels.push(UtcLabel {
-                candle_index: index,
-                x: u16::try_from(start).expect("axis coordinates fit u16"),
-                text,
-            });
-            previous_end = end.saturating_add(1);
-        }
-        if labels.len() >= MIN_UTC_LABELS {
-            return labels;
-        }
-    }
-    Vec::new()
+    select_utc_labels_indexed(
+        open_times_ms.len(),
+        |index| open_times_ms.get(index).copied(),
+        |index| centers.get(index).copied(),
+        axis_x,
+        axis_width,
+    )
 }
 
 #[cfg(test)]
@@ -412,12 +515,9 @@ mod tests {
         let centers: Vec<_> = (0..9).map(|index| 5 + index * 12).collect();
         let labels = select_utc_labels(&times, &centers, 0, 110);
         assert!((4..=8).contains(&labels.len()));
-        assert!(
-            labels
-                .windows(2)
-                .all(|pair| u32::from(pair[0].x) + (pair[0].text.len() as u32)
-                    < u32::from(pair[1].x))
-        );
+        assert!(labels.windows(2).all(|pair| {
+            u32::from(pair[0].x) + pair[0].text.len() as u32 <= u32::from(pair[1].x)
+        }));
         assert!(
             labels
                 .iter()
@@ -425,5 +525,159 @@ mod tests {
         );
         assert!(select_utc_labels(&times, &centers, 0, 20).is_empty());
         assert!(select_utc_labels(&[], &[], 0, 100).is_empty());
+    }
+
+    #[test]
+    fn indexed_utc_selection_samples_at_most_eight_candles() {
+        use std::cell::Cell;
+
+        let count = 1_000_000;
+        let time_accesses = Cell::new(0);
+        let center_accesses = Cell::new(0);
+        let labels = select_utc_labels_indexed(
+            count,
+            |index| {
+                time_accesses.set(time_accesses.get() + 1);
+                Some(1_704_164_645_000 + i64::try_from(index).ok()? * 60_000)
+            },
+            |index| {
+                center_accesses.set(center_accesses.get() + 1);
+                let scaled = 5 + index * 100 / (count - 1);
+                u16::try_from(scaled).ok()
+            },
+            0,
+            110,
+        );
+
+        assert!((MIN_UTC_LABELS..=MAX_UTC_LABELS).contains(&labels.len()));
+        assert!(time_accesses.get() <= MAX_UTC_LABELS);
+        assert!(center_accesses.get() <= MAX_UTC_LABELS);
+    }
+
+    #[test]
+    fn slice_utc_selector_is_only_an_indexed_adapter() {
+        let times: Vec<_> = (0..9)
+            .map(|index| 1_704_164_645_000 + index * 60_000)
+            .collect();
+        let centers: Vec<_> = (0..9).map(|index| 5 + index * 12).collect();
+
+        assert_eq!(
+            select_utc_labels(&times, &centers, 0, 110),
+            select_utc_labels_indexed(
+                times.len(),
+                |index| times.get(index).copied(),
+                |index| centers.get(index).copied(),
+                0,
+                110,
+            )
+        );
+        assert!(select_utc_labels(&times, &centers[..8], 0, 110).is_empty());
+    }
+
+    #[test]
+    fn utc_selection_keeps_edge_labels_whole_when_four_fit() {
+        let times: Vec<_> = (0..5)
+            .map(|index| 1_704_164_645_000 + index * 1_000)
+            .collect();
+        let centers = [0, 9, 18, 27, 35];
+        let labels = select_utc_labels(&times, &centers, 0, 36);
+
+        assert_eq!(
+            labels
+                .iter()
+                .map(|label| (label.candle_index, label.x, label.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (0, 0, "03:04:05"),
+                (1, 9, "03:04:06"),
+                (2, 18, "03:04:07"),
+                (4, 28, "03:04:09"),
+            ]
+        );
+    }
+
+    #[test]
+    fn utc_selection_packs_actual_signed_year_widths() {
+        use time::{Date, Month};
+
+        let start = Date::from_calendar_date(-1, Month::January, 1)
+            .expect("supported negative year")
+            .midnight()
+            .assume_utc()
+            .unix_timestamp()
+            * 1_000;
+        let end = Date::from_calendar_date(2_001, Month::January, 1)
+            .expect("supported positive year")
+            .midnight()
+            .assume_utc()
+            .unix_timestamp()
+            * 1_000;
+        let span = end - start;
+        let times: Vec<_> = (0_i64..8).map(|index| start + span * index / 7).collect();
+        let centers: Vec<_> = (0_u16..8).map(|index| 5 + index * 10).collect();
+
+        let labels = select_utc_labels(&times, &centers, 0, 64);
+
+        assert!(labels.len() >= MIN_UTC_LABELS);
+        assert!(labels.iter().any(|label| label.text.starts_with('-')));
+        assert!(labels.iter().any(|label| label.text.len() == 8));
+        assert!(labels.windows(2).all(|pair| {
+            u32::from(pair[0].x) + pair[0].text.len() as u32 + UTC_LABEL_GAP as u32
+                <= u32::from(pair[1].x)
+        }));
+        assert!(
+            labels
+                .iter()
+                .all(|label| { u32::from(label.x) + label.text.len() as u32 <= 64 })
+        );
+    }
+
+    #[test]
+    fn utc_selection_accepts_exclusive_axis_end_65536_and_rejects_overflow() {
+        let times: Vec<_> = (0..5)
+            .map(|index| 1_704_164_645_000 + index * 1_000)
+            .collect();
+        let boundary_centers = [65_500, 65_509, 65_518, 65_527, 65_535];
+        let labels = select_utc_labels(&times, &boundary_centers, 65_500, 36);
+
+        assert_eq!(labels.len(), 4);
+        assert_eq!(labels.first().map(|label| label.x), Some(65_500));
+        assert_eq!(labels.last().map(|label| label.x), Some(65_528));
+        assert!(
+            labels
+                .iter()
+                .all(|label| { u32::from(label.x) + label.text.len() as u32 <= 65_536 })
+        );
+
+        assert!(select_utc_labels(&times, &boundary_centers, 65_535, 2).is_empty());
+        assert!(select_utc_labels(&times, &boundary_centers, 65_535, u16::MAX).is_empty());
+    }
+
+    #[test]
+    fn utc_selection_uses_axis_coordinates_for_nonzero_origins() {
+        let times: Vec<_> = (0..5)
+            .map(|index| 1_704_164_645_000 + index * 1_000)
+            .collect();
+        let centers = [7, 16, 25, 34, 42];
+        let labels = select_utc_labels(&times, &centers, 7, 36);
+
+        assert_eq!(
+            labels
+                .iter()
+                .map(|label| (label.candle_index, label.x, label.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (0, 7, "03:04:05"),
+                (1, 16, "03:04:06"),
+                (2, 25, "03:04:07"),
+                (4, 35, "03:04:09"),
+            ]
+        );
+        assert!(labels.windows(2).all(|pair| {
+            u32::from(pair[0].x) + pair[0].text.len() as u32 <= u32::from(pair[1].x)
+        }));
+        assert!(labels.iter().all(|label| {
+            u32::from(label.x) >= 7 && u32::from(label.x) + label.text.len() as u32 <= 43
+        }));
     }
 }
