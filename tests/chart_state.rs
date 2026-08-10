@@ -239,6 +239,13 @@ fn maximum_step_bounded_factor_is_positive_and_reaches_zoom_minima() {
     assert_eq!(bounded_zoom_factor(1.0, usize::MAX, 100.0), 1.0);
     assert_eq!(bounded_zoom_factor(0.5, 4, 10.0), 0.125);
     assert_eq!(bounded_zoom_factor(0.5, usize::MAX, 10.0), 0.125);
+    let maximum_factor = 2.0_f64.powi(1023);
+    for steps in [1024, usize::MAX] {
+        let factor = bounded_zoom_factor(2.0, steps, f64::MAX);
+        assert!(factor.is_finite(), "steps={steps}");
+        assert!(factor > 0.0, "steps={steps}");
+        assert_eq!(factor, maximum_factor, "steps={steps}");
+    }
 
     let minimum_factor = bounded_zoom_factor(0.8, usize::MAX, f64::MAX);
     assert!(minimum_factor.is_finite());

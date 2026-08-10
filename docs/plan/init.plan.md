@@ -865,6 +865,18 @@ Chunk-5 append-only outcome correction for `attempt-2026-08-10-chunk5-9` / `fmt-
 
 The canonical total remains **23 `DET-FMT` executions**. Current `DET-FMT=PASS` continues to rely on `fmt-exec-23`, accompanied by `artifact://1060`; this append-only correction changes only the recorded post-formatter outcomes.
 
+Chunk-5 append-only formatter update (authoritative over the earlier 23-execution total and `fmt-exec-23` current-basis statement, which remain preserved as historical accounting):
+
+| Record ID | Attempt/date | Requirement | Status after attempt | Environment | Command/scenario | PASS semantics | Observed result | Evidence | Blocker/next action | Supersedes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| DET-FMT | `attempt-2026-08-10-chunk5-10` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, latest corrected chunk-5 chart-state tree | `cargo fmt --check` within the retained chained command accompanied by `artifact://1119` | exit 0 | PASS; the chain advanced beyond formatting, the subsequent Cargo check passed, all 22 chart-state tests passed, and the final Clippy gate passed | The retained chained invocation and `artifact://1119` prove the formatter stage exited 0 because execution advanced beyond it; rustfmt emitted no diagnostics. The artifact records the subsequent check, 22 passing chart-state tests, and final Clippy success. | — | `attempt-2026-08-10-chunk5-9` |
+
+| Record ID | True occurrence | Canonical execution identity | Exact invocation/result evidence | Historical rows accounted for |
+|---|---:|---|---|---|
+| DET-FMT | 24 | `fmt-exec-24` | The retained command accompanied by `artifact://1119` contains `cargo fmt --check`; the artifact records the subsequent Cargo check passing, all 22 chart-state tests passing, and the final `cargo clippy --locked --all-targets -- -D warnings` passing, so the formatter stage necessarily exited 0 without diagnostics. | `attempt-2026-08-10-chunk5-10` is the execution row and supplies current `DET-FMT=PASS`. |
+
+The canonical total is therefore **24 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-24`, accompanied by `artifact://1119`; the artifact's later check, chart-state test, and Clippy executions do not update unrelated ledger records because their commands and scopes do not exactly match those records.
+
 The final planned test inventory includes `tests/app_live_contract.rs` and contains no `tests/app_integration.rs`; this is not a precreation requirement. Chunk 2 creates and uses `tests/feature_selection.rs` only for its named feature-selection gates; `tests/app_live_contract.rs` MUST NOT exist before chunk 17, where the real App reducer/sole MarketEvent consumer contract is introduced. The final inventory also contains exactly `tests/terminal_lifecycle.rs` and `tests/api_boundaries.rs` for the other named specialized gates. `terminal_pty` and `transport_api_boundary` are not API/test-target names.
 ### Smoke and delivery references（ledger-only）
 

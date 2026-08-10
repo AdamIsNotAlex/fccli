@@ -578,15 +578,45 @@ pub fn bounded_zoom_factor(base: f64, steps: usize, limit: f64) -> f64 {
         return factor;
     }
 
-    let requested = steps as f64;
-    let maximum_steps = (limit.ln() / base.ln()).floor().max(0.0);
-    let applied_steps = requested.min(maximum_steps);
-    let mut factor = base.powf(applied_steps);
-    while factor > limit {
-        factor /= base;
+    let power_within_limit = |mut exponent: usize| {
+        let mut result = 1.0;
+        let mut power = base;
+        let mut power_exceeds_limit = false;
+
+        while exponent != 0 {
+            if exponent & 1 == 1 {
+                if power_exceeds_limit || result > limit / power {
+                    return None;
+                }
+                result *= power;
+                if !result.is_finite() || result > limit {
+                    return None;
+                }
+            }
+
+            exponent >>= 1;
+            if exponent != 0 {
+                if power_exceeds_limit || power > limit / power {
+                    power_exceeds_limit = true;
+                } else {
+                    power *= power;
+                }
+            }
+        }
+
+        Some(result)
+    };
+
+    let mut lower = 0;
+    let mut upper = steps;
+    while lower < upper {
+        let middle = lower + (upper - lower).div_ceil(2);
+        if power_within_limit(middle).is_some() {
+            lower = middle;
+        } else {
+            upper = middle - 1;
+        }
     }
-    while applied_steps < requested && factor <= limit / base {
-        factor *= base;
-    }
-    factor
+
+    power_within_limit(lower).unwrap_or(1.0)
 }
