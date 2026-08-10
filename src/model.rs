@@ -605,34 +605,6 @@ pub enum RateGateState {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ReconcileBatch {
-    candles: Vec<Candle>,
-}
-
-impl ReconcileBatch {
-    pub fn new(candles: Vec<Candle>) -> Result<Self, ModelError> {
-        validate_limit(u16::try_from(candles.len()).unwrap_or(u16::MAX))?;
-        Ok(Self { candles })
-    }
-
-    pub fn candles(&self) -> &[Candle] {
-        &self.candles
-    }
-
-    pub fn into_candles(self) -> Vec<Candle> {
-        self.candles
-    }
-
-    pub fn len(&self) -> usize {
-        self.candles.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.candles.is_empty()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub enum MarketEvent {
     Status {
         generation: Option<GapGeneration>,
@@ -642,7 +614,7 @@ pub enum MarketEvent {
         generation: GapGeneration,
         revision: ReplayRevision,
         target_open_time: i64,
-        candles: ReconcileBatch,
+        candles: Vec<Candle>,
     },
     Candle {
         generation: GapGeneration,

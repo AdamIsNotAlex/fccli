@@ -1,12 +1,14 @@
 use std::str::FromStr;
 
 use fccli::{
-    error::{ErrorContext, ModelError, ProviderError, SanitizedCause, SanitizedMessage},
+    error::{
+        ErrorContext, ErrorOperation, ModelError, ProviderError, SanitizedCause, SanitizedMessage,
+    },
     model::{
         CHART_PRICE_MAX, Candle, ConnectionStatus, FinalityAuthority, GapGeneration,
         HistoryRequest, HistoryRequestKind, Instrument, InstrumentSpec, MAX_HISTORY_LIMIT,
         MAX_TIMESTAMP_MS, MIN_TIMESTAMP_MS, Market, MarketEvent, MonoInstant, ProviderId,
-        RateGateState, ReconcileBatch, ReplayRevision, Timeframe,
+        RateGateState, ReplayRevision, Timeframe,
     },
 };
 
@@ -293,7 +295,7 @@ fn monotonic_deadline_and_event_values_preserve_exact_tags_and_payloads() {
             generation,
             revision,
             target_open_time: item.open_time(),
-            candles: ReconcileBatch::new(vec![item.clone()]).expect("bounded nonempty batch"),
+            candles: vec![item.clone()],
         },
         MarketEvent::Candle {
             generation,
@@ -302,7 +304,7 @@ fn monotonic_deadline_and_event_values_preserve_exact_tags_and_payloads() {
         MarketEvent::RecoverableError {
             generation: Some(generation),
             error: ProviderError::RateLimited {
-                context: ErrorContext::operation("history"),
+                context: ErrorContext::operation(ErrorOperation::History),
                 status: 429,
             },
             rate_gate_deadline: Some(deadline),
@@ -317,9 +319,15 @@ fn monotonic_deadline_and_event_values_preserve_exact_tags_and_payloads() {
             status: ConnectionStatus::GapSync
         }
     ));
-    assert!(
-        matches!(&events[1], MarketEvent::ReconcileBatch { generation: GapGeneration(7), revision: ReplayRevision(11), target_open_time: 1_700_000_000_000, candles } if candles.candles() == std::slice::from_ref(&item) && candles.len() == 1 && !candles.is_empty())
-    );
+    assert!(matches!(
+        &events[1],
+        MarketEvent::ReconcileBatch {
+            generation: GapGeneration(7),
+            revision: ReplayRevision(11),
+            target_open_time: 1_700_000_000_000,
+            candles,
+        } if candles == std::slice::from_ref(&item)
+    ));
     assert!(matches!(
         &events[2],
         MarketEvent::Candle {
@@ -337,38 +345,30 @@ fn monotonic_deadline_and_event_values_preserve_exact_tags_and_payloads() {
 }
 
 #[test]
-fn reconcile_batches_reject_empty_and_oversized_payloads() {
-    assert_eq!(
-        ReconcileBatch::new(Vec::new()),
-        Err(ModelError::InvalidLimit { limit: 0 })
-    );
+fn typed_errors_never_retain_untrusted_context_or_provider_messages() {
+    let provider = ProviderId::new("binance").expect("validated provider");
+    let instrument = Instrument::new(provider, Market::Spot, "BTC", "USDT", "BTCUSDT")
+        .expect("validated instrument");
+    let context = ErrorContext::operation(ErrorOperation::WebSocket)
+        .with_market(&instrument, Timeframe::Minute1);
 
-    let oversized =
-        vec![candle(FinalityAuthority::WsAuthoritativeOpen); usize::from(MAX_HISTORY_LIMIT) + 1];
-    assert!(matches!(
-        ReconcileBatch::new(oversized),
-        Err(ModelError::InvalidLimit { .. })
-    ));
-}
-
-#[test]
-fn typed_errors_redact_malicious_context_and_provider_messages_in_display_and_debug() {
     let malicious = [
         "https://user:secret@example.invalid/private?token=secret",
         "Authorization: Bearer top-secret",
         "X-API-Key=top-secret",
         "unknown provider payload top-secret\n\r\u{1b}[31m\u{202e}",
+        "api_key_ABC123",
+        "Basic dXNlcjpwYXNz",
     ];
 
     for raw in malicious {
-        let context = ErrorContext::operation(raw).with_market(raw, raw, raw);
         let invalid_symbol = ProviderError::InvalidSymbol {
             context: context.clone(),
             code: -1121,
             message: SanitizedMessage::new(raw),
         };
         let client_status = ProviderError::ClientStatus {
-            context,
+            context: context.clone(),
             status: 400,
             code: Some(-1),
             message: Some(SanitizedMessage::new(raw)),
@@ -384,6 +384,8 @@ fn typed_errors_redact_malicious_context_and_provider_messages_in_display_and_de
                 assert!(!rendered.contains("token=secret"));
                 assert!(!rendered.contains("Authorization"));
                 assert!(!rendered.contains("X-API-Key"));
+                assert!(!rendered.contains("api_key_ABC123"));
+                assert!(!rendered.contains("Basic dXNlcjpwYXNz"));
                 assert!(!rendered.contains('\n'));
                 assert!(!rendered.contains('\r'));
                 assert!(!rendered.contains('\u{1b}'));
@@ -392,12 +394,22 @@ fn typed_errors_redact_malicious_context_and_provider_messages_in_display_and_de
         }
     }
 
+    assert_eq!(
+        ProviderId::new("api_key_ABC123"),
+        Err(ModelError::InvalidProvider)
+    );
+    assert_eq!(
+        ProviderId::new("Basic dXNlcjpwYXNz"),
+        Err(ModelError::InvalidProvider)
+    );
+
     let transport = ProviderError::Transport {
-        context: ErrorContext::operation("websocket").with_market("binance", "BTCUSDT", "1m"),
+        context,
         cause: SanitizedCause::Connection,
     };
     assert!(transport.to_string().contains("binance"));
-    assert!(format!("{transport:?}").contains("BTCUSDT"));
+    assert!(transport.to_string().contains("BTC/USDT"));
+    assert!(format!("{transport:?}").contains("Minute1"));
 }
 
 #[test]

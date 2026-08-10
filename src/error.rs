@@ -6,34 +6,69 @@
 
 use std::{error::Error, fmt};
 
-use crate::model::{GapGeneration, ReplayRevision};
+use crate::model::{GapGeneration, Instrument, ProviderId, ReplayRevision, Timeframe};
 
-const CONTEXT_MAX_CHARS: usize = 64;
-const REDACTED: &str = "[redacted]";
+/// Closed names for provider operations that may be rendered in errors.
+///
+/// Keeping this list closed prevents request data, headers, credentials, URLs, or provider
+/// payloads from being retained as an operation label.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorOperation {
+    History,
+    Rest,
+    WebSocket,
+    LiveFeed,
+    Reconciliation,
+    Channel,
+}
+
+impl fmt::Display for ErrorOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::History => "history",
+            Self::Rest => "REST",
+            Self::WebSocket => "websocket",
+            Self::LiveFeed => "live feed",
+            Self::Reconciliation => "reconciliation",
+            Self::Channel => "channel",
+        })
+    }
+}
 
 /// Stable context attached to provider failures without retaining untrusted provider text.
+///
+/// Every stored value is either a closed enum or derived from validated domain types. Fields
+/// remain private so callers cannot bypass that construction boundary.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ErrorContext {
-    provider: Option<ContextValue>,
-    symbol: Option<ContextValue>,
-    timeframe: Option<ContextValue>,
-    operation: ContextValue,
+    provider: Option<ProviderId>,
+    instrument: Option<String>,
+    timeframe: Option<Timeframe>,
+    operation: ErrorOperation,
 }
 
 impl ErrorContext {
-    pub fn operation(operation: &str) -> Self {
+    #[must_use]
+    pub const fn operation(operation: ErrorOperation) -> Self {
         Self {
             provider: None,
-            symbol: None,
+            instrument: None,
             timeframe: None,
-            operation: ContextValue::new(operation),
+            operation,
         }
     }
 
-    pub fn with_market(mut self, provider: &str, symbol: &str, timeframe: &str) -> Self {
-        self.provider = Some(ContextValue::new(provider));
-        self.symbol = Some(ContextValue::new(symbol));
-        self.timeframe = Some(ContextValue::new(timeframe));
+    #[must_use]
+    pub fn with_provider(mut self, provider: &ProviderId) -> Self {
+        self.provider = Some(provider.clone());
+        self
+    }
+
+    #[must_use]
+    pub fn with_market(mut self, instrument: &Instrument, timeframe: Timeframe) -> Self {
+        self.provider = Some(instrument.provider().clone());
+        self.instrument = Some(instrument.display_pair().to_owned());
+        self.timeframe = Some(timeframe);
         self
     }
 }
@@ -42,7 +77,7 @@ impl fmt::Debug for ErrorContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ErrorContext")
             .field("provider", &self.provider)
-            .field("symbol", &self.symbol)
+            .field("instrument", &self.instrument)
             .field("timeframe", &self.timeframe)
             .field("operation", &self.operation)
             .finish()
@@ -55,102 +90,14 @@ impl fmt::Display for ErrorContext {
         if let Some(provider) = &self.provider {
             write!(f, ", provider {provider}")?;
         }
-        if let Some(symbol) = &self.symbol {
-            write!(f, ", symbol {symbol}")?;
+        if let Some(instrument) = &self.instrument {
+            write!(f, ", instrument {instrument}")?;
         }
-        if let Some(timeframe) = &self.timeframe {
+        if let Some(timeframe) = self.timeframe {
             write!(f, ", timeframe {timeframe}")?;
         }
         Ok(())
     }
-}
-
-#[derive(Clone, Eq, PartialEq)]
-struct ContextValue(String);
-
-impl ContextValue {
-    fn new(value: &str) -> Self {
-        Self(sanitize_context(value))
-    }
-}
-
-impl fmt::Debug for ContextValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("ContextValue").field(&self.0).finish()
-    }
-}
-
-impl fmt::Display for ContextValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-fn sanitize_context(value: &str) -> String {
-    if looks_sensitive(value) {
-        return REDACTED.to_owned();
-    }
-
-    let mut clean = String::with_capacity(value.len().min(CONTEXT_MAX_CHARS));
-    for (count, character) in value.chars().enumerate() {
-        if count == CONTEXT_MAX_CHARS {
-            break;
-        }
-        if is_unsafe_format_character(character) {
-            clean.push(' ');
-        } else if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/') {
-            clean.push(character);
-        } else {
-            clean.push('_');
-        }
-    }
-
-    let clean = clean.trim().to_owned();
-    if clean.is_empty() {
-        "unknown".to_owned()
-    } else {
-        clean
-    }
-}
-
-fn looks_sensitive(value: &str) -> bool {
-    let lower: String = value
-        .chars()
-        .take(CONTEXT_MAX_CHARS)
-        .flat_map(char::to_lowercase)
-        .collect();
-    value.contains("://")
-        || value.contains('@')
-        || value.contains('?')
-        || value.contains('=')
-        || [
-            "authorization",
-            "proxy-authorization",
-            "api-key",
-            "apikey",
-            "bearer ",
-            "cookie",
-            "credential",
-            "password",
-            "secret",
-            "token",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
-}
-
-fn is_unsafe_format_character(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{2028}'
-                | '\u{2029}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
 }
 
 /// A stable provider-message category. Raw provider text is never retained.
