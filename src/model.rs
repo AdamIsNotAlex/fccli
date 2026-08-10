@@ -45,9 +45,9 @@ pub enum Market {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstrumentSpec {
-    pub provider: ProviderId,
-    pub base: String,
-    pub quote: Option<String>,
+    provider: ProviderId,
+    base: String,
+    quote: Option<String>,
 }
 
 impl InstrumentSpec {
@@ -66,16 +66,28 @@ impl InstrumentSpec {
             quote,
         })
     }
+
+    pub const fn provider(&self) -> &ProviderId {
+        &self.provider
+    }
+
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    pub fn quote(&self) -> Option<&str> {
+        self.quote.as_deref()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Instrument {
-    pub provider: ProviderId,
-    pub market: Market,
-    pub base: String,
-    pub quote: String,
-    pub display_pair: String,
-    pub provider_symbol: String,
+    provider: ProviderId,
+    market: Market,
+    base: String,
+    quote: String,
+    display_pair: String,
+    provider_symbol: String,
 }
 
 impl Instrument {
@@ -90,9 +102,8 @@ impl Instrument {
         let quote = validate_component(quote.into(), "quote")?;
         let provider_symbol = provider_symbol.into();
         if provider_symbol.is_empty()
-            || !provider_symbol
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric())
+            || provider_symbol.len() > 256
+            || provider_symbol.chars().any(char::is_control)
         {
             return Err(ModelError::InvalidInstrument);
         }
@@ -105,6 +116,30 @@ impl Instrument {
             display_pair,
             provider_symbol,
         })
+    }
+
+    pub const fn provider(&self) -> &ProviderId {
+        &self.provider
+    }
+
+    pub const fn market(&self) -> Market {
+        self.market
+    }
+
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    pub fn quote(&self) -> &str {
+        &self.quote
+    }
+
+    pub fn display_pair(&self) -> &str {
+        &self.display_pair
+    }
+
+    pub fn provider_symbol(&self) -> &str {
+        &self.provider_symbol
     }
 }
 
@@ -295,19 +330,69 @@ impl FinalityAuthority {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Candle {
-    pub open_time: i64,
-    pub close_time: i64,
-    pub open: f64,
-    pub high: f64,
-    pub low: f64,
-    pub close: f64,
-    pub base_volume: f64,
-    pub authority: FinalityAuthority,
+    open_time: UnixMillis,
+    close_time: UnixMillis,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    base_volume: f64,
+    authority: FinalityAuthority,
 }
 
 impl Candle {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn from_rest(
+        open_time: i64,
+        close_time: i64,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        base_volume: f64,
+    ) -> Result<Self, ModelError> {
+        Self::validated(
+            open_time,
+            close_time,
+            open,
+            high,
+            low,
+            close,
+            base_volume,
+            FinalityAuthority::RestProvisionalOpen,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_ws(
+        open_time: i64,
+        close_time: i64,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        base_volume: f64,
+        is_closed: bool,
+    ) -> Result<Self, ModelError> {
+        let authority = if is_closed {
+            FinalityAuthority::WsAuthoritativeClosed
+        } else {
+            FinalityAuthority::WsAuthoritativeOpen
+        };
+        Self::validated(
+            open_time,
+            close_time,
+            open,
+            high,
+            low,
+            close,
+            base_volume,
+            authority,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validated(
         open_time: i64,
         close_time: i64,
         open: f64,
@@ -317,8 +402,8 @@ impl Candle {
         base_volume: f64,
         authority: FinalityAuthority,
     ) -> Result<Self, ModelError> {
-        validate_timestamp(open_time)?;
-        validate_timestamp(close_time)?;
+        let open_time = UnixMillis::new(open_time)?;
+        let close_time = UnixMillis::new(close_time)?;
         if open_time > close_time {
             return Err(ModelError::InvalidTimestampOrder);
         }
@@ -361,6 +446,31 @@ impl Candle {
         })
     }
 
+    pub const fn open_time(&self) -> i64 {
+        self.open_time.get()
+    }
+    pub const fn close_time(&self) -> i64 {
+        self.close_time.get()
+    }
+    pub const fn open(&self) -> f64 {
+        self.open
+    }
+    pub const fn high(&self) -> f64 {
+        self.high
+    }
+    pub const fn low(&self) -> f64 {
+        self.low
+    }
+    pub const fn close(&self) -> f64 {
+        self.close
+    }
+    pub const fn base_volume(&self) -> f64 {
+        self.base_volume
+    }
+    pub const fn authority(&self) -> FinalityAuthority {
+        self.authority
+    }
+
     pub const fn is_closed(&self) -> bool {
         self.authority.is_closed()
     }
@@ -374,48 +484,83 @@ pub enum HistoryRequestKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryBounds {
+    Latest,
+    Older {
+        end_time: UnixMillis,
+    },
+    Gap {
+        start_time: UnixMillis,
+        end_time: UnixMillis,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HistoryRequest {
-    pub kind: HistoryRequestKind,
-    pub start_time: Option<i64>,
-    pub end_time: Option<i64>,
-    pub limit: u16,
+    bounds: HistoryBounds,
+    limit: u16,
 }
 
 impl HistoryRequest {
     pub fn latest(limit: u16) -> Result<Self, ModelError> {
         validate_limit(limit)?;
         Ok(Self {
-            kind: HistoryRequestKind::Latest,
-            start_time: None,
-            end_time: None,
+            bounds: HistoryBounds::Latest,
             limit,
         })
     }
 
     pub fn older(oldest_open_time: i64, limit: u16) -> Result<Self, ModelError> {
         validate_limit(limit)?;
-        let end_time = checked_timestamp_sub(oldest_open_time, 1)?;
+        let end_time = UnixMillis::new(checked_timestamp_sub(oldest_open_time, 1)?)?;
         Ok(Self {
-            kind: HistoryRequestKind::Older,
-            start_time: None,
-            end_time: Some(end_time),
+            bounds: HistoryBounds::Older { end_time },
             limit,
         })
     }
 
     pub fn gap(start_time: i64, end_time: i64, limit: u16) -> Result<Self, ModelError> {
         validate_limit(limit)?;
-        validate_timestamp(start_time)?;
-        validate_timestamp(end_time)?;
+        let start_time = UnixMillis::new(start_time)?;
+        let end_time = UnixMillis::new(end_time)?;
         if start_time > end_time {
             return Err(ModelError::InvalidRange);
         }
         Ok(Self {
-            kind: HistoryRequestKind::Gap,
-            start_time: Some(start_time),
-            end_time: Some(end_time),
+            bounds: HistoryBounds::Gap {
+                start_time,
+                end_time,
+            },
             limit,
         })
+    }
+
+    pub const fn kind(self) -> HistoryRequestKind {
+        match self.bounds {
+            HistoryBounds::Latest => HistoryRequestKind::Latest,
+            HistoryBounds::Older { .. } => HistoryRequestKind::Older,
+            HistoryBounds::Gap { .. } => HistoryRequestKind::Gap,
+        }
+    }
+
+    pub const fn start_time(self) -> Option<i64> {
+        match self.bounds {
+            HistoryBounds::Gap { start_time, .. } => Some(start_time.get()),
+            HistoryBounds::Latest | HistoryBounds::Older { .. } => None,
+        }
+    }
+
+    pub const fn end_time(self) -> Option<i64> {
+        match self.bounds {
+            HistoryBounds::Older { end_time } | HistoryBounds::Gap { end_time, .. } => {
+                Some(end_time.get())
+            }
+            HistoryBounds::Latest => None,
+        }
+    }
+
+    pub const fn limit(self) -> u16 {
+        self.limit
     }
 
     pub fn next_inclusive_start(last_returned_open_time: i64) -> Result<i64, ModelError> {
@@ -460,6 +605,34 @@ pub enum RateGateState {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ReconcileBatch {
+    candles: Vec<Candle>,
+}
+
+impl ReconcileBatch {
+    pub fn new(candles: Vec<Candle>) -> Result<Self, ModelError> {
+        validate_limit(u16::try_from(candles.len()).unwrap_or(u16::MAX))?;
+        Ok(Self { candles })
+    }
+
+    pub fn candles(&self) -> &[Candle] {
+        &self.candles
+    }
+
+    pub fn into_candles(self) -> Vec<Candle> {
+        self.candles
+    }
+
+    pub fn len(&self) -> usize {
+        self.candles.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.candles.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum MarketEvent {
     Status {
         generation: Option<GapGeneration>,
@@ -469,7 +642,7 @@ pub enum MarketEvent {
         generation: GapGeneration,
         revision: ReplayRevision,
         target_open_time: i64,
-        candles: Vec<Candle>,
+        candles: ReconcileBatch,
     },
     Candle {
         generation: GapGeneration,

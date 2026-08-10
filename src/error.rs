@@ -6,37 +6,46 @@
 
 use std::{error::Error, fmt};
 
-/// Stable context attached to provider failures without depending on provider implementations.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+use crate::model::{GapGeneration, ReplayRevision};
+
+const CONTEXT_MAX_CHARS: usize = 64;
+const REDACTED: &str = "[redacted]";
+
+/// Stable context attached to provider failures without retaining untrusted provider text.
+#[derive(Clone, Eq, PartialEq)]
 pub struct ErrorContext {
-    pub provider: Option<String>,
-    pub symbol: Option<String>,
-    pub timeframe: Option<String>,
-    pub operation: &'static str,
+    provider: Option<ContextValue>,
+    symbol: Option<ContextValue>,
+    timeframe: Option<ContextValue>,
+    operation: ContextValue,
 }
 
 impl ErrorContext {
-    #[must_use]
-    pub const fn operation(operation: &'static str) -> Self {
+    pub fn operation(operation: &str) -> Self {
         Self {
             provider: None,
             symbol: None,
             timeframe: None,
-            operation,
+            operation: ContextValue::new(operation),
         }
     }
 
-    #[must_use]
-    pub fn with_market(
-        mut self,
-        provider: impl Into<String>,
-        symbol: impl Into<String>,
-        timeframe: impl Into<String>,
-    ) -> Self {
-        self.provider = Some(provider.into());
-        self.symbol = Some(symbol.into());
-        self.timeframe = Some(timeframe.into());
+    pub fn with_market(mut self, provider: &str, symbol: &str, timeframe: &str) -> Self {
+        self.provider = Some(ContextValue::new(provider));
+        self.symbol = Some(ContextValue::new(symbol));
+        self.timeframe = Some(ContextValue::new(timeframe));
         self
+    }
+}
+
+impl fmt::Debug for ErrorContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ErrorContext")
+            .field("provider", &self.provider)
+            .field("symbol", &self.symbol)
+            .field("timeframe", &self.timeframe)
+            .field("operation", &self.operation)
+            .finish()
     }
 }
 
@@ -56,38 +65,140 @@ impl fmt::Display for ErrorContext {
     }
 }
 
-/// A bounded, single-line message safe to present to users.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SanitizedMessage(String);
+#[derive(Clone, Eq, PartialEq)]
+struct ContextValue(String);
+
+impl ContextValue {
+    fn new(value: &str) -> Self {
+        Self(sanitize_context(value))
+    }
+}
+
+impl fmt::Debug for ContextValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ContextValue").field(&self.0).finish()
+    }
+}
+
+impl fmt::Display for ContextValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+fn sanitize_context(value: &str) -> String {
+    if looks_sensitive(value) {
+        return REDACTED.to_owned();
+    }
+
+    let mut clean = String::with_capacity(value.len().min(CONTEXT_MAX_CHARS));
+    for (count, character) in value.chars().enumerate() {
+        if count == CONTEXT_MAX_CHARS {
+            break;
+        }
+        if is_unsafe_format_character(character) {
+            clean.push(' ');
+        } else if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/') {
+            clean.push(character);
+        } else {
+            clean.push('_');
+        }
+    }
+
+    let clean = clean.trim().to_owned();
+    if clean.is_empty() {
+        "unknown".to_owned()
+    } else {
+        clean
+    }
+}
+
+fn looks_sensitive(value: &str) -> bool {
+    let lower: String = value
+        .chars()
+        .take(CONTEXT_MAX_CHARS)
+        .flat_map(char::to_lowercase)
+        .collect();
+    value.contains("://")
+        || value.contains('@')
+        || value.contains('?')
+        || value.contains('=')
+        || [
+            "authorization",
+            "proxy-authorization",
+            "api-key",
+            "apikey",
+            "bearer ",
+            "cookie",
+            "credential",
+            "password",
+            "secret",
+            "token",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+fn is_unsafe_format_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// A stable provider-message category. Raw provider text is never retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SanitizedMessage {
+    InvalidSymbol,
+    TooManyRequests,
+    IpBanned,
+    ServiceUnavailable,
+    Redacted,
+}
 
 impl SanitizedMessage {
-    pub const MAX_CHARS: usize = 256;
-
     #[must_use]
     pub fn new(message: &str) -> Self {
-        let mut clean = String::with_capacity(message.len().min(Self::MAX_CHARS));
-        for (index, character) in message.chars().enumerate() {
-            if index == Self::MAX_CHARS {
-                break;
-            }
-            clean.push(if character.is_control() {
-                ' '
-            } else {
-                character
-            });
+        let lower: String = message
+            .chars()
+            .take(256)
+            .flat_map(char::to_lowercase)
+            .collect();
+        if lower.contains("invalid symbol") {
+            Self::InvalidSymbol
+        } else if lower.contains("too many requests") {
+            Self::TooManyRequests
+        } else if lower.contains("ip banned") || lower.contains("ip has been banned") {
+            Self::IpBanned
+        } else if lower.contains("service unavailable") {
+            Self::ServiceUnavailable
+        } else {
+            Self::Redacted
         }
-        Self(clean.trim().to_owned())
     }
 
     #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidSymbol => "invalid symbol",
+            Self::TooManyRequests => "too many requests",
+            Self::IpBanned => "IP banned",
+            Self::ServiceUnavailable => "service unavailable",
+            Self::Redacted => "provider message redacted",
+        }
     }
 }
 
 impl fmt::Display for SanitizedMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.as_str())
     }
 }
 
@@ -175,7 +286,6 @@ pub enum PayloadError {
 pub enum TimeoutKind {
     Request,
     FirstKline,
-    ReconcileAck,
     StalledWrite,
     ProducerJoin,
     HistoryJoin,
@@ -186,7 +296,6 @@ impl fmt::Display for TimeoutKind {
         f.write_str(match self {
             Self::Request => "request",
             Self::FirstKline => "first kline",
-            Self::ReconcileAck => "reconciliation acknowledgement",
             Self::StalledWrite => "stalled write",
             Self::ProducerJoin => "producer join",
             Self::HistoryJoin => "history join",
@@ -286,8 +395,14 @@ pub enum ProviderError {
         target_open_time: i64,
         last_open_time: Option<i64>,
     },
-    #[error("reconciliation acknowledgement timed out")]
-    ReconcileAckTimeout,
+    #[error(
+        "reconciliation acknowledgement timed out for generation {generation:?}, revision {revision:?}, target open time {target_open_time}"
+    )]
+    ReconcileAckTimeout {
+        generation: GapGeneration,
+        revision: ReplayRevision,
+        target_open_time: i64,
+    },
     #[error("provider configuration is invalid: {0}")]
     Configuration(&'static str),
     #[error("provider invariant failed: {0}")]
@@ -306,9 +421,11 @@ impl ProviderError {
             self,
             Self::ServerStatus { .. }
                 | Self::RateLimited { .. }
-                | Self::Timeout { .. }
+                | Self::Timeout {
+                    kind: TimeoutKind::Request,
+                    ..
+                }
                 | Self::Transport { .. }
-                | Self::ChannelClosed { .. }
         )
     }
 }
