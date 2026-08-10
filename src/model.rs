@@ -477,6 +477,9 @@ impl Candle {
         self.authority.is_closed()
     }
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("candle series replacement is only valid during empty-series initialization")]
+pub struct CandleSeriesInitializationError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MutationKind {
@@ -610,14 +613,22 @@ impl CandleSeries {
         start <= end && self.is_range_contiguous(start..end.saturating_add(1))
     }
 
-    #[must_use]
-    pub fn replace(&mut self, candles: Vec<Candle>) -> MutationSummary {
-        self.mutate(candles, true)
+    pub fn replace(
+        &mut self,
+        candles: Vec<Candle>,
+    ) -> Result<MutationSummary, CandleSeriesInitializationError> {
+        if !self.candles.is_empty() {
+            return Err(CandleSeriesInitializationError);
+        }
+        Ok(self.initialize(candles))
     }
 
     #[must_use]
     pub fn merge(&mut self, candles: Vec<Candle>) -> MutationSummary {
-        self.mutate(candles, false)
+        if candles.len() == 1 {
+            return self.upsert(candles.into_iter().next().expect("length checked"));
+        }
+        self.merge_batch(candles)
     }
 
     #[must_use]
@@ -627,78 +638,201 @@ impl CandleSeries {
 
     #[must_use]
     pub fn upsert(&mut self, candle: Candle) -> MutationSummary {
-        self.merge(vec![candle])
+        self.upsert_one(candle)
     }
 
     #[must_use]
     pub fn append(&mut self, candle: Candle) -> MutationSummary {
-        self.merge(vec![candle])
+        self.upsert_one(candle)
     }
 
-    fn mutate(&mut self, mut input: Vec<Candle>, replace: bool) -> MutationSummary {
-        let empty_input = input.is_empty();
-        let old: Vec<Candle> = self.candles.iter().cloned().collect();
-        if empty_input {
-            return MutationSummary {
-                inserted: 0,
-                replaced: 0,
-                unchanged: 0,
-                old_to_new: (0..old.len()).collect(),
-                resolved: Vec::new(),
-                empty_input: true,
-                duplicate_only: false,
-                no_progress: true,
-            };
+    fn initialize(&mut self, mut input: Vec<Candle>) -> MutationSummary {
+        if input.is_empty() {
+            return empty_summary(0);
         }
-
-        input.sort_by_key(Candle::open_time);
-        let mut accepted: Vec<Candle> = Vec::with_capacity(input.len());
-        for candle in input {
-            if let Some(previous) = accepted.last_mut()
-                && previous.open_time() == candle.open_time()
-            {
-                *previous = merge_equal(previous, candle);
-            } else {
-                accepted.push(candle);
-            }
-        }
-        let accepted_times: Vec<i64> = accepted.iter().map(Candle::open_time).collect();
-
-        let mut merged = if replace {
-            accepted
-        } else {
-            merge_sorted(&old, accepted)
-        };
-        recompute_rest_adjacency(self.timeframe, &mut merged);
-        self.candles = merged.into();
-
-        let old_to_new = old
+        normalize_input(&mut input);
+        let mut candles: VecDeque<_> = input.into();
+        let affected: Vec<_> = (0..candles.len()).collect();
+        recompute_rest_adjacency(self.timeframe, &mut candles, &affected);
+        let resolved = candles
             .iter()
-            .map(|candle| {
-                self.index_of_open_time(candle.open_time())
-                    .unwrap_or(usize::MAX)
+            .enumerate()
+            .map(|(final_index, candle)| ResolvedMutation {
+                open_time: candle.open_time(),
+                final_index,
+                kind: MutationKind::Inserted,
             })
             .collect();
+        let inserted = candles.len();
+        self.candles = candles;
+        MutationSummary {
+            inserted,
+            replaced: 0,
+            unchanged: 0,
+            old_to_new: Vec::new(),
+            resolved,
+            empty_input: false,
+            duplicate_only: false,
+            no_progress: false,
+        }
+    }
+
+    fn upsert_one(&mut self, candidate: Candle) -> MutationSummary {
+        let old_len = self.candles.len();
+        let open_time = candidate.open_time();
+        let position = match self.candles.back() {
+            Some(newest) if open_time > newest.open_time() => Err(old_len),
+            Some(newest) if open_time == newest.open_time() => Ok(old_len - 1),
+            _ => self
+                .candles
+                .binary_search_by_key(&open_time, Candle::open_time),
+        };
+        match position {
+            Ok(index) => {
+                let current = self.candles[index].clone();
+                let merged = merge_equal(&current, candidate);
+                self.candles[index] = merged;
+                recompute_rest_adjacency(self.timeframe, &mut self.candles, &[index]);
+                let unchanged = usize::from(self.candles[index] == current);
+                let replaced = 1 - unchanged;
+                MutationSummary {
+                    inserted: 0,
+                    replaced,
+                    unchanged,
+                    old_to_new: (0..old_len).collect(),
+                    resolved: vec![ResolvedMutation {
+                        open_time,
+                        final_index: index,
+                        kind: if replaced == 1 {
+                            MutationKind::Replaced
+                        } else {
+                            MutationKind::Unchanged
+                        },
+                    }],
+                    empty_input: false,
+                    duplicate_only: replaced == 0,
+                    no_progress: true,
+                }
+            }
+            Err(index) => {
+                if index == old_len {
+                    self.candles.push_back(candidate);
+                } else if index == 0 {
+                    self.candles.push_front(candidate);
+                } else {
+                    self.candles.insert(index, candidate);
+                }
+                let mut affected = vec![index];
+                if let Some(predecessor_time) = timeframe_predecessor(self.timeframe, open_time)
+                    && let Ok(predecessor) = self
+                        .candles
+                        .binary_search_by_key(&predecessor_time, Candle::open_time)
+                {
+                    affected.push(predecessor);
+                    affected.sort_unstable();
+                    affected.dedup();
+                }
+                recompute_rest_adjacency(self.timeframe, &mut self.candles, &affected);
+                MutationSummary {
+                    inserted: 1,
+                    replaced: 0,
+                    unchanged: 0,
+                    old_to_new: (0..old_len)
+                        .map(|old_index| old_index + usize::from(old_index >= index))
+                        .collect(),
+                    resolved: vec![ResolvedMutation {
+                        open_time,
+                        final_index: index,
+                        kind: MutationKind::Inserted,
+                    }],
+                    empty_input: false,
+                    duplicate_only: false,
+                    no_progress: false,
+                }
+            }
+        }
+    }
+
+    fn merge_batch(&mut self, mut input: Vec<Candle>) -> MutationSummary {
+        if input.is_empty() {
+            return empty_summary(self.candles.len());
+        }
+        normalize_input(&mut input);
+        let accepted_times: Vec<_> = input.iter().map(Candle::open_time).collect();
+        let old_len = self.candles.len();
+        let mut old = std::mem::take(&mut self.candles).into_iter().peekable();
+        let mut incoming = input.into_iter().peekable();
+        let mut merged = VecDeque::with_capacity(old_len + incoming.len());
+        let mut old_to_new = Vec::with_capacity(old_len);
+        let mut drafts = Vec::with_capacity(incoming.len());
+
+        while old.peek().is_some() || incoming.peek().is_some() {
+            let final_index = merged.len();
+            match (old.peek(), incoming.peek()) {
+                (Some(current), Some(candidate)) if current.open_time() < candidate.open_time() => {
+                    old_to_new.push(final_index);
+                    merged.push_back(old.next().expect("peeked candle exists"));
+                }
+                (Some(current), Some(candidate))
+                    if current.open_time() == candidate.open_time() =>
+                {
+                    let current = old.next().expect("peeked candle exists");
+                    let candidate = incoming.next().expect("peeked candle exists");
+                    let open_time = candidate.open_time();
+                    let result = merge_equal(&current, candidate);
+                    old_to_new.push(final_index);
+                    drafts.push((open_time, final_index, Some(current)));
+                    merged.push_back(result);
+                }
+                (_, Some(_)) => {
+                    let candidate = incoming.next().expect("peeked candle exists");
+                    drafts.push((candidate.open_time(), final_index, None));
+                    merged.push_back(candidate);
+                }
+                (Some(_), None) => {
+                    old_to_new.push(final_index);
+                    merged.push_back(old.next().expect("peeked candle exists"));
+                }
+                (None, None) => break,
+            }
+        }
+
+        let mut affected = Vec::with_capacity(drafts.len().saturating_mul(2));
+        affected.extend(drafts.iter().map(|(_, index, _)| *index));
+        let mut accepted_index = 0;
+        for (index, candle) in merged.iter().enumerate() {
+            let Some(successor) = timeframe_successor(self.timeframe, candle.open_time()) else {
+                continue;
+            };
+            while accepted_index < accepted_times.len()
+                && accepted_times[accepted_index] < successor
+            {
+                accepted_index += 1;
+            }
+            if accepted_times.get(accepted_index) == Some(&successor) {
+                affected.push(index);
+            }
+        }
+        affected.sort_unstable();
+        affected.dedup();
+        recompute_rest_adjacency(self.timeframe, &mut merged, &affected);
+
         let mut inserted = 0;
         let mut replaced = 0;
         let mut unchanged = 0;
-        let resolved = accepted_times
+        let resolved = drafts
             .into_iter()
-            .map(|open_time| {
-                let final_index = self
-                    .index_of_open_time(open_time)
-                    .expect("accepted candle must exist after normalization");
-                let final_candle = &self.candles[final_index];
-                let kind = match old.binary_search_by_key(&open_time, Candle::open_time) {
-                    Err(_) => {
+            .map(|(open_time, final_index, previous)| {
+                let kind = match previous {
+                    None => {
                         inserted += 1;
                         MutationKind::Inserted
                     }
-                    Ok(old_index) if old[old_index] == *final_candle => {
+                    Some(previous) if previous == merged[final_index] => {
                         unchanged += 1;
                         MutationKind::Unchanged
                     }
-                    Ok(_) => {
+                    Some(_) => {
                         replaced += 1;
                         MutationKind::Replaced
                     }
@@ -710,6 +844,7 @@ impl CandleSeries {
                 }
             })
             .collect();
+        self.candles = merged;
         MutationSummary {
             inserted,
             replaced,
@@ -723,33 +858,32 @@ impl CandleSeries {
     }
 }
 
-fn merge_sorted(old: &[Candle], incoming: Vec<Candle>) -> Vec<Candle> {
-    let mut merged = Vec::with_capacity(old.len() + incoming.len());
-    let mut old_index = 0;
-    let mut incoming = incoming.into_iter().peekable();
-    while old_index < old.len() || incoming.peek().is_some() {
-        match incoming.peek() {
-            None => {
-                merged.extend_from_slice(&old[old_index..]);
-                break;
-            }
-            Some(next)
-                if old_index == old.len() || next.open_time() < old[old_index].open_time() =>
-            {
-                merged.push(incoming.next().expect("peeked candle must exist"));
-            }
-            Some(next) if next.open_time() == old[old_index].open_time() => {
-                let candidate = incoming.next().expect("peeked candle must exist");
-                merged.push(merge_equal(&old[old_index], candidate));
-                old_index += 1;
-            }
-            Some(_) => {
-                merged.push(old[old_index].clone());
-                old_index += 1;
-            }
+fn empty_summary(old_len: usize) -> MutationSummary {
+    MutationSummary {
+        inserted: 0,
+        replaced: 0,
+        unchanged: 0,
+        old_to_new: (0..old_len).collect(),
+        resolved: Vec::new(),
+        empty_input: true,
+        duplicate_only: false,
+        no_progress: true,
+    }
+}
+
+fn normalize_input(input: &mut Vec<Candle>) {
+    input.sort_by_key(Candle::open_time);
+    let mut write = 0;
+    for read in 0..input.len() {
+        if write > 0 && input[write - 1].open_time() == input[read].open_time() {
+            let candidate = input[read].clone();
+            input[write - 1] = merge_equal(&input[write - 1], candidate);
+        } else {
+            input.swap(write, read);
+            write += 1;
         }
     }
-    merged
+    input.truncate(write);
 }
 
 fn merge_equal(current: &Candle, candidate: Candle) -> Candle {
@@ -769,13 +903,27 @@ fn merge_equal(current: &Candle, candidate: Candle) -> Candle {
     }
 }
 
-fn recompute_rest_adjacency(timeframe: Timeframe, candles: &mut [Candle]) {
-    for index in 0..candles.len() {
+fn recompute_rest_adjacency(
+    timeframe: Timeframe,
+    candles: &mut VecDeque<Candle>,
+    affected: &[usize],
+) {
+    let mut search_index = 0;
+    for &index in affected {
         if candles[index].authority().is_authoritative() {
             continue;
         }
-        let has_successor = candles.get(index + 1).is_some_and(|next| {
-            timeframe_successor(timeframe, candles[index].open_time()) == Some(next.open_time())
+        let expected = timeframe_successor(timeframe, candles[index].open_time());
+        search_index = search_index.max(index.saturating_add(1));
+        while search_index < candles.len()
+            && expected.is_some_and(|open_time| candles[search_index].open_time() < open_time)
+        {
+            search_index += 1;
+        }
+        let has_successor = expected.is_some_and(|open_time| {
+            candles
+                .get(search_index)
+                .is_some_and(|candidate| candidate.open_time() == open_time)
         });
         candles[index].authority = if has_successor {
             FinalityAuthority::RestProvisionalClosed
@@ -783,6 +931,42 @@ fn recompute_rest_adjacency(timeframe: Timeframe, candles: &mut [Candle]) {
             FinalityAuthority::RestProvisionalOpen
         };
     }
+}
+
+fn timeframe_predecessor(timeframe: Timeframe, open_time: i64) -> Option<i64> {
+    let fixed_milliseconds = match timeframe {
+        Timeframe::Second1 => Some(1_000),
+        Timeframe::Minute1 => Some(60_000),
+        Timeframe::Minute3 => Some(180_000),
+        Timeframe::Minute5 => Some(300_000),
+        Timeframe::Minute15 => Some(900_000),
+        Timeframe::Minute30 => Some(1_800_000),
+        Timeframe::Hour1 => Some(3_600_000),
+        Timeframe::Hour2 => Some(7_200_000),
+        Timeframe::Hour4 => Some(14_400_000),
+        Timeframe::Hour6 => Some(21_600_000),
+        Timeframe::Hour8 => Some(28_800_000),
+        Timeframe::Hour12 => Some(43_200_000),
+        Timeframe::Day1 => Some(86_400_000),
+        Timeframe::Day3 => Some(259_200_000),
+        Timeframe::Week1 => Some(604_800_000),
+        Timeframe::Month1 => None,
+    };
+    if let Some(milliseconds) = fixed_milliseconds {
+        return checked_timestamp_add(open_time, -milliseconds).ok();
+    }
+
+    let timestamp =
+        OffsetDateTime::from_unix_timestamp_nanos(i128::from(open_time) * 1_000_000).ok()?;
+    let (year, month) = match timestamp.month() {
+        Month::January => (timestamp.year().checked_sub(1)?, Month::December),
+        month => (timestamp.year(), month.previous()),
+    };
+    let date = Date::from_calendar_date(year, month, timestamp.day()).ok()?;
+    let predecessor = timestamp.replace_date(date).unix_timestamp_nanos() / 1_000_000;
+    i64::try_from(predecessor)
+        .ok()
+        .filter(|value| validate_timestamp(*value).is_ok())
 }
 
 fn timeframe_successor(timeframe: Timeframe, open_time: i64) -> Option<i64> {

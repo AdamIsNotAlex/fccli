@@ -40,6 +40,49 @@ fn assert_strict_chronology(series: &CandleSeries) {
     let times = open_times(series);
     assert!(times.windows(2).all(|pair| pair[0] < pair[1]), "{times:?}");
 }
+fn assert_valid_old_to_new(summary: &fccli::model::MutationSummary, series: &CandleSeries) {
+    assert!(
+        summary.old_to_new.iter().all(|&index| index < series.len()),
+        "all old_to_new entries must be valid final indices: {:?}",
+        summary.old_to_new
+    );
+}
+
+#[test]
+fn replacement_is_initial_only_including_empty_initialization() {
+    let mut empty = CandleSeries::new(Timeframe::Minute1);
+    let empty_summary = empty
+        .replace(Vec::new())
+        .expect("empty initial replacement is valid");
+    assert!(empty.is_empty());
+    assert!(empty_summary.empty_input);
+    assert!(empty_summary.no_progress);
+    assert!(empty_summary.old_to_new.is_empty());
+
+    let initialized = empty
+        .replace(vec![rest(BASE + MINUTE, 11.0), rest(BASE, 10.0)])
+        .expect("first nonempty replacement initializes the series");
+    assert_eq!((initialized.inserted, initialized.replaced), (2, 0));
+    assert!(initialized.old_to_new.is_empty());
+    assert_eq!(open_times(&empty), vec![BASE, BASE + MINUTE]);
+
+    let mut authoritative = CandleSeries::new(Timeframe::Minute1);
+    authoritative
+        .replace(vec![ws(BASE, 20.0, true)])
+        .expect("first replacement initializes authoritative data");
+    let before = authoritative.get(0).expect("stored candle").clone();
+    assert!(authoritative.replace(Vec::new()).is_err());
+    assert!(authoritative.replace(vec![rest(BASE, 30.0)]).is_err());
+    assert_eq!(authoritative.len(), 1);
+    assert_eq!(authoritative.get(0), Some(&before));
+    assert_eq!(
+        authoritative
+            .get(0)
+            .expect("authority retained")
+            .authority(),
+        FinalityAuthority::WsAuthoritativeClosed
+    );
+}
 
 #[test]
 fn empty_singleton_and_current_open_series_are_safe() {
@@ -81,7 +124,9 @@ fn empty_singleton_and_current_open_series_are_safe() {
 #[test]
 fn unsorted_overlapping_duplicates_are_stably_normalized() {
     let mut series = CandleSeries::new(Timeframe::Minute1);
-    let _ = series.replace(vec![rest(BASE + MINUTE, 11.0), rest(BASE, 10.0)]);
+    let _ = series
+        .replace(vec![rest(BASE + MINUTE, 11.0), rest(BASE, 10.0)])
+        .expect("initial replacement succeeds");
 
     let summary = series.merge(vec![
         rest(BASE + 3 * MINUTE, 30.0),
@@ -207,24 +252,27 @@ fn rest_adjacency_promotes_and_demotes_across_page_boundaries() {
         FinalityAuthority::RestProvisionalOpen
     );
 
-    let _ = series.replace(vec![rest(BASE, 10.0), rest(BASE + 2 * MINUTE, 12.0)]);
+    let mut gapped = CandleSeries::new(Timeframe::Minute1);
+    let _ = gapped
+        .replace(vec![rest(BASE, 10.0), rest(BASE + 2 * MINUTE, 12.0)])
+        .expect("initial replacement succeeds");
     assert_eq!(
-        series.get(0).expect("gap predecessor").authority(),
+        gapped.get(0).expect("gap predecessor").authority(),
         FinalityAuthority::RestProvisionalOpen
     );
-    assert!(!series.is_contiguous());
-    let gap_fill = series.merge(vec![rest(BASE + MINUTE, 11.0)]);
+    assert!(!gapped.is_contiguous());
+    let gap_fill = gapped.merge(vec![rest(BASE + MINUTE, 11.0)]);
     assert_eq!((gap_fill.inserted, gap_fill.replaced), (1, 0));
     assert_eq!(
-        series.get(0).expect("first predecessor").authority(),
+        gapped.get(0).expect("first predecessor").authority(),
         FinalityAuthority::RestProvisionalClosed
     );
     assert_eq!(
-        series.get(1).expect("second predecessor").authority(),
+        gapped.get(1).expect("second predecessor").authority(),
         FinalityAuthority::RestProvisionalClosed
     );
     assert_eq!(
-        series.get(2).expect("current row").authority(),
+        gapped.get(2).expect("current row").authority(),
         FinalityAuthority::RestProvisionalOpen
     );
 
@@ -280,7 +328,11 @@ fn ws_open_and_closed_precedence_is_independent_of_rest_adjacency() {
         series.get(0).expect("closed WS").authority(),
         FinalityAuthority::WsAuthoritativeClosed
     );
-    let _ = series.replace(vec![series.get(0).expect("closed WS").clone()]);
+    assert!(
+        series
+            .replace(vec![series.get(0).expect("closed WS").clone()])
+            .is_err()
+    );
     assert_eq!(
         series.get(0).expect("isolated WS").authority(),
         FinalityAuthority::WsAuthoritativeClosed
@@ -291,10 +343,12 @@ fn ws_open_and_closed_precedence_is_independent_of_rest_adjacency() {
 #[test]
 fn prepend_middle_append_report_exact_mapping_and_resolutions() {
     let mut series = CandleSeries::new(Timeframe::Minute1);
-    let _ = series.replace(vec![
-        rest(BASE + MINUTE, 11.0),
-        rest(BASE + 3 * MINUTE, 13.0),
-    ]);
+    let _ = series
+        .replace(vec![
+            rest(BASE + MINUTE, 11.0),
+            rest(BASE + 3 * MINUTE, 13.0),
+        ])
+        .expect("initial replacement succeeds");
 
     let summary = series.merge(vec![
         rest(BASE + 4 * MINUTE, 14.0),
@@ -302,6 +356,7 @@ fn prepend_middle_append_report_exact_mapping_and_resolutions() {
         rest(BASE + 2 * MINUTE, 12.0),
     ]);
     assert_eq!(summary.old_to_new, vec![1, 3]);
+    assert_valid_old_to_new(&summary, &series);
     assert_eq!(
         summary.resolved,
         vec![
@@ -329,6 +384,7 @@ fn prepend_middle_append_report_exact_mapping_and_resolutions() {
 
     let update = series.upsert(ws(BASE + 2 * MINUTE, 22.0, false));
     assert_eq!(update.old_to_new, vec![0, 1, 2, 3, 4]);
+    assert_valid_old_to_new(&update, &series);
     assert_eq!(
         update.resolved,
         vec![ResolvedMutation {
@@ -347,9 +403,12 @@ fn prepend_middle_append_report_exact_mapping_and_resolutions() {
 #[test]
 fn empty_duplicate_and_no_progress_signals_are_distinct() {
     let mut series = CandleSeries::new(Timeframe::Minute1);
-    let _ = series.replace(vec![rest(BASE, 10.0), rest(BASE + MINUTE, 11.0)]);
+    let _ = series
+        .replace(vec![rest(BASE, 10.0), rest(BASE + MINUTE, 11.0)])
+        .expect("initial replacement succeeds");
 
     let empty = series.merge(Vec::new());
+    assert_valid_old_to_new(&empty, &series);
     assert!(empty.empty_input);
     assert!(!empty.duplicate_only);
     assert!(empty.no_progress);
@@ -357,6 +416,7 @@ fn empty_duplicate_and_no_progress_signals_are_distinct() {
     assert!(empty.resolved.is_empty());
 
     let duplicate = series.merge(vec![rest(BASE, 10.0), rest(BASE, 10.0)]);
+    assert_valid_old_to_new(&duplicate, &series);
     assert!(!duplicate.empty_input);
     assert!(duplicate.duplicate_only);
     assert!(duplicate.no_progress);
@@ -368,6 +428,7 @@ fn empty_duplicate_and_no_progress_signals_are_distinct() {
     assert_eq!(duplicate.resolved[0].kind, MutationKind::Unchanged);
 
     let replacement_without_insertion = series.upsert(ws(BASE, 20.0, false));
+    assert_valid_old_to_new(&replacement_without_insertion, &series);
     assert!(!replacement_without_insertion.duplicate_only);
     assert!(replacement_without_insertion.no_progress);
     assert_eq!(
@@ -406,10 +467,69 @@ fn chronology_lookup_and_continuity_detect_middle_gaps() {
 }
 
 #[test]
+fn exact_successor_closes_rest_predecessor_even_with_intervening_off_grid_row() {
+    let mut fixed = CandleSeries::new(Timeframe::Minute1);
+    let summary = fixed.merge(vec![
+        rest(BASE, 10.0),
+        rest(BASE + MINUTE / 2, 10.5),
+        rest(BASE + MINUTE, 11.0),
+    ]);
+    assert_valid_old_to_new(&summary, &fixed);
+    assert_eq!(
+        fixed
+            .candle_at_open_time(BASE)
+            .expect("predecessor")
+            .authority(),
+        FinalityAuthority::RestProvisionalClosed
+    );
+    assert!(
+        !fixed.is_contiguous(),
+        "off-grid row still breaks continuity"
+    );
+}
+
+#[test]
+fn hot_append_and_upsert_keep_exact_mappings_and_authority() {
+    let mut series = CandleSeries::new(Timeframe::Minute1);
+    series
+        .replace(vec![rest(BASE, 10.0), rest(BASE + MINUTE, 11.0)])
+        .expect("initial replacement succeeds");
+
+    let appended = series.append(ws(BASE + 2 * MINUTE, 12.0, false));
+    assert_eq!(appended.old_to_new, vec![0, 1]);
+    assert_valid_old_to_new(&appended, &series);
+    assert_eq!(
+        appended.resolved,
+        vec![ResolvedMutation {
+            open_time: BASE + 2 * MINUTE,
+            final_index: 2,
+            kind: MutationKind::Inserted,
+        }]
+    );
+
+    let replaced = series.upsert(ws(BASE + MINUTE, 21.0, true));
+    assert_eq!(replaced.old_to_new, vec![0, 1, 2]);
+    assert_valid_old_to_new(&replaced, &series);
+    assert_eq!(replaced.resolved[0].kind, MutationKind::Replaced);
+    assert_eq!(replaced.resolved[0].final_index, 1);
+    assert_eq!(
+        series.get(1).expect("closed live update").authority(),
+        FinalityAuthority::WsAuthoritativeClosed
+    );
+
+    let rejected = series.upsert(rest(BASE + MINUTE, 99.0));
+    assert_eq!(rejected.old_to_new, vec![0, 1, 2]);
+    assert_valid_old_to_new(&rejected, &series);
+    assert_eq!(rejected.resolved[0].kind, MutationKind::Unchanged);
+    assert_eq!(series.get(1).expect("authority retained").open(), 21.0);
+}
+
+#[test]
 fn monthly_continuity_uses_calendar_successors_not_fixed_durations() {
     const JAN_2024: i64 = 1_704_067_200_000;
     const FEB_2024: i64 = 1_706_745_600_000;
     const MAR_2024: i64 = 1_709_251_200_000;
+    const JAN_15_2024: i64 = 1_705_276_800_000;
 
     let monthly = |open_time, marker| {
         Candle::from_rest(
@@ -424,24 +544,38 @@ fn monthly_continuity_uses_calendar_successors_not_fixed_durations() {
         .expect("valid monthly test candle")
     };
     let mut series = CandleSeries::new(Timeframe::Month1);
-    let _ = series.merge(vec![
+    let summary = series.merge(vec![
         monthly(MAR_2024, 12.0),
         monthly(JAN_2024, 10.0),
+        monthly(JAN_15_2024, 10.5),
         monthly(FEB_2024, 11.0),
     ]);
+    assert_valid_old_to_new(&summary, &series);
 
-    assert!(series.is_contiguous());
-    assert!(series.is_contiguous_through(JAN_2024, MAR_2024));
+    assert!(
+        !series.is_contiguous(),
+        "off-grid January row breaks continuity"
+    );
+    assert!(!series.is_contiguous_through(JAN_2024, MAR_2024));
     assert_eq!(
-        series.get(0).expect("January").authority(),
+        series
+            .candle_at_open_time(JAN_2024)
+            .expect("January")
+            .authority(),
         FinalityAuthority::RestProvisionalClosed
     );
     assert_eq!(
-        series.get(1).expect("February").authority(),
+        series
+            .candle_at_open_time(FEB_2024)
+            .expect("February")
+            .authority(),
         FinalityAuthority::RestProvisionalClosed
     );
     assert_eq!(
-        series.get(2).expect("March").authority(),
+        series
+            .candle_at_open_time(MAR_2024)
+            .expect("March")
+            .authority(),
         FinalityAuthority::RestProvisionalOpen
     );
 }
