@@ -857,6 +857,14 @@ Chunk-5 append-only formatter update (authoritative over the earlier 22-executio
 
 The canonical total is therefore **23 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-23`, accompanied by `artifact://1060`; the artifact's later checks and chart-state test execution do not update unrelated ledger records because their commands and scopes do not exactly match those records.
 
+Chunk-5 append-only outcome correction for `attempt-2026-08-10-chunk5-9` / `fmt-exec-23` (authoritative over its inaccurate post-formatter outcome narrative above, which remains preserved as historical accounting):
+
+| Record ID | Corrected canonical execution | Authoritative observed outcome | Accounting effect | Supersedes narrative |
+|---|---|---|---|---|
+| DET-FMT | `fmt-exec-23` / `attempt-2026-08-10-chunk5-9` | `artifact://1060` records that the retained `&&` chain advanced beyond `cargo fmt --check`; the subsequent plain Cargo check passed, all 22 chart-state tests passed, and the final `cargo clippy --locked --all-targets -- -D warnings` passed. | Formatter execution 23 remains the current `DET-FMT=PASS` basis; the canonical total remains 23, and this correction does not update unrelated ledger records. | The earlier statements that the final chained stage was another Cargo check. |
+
+The canonical total remains **23 `DET-FMT` executions**. Current `DET-FMT=PASS` continues to rely on `fmt-exec-23`, accompanied by `artifact://1060`; this append-only correction changes only the recorded post-formatter outcomes.
+
 The final planned test inventory includes `tests/app_live_contract.rs` and contains no `tests/app_integration.rs`; this is not a precreation requirement. Chunk 2 creates and uses `tests/feature_selection.rs` only for its named feature-selection gates; `tests/app_live_contract.rs` MUST NOT exist before chunk 17, where the real App reducer/sole MarketEvent consumer contract is introduced. The final inventory also contains exactly `tests/terminal_lifecycle.rs` and `tests/api_boundaries.rs` for the other named specialized gates. `terminal_pty` and `transport_api_boundary` are not API/test-target names.
 ### Smoke and delivery references（ledger-only）
 
