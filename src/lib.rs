@@ -5,6 +5,7 @@ compile_error!("features `test-transport` and `production-transport` are mutuall
 
 pub mod chart;
 pub mod cli;
+pub mod clock;
 pub mod error;
 pub mod model;
 pub mod provider;

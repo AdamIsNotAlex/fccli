@@ -95,11 +95,11 @@ Each chunk is independently reviewable and committable after its definition of d
 
 ### 7. Define provider interface and task ownership
 
-- [ ] Implement exact chunk-7 aliases, provider traits, non-`Clone` `LiveRequest`, `LiveFeed`, `ProducerCompletionReceiver`, `RateGateSnapshot`, and every canonical latest-value endpoint/error symbol from the sole plan block. Keep `ReconcileAckReceiver` non-cloneable and sole: App retains `ReconcileAckSender`, while the consuming supervisor receives the receiver through `LiveRequest`.
-- [ ] Construct `accepted_watermark_channel(initial)` and initially-empty `reconcile_ack_channel()`; verify synchronous publication, awaitable `changed`, per-clone cursors, expectation registration, matching proof-only ack, every exact closure/publication/expectation error, and no polling.
-- [ ] Define cancellation, `Clock`, manual scheduler, checked duration-to-`MonoInstant` conversion, and task timeout seams; do not redefine chunk-3 deadline values.
-- [ ] Fake-provider tests prove one-way `ProducerCompletion::Running`→`Finished`, active non-consuming observation, and later consuming join returning the same result without duplicate accounting.
-- [ ] Preserve request-shutdown-before-restoration and consuming bounded join after restoration.
+- [x] Implement exact chunk-7 aliases, provider traits, non-`Clone` `LiveRequest`, `LiveFeed`, `ProducerCompletionReceiver`, `RateGateSnapshot`, and every canonical latest-value endpoint/error symbol from the sole plan block. Keep `ReconcileAckReceiver` non-cloneable and sole: App retains `ReconcileAckSender`, while the consuming supervisor receives the receiver through `LiveRequest`.
+- [x] Construct `accepted_watermark_channel(initial)` and initially-empty `reconcile_ack_channel()`; verify synchronous publication, awaitable `changed`, per-clone cursors, expectation registration, matching proof-only ack, every exact closure/publication/expectation error, and no polling.
+- [x] Define cancellation, `Clock`, manual scheduler, checked duration-to-`MonoInstant` conversion, and task timeout seams; do not redefine chunk-3 deadline values.
+- [x] Fake-provider tests prove one-way `ProducerCompletion::Running`→`Finished`, active non-consuming observation, and later consuming join returning the same result without duplicate accounting.
+- [x] Preserve request-shutdown-before-restoration and consuming bounded join after restoration.
 - Definition of done: exact canonical APIs and symbols compile with no aliases or invented channels; no concrete Binance/registry exists yet.
 
 ### 8. Implement deterministic Binance REST
