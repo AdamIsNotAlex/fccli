@@ -3,434 +3,201 @@
 ## Locked decisions
 
 - `fccli <instrument> <timeframe>` renders one snapshot and exits; `-i` / `--interactive` starts the interactive TUI.
-- The default provider is `binance`; v1 supports Binance Spot only and does not support Binance Futures.
-- Bare assets default to USDT: `btc` and `binance:btc` resolve to `BTCUSDT`; `btc/usdc`, `btc-usdt`, and `BTCUSDT` are accepted explicit forms.
+- Interactive mode requires both stdin and stdout to be TTYs. If either is not a TTY, it exits nonzero with an actionable recommendation to use snapshot mode; it never silently changes mode.
+- The default provider is the case-sensitive lowercase name `binance`; v1 supports Binance Spot only and does not support Binance Futures.
+- CLI parsing produces a provider-neutral `InstrumentSpec`. Binance performs local, pure canonicalization into `Instrument`; v1 does not query `exchangeInfo`.
+- Symbol components are uppercased. Bare assets default to USDT: `btc` and `binance:btc` resolve to `BTCUSDT`; `btc/usdc`, `btc-usdt`, and `BTCUSDT` are accepted explicit forms. Under this locked grammar, any separator-free token not ending in `USDT`, including `BTCUSDC`, receives a `USDT` suffix.
+- The normalized display pair is always `BASE/QUOTE` (for example `BTC/USDT`), independently of the opaque Binance transport symbol (`BTCUSDT`).
+- Reject more than one colon, more than one pair separator, mixed `/` and `-`, empty components, whitespace, and non-ASCII-alphanumeric components.
 - Supported timeframes are exactly `1s`, `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, and `1M`; parsing is case-sensitive.
-- The chart contains a two-line source/symbol/OHLCV header, main candlestick pane, right-side price axis, volume pane, UTC time axis, and an interactive shortcut/status footer.
-- Candles use filled Unicode bodies with green bullish candles and red bearish candles. `NO_COLOR` uses distinct monochrome glyphs instead of losing direction information.
-- Snapshot output uses the current terminal dimensions minus one shell row. Non-TTY output uses 120×36 and contains no ANSI escapes.
-- Layouts smaller than 60×18 are unsupported: snapshot mode exits with a clear error; interactive mode remains running and displays a resize instruction.
-- Interactive startup loads the latest 500 candles. Near the left history boundary, one serialized request loads up to 1000 older candles with `endTime = oldest_open_time - 1`.
-- Binance history uses REST; Binance live updates use WebSocket. Both are exposed to the application through provider-neutral candle and status events.
-- WebSocket reconnect delays are 1, 2, 4, 8, 16, then 30 seconds. Reconnect performs REST gap synchronization before normal streaming resumes.
-- Live-follow starts enabled. Moving left pauses it; `End` returns to the latest candle and resumes it. `r` resets X zoom, Y auto-scale, latest position, and live-follow.
-- Keyboard controls are locked: `A/←` older, `D/→` newer, `W/↑` price window up, `S/↓` price window down, `h` X zoom in, `H` X zoom out, `v` Y zoom in, `V` Y zoom out, `q/Esc/Ctrl-C` quit.
-- Keyboard X pan is 5% of visible bars with a one-bar minimum; Y pan is 10% of price span; zoom-in multiplies the visible range by `0.8`; zoom-out multiplies it by `1.25`.
-- Interactive mode initially renders approximately one candle per two terminal columns. Zoom-out stops at one real candle per column; the renderer never merges candles into synthetic display candles.
-- Mouse behavior is locked: plot drag pans X and Y, right price-axis drag scales Y, bottom time-axis drag scales X, and hover displays a crosshair plus the nearest candle’s UTC OHLCV.
-- Right-axis upward drag and bottom-axis rightward drag zoom in. Dragging suppresses the crosshair until release.
-- Snapshot and interactive modes share the same domain models, view state, layout calculation, and custom Ratatui Buffer renderer.
-- Rust baseline is Edition 2024 with `rust-version = "1.96"`. Supported platforms are Linux, macOS, and Windows.
-- Automated tests must use local REST/WS mocks and must not contact Binance. Real Binance access is reserved for explicit smoke tests.
-- V1 excludes indicators, drawing tools, trading, image export, persistent configuration, disk caching, multiple charts, and additional providers.
+- Provider-neutral timestamps are Unix milliseconds.
+- The chart contains a two-line source/symbol/OHLCV header, main candlestick pane, right-side price axis, volume pane, and UTC time axis. The shortcut/status footer is interactive-only.
+- Rendering receives one explicit `RenderPolicy`, detected once from output capability and `NO_COLOR`; it selects deterministic green/red TTY styles or style-free monochrome bull=`█`, bear=`▓`, doji=`━` with the existing wick geometry.
+- Snapshot output uses the current terminal dimensions minus one shell row. The 60×18 minimum applies to the effective rendered frame, so a snapshot TTY requires at least 60×19 physical cells. Non-TTY output uses an effective 120×36 frame and contains no ANSI escapes.
+- Interactive frames smaller than the effective 60×18 minimum remain running and display only a resize instruction; no partial chart geometry is exposed.
+- Interactive startup loads the latest 500 candles. Near the left history boundary, one serialized request loads up to 1000 older candles with checked `endTime = oldest_open_time - 1`.
+- Binance history uses REST; Binance live updates use WebSocket. Both are exposed through provider-neutral candle and status events. The application alone owns `CandleSeries` and `ChartViewState`; network tasks emit immutable results/events. REST emits validated immutable `RestProvisionalOpen` candles only; `CandleSeries` alone recomputes provider-successor adjacency after every merge, promoting/demoting `RestProvisionalClosed` independently of page boundaries.
+- Equal-`open_time` merge precedence uses the exact `FinalityAuthority { RestProvisionalOpen, RestProvisionalClosed, WsAuthoritativeOpen, WsAuthoritativeClosed }` table: `WsAuthoritativeClosed` cannot regress; WS beats REST; closed beats open within one provenance when closure is valid; within the same resulting state later acceptance wins. Structural REST closure is a series-level adjacency hint and never authoritative.
+- Live startup/reconnect opens and continuously polls WS first. Every generation, including nonempty history, waits at most `FIRST_KLINE_HANDSHAKE_TIMEOUT = 10 s` for a first decoded kline before REST reconciliation can complete; event-at-deadline wins. `Some(confirmed)` keeps inclusive start at confirmed and uses that kline to establish the initial target; `None` uses it as start and initial target. During reconciliation, every WS candle mutation advances `revision` and sets `target_open_time = max(current_target_open_time, candle.open_time)`, including accepted or coalesced mutations racing any REST page; every ordered tagged batch registers its exact latest `ReconcileExpectation` before delivery.
+- App publishes monotonic accepted watermark and proof-only matching `ReconcileAck` through the exact canonical awaitable latest-value APIs. Missing-middle publishes no ack; `RECONCILE_ACK_TIMEOUT = 10 s` with ack-at-deadline wins, otherwise exact `ReconcileAckTimeout` invalidates/purges/closes and enters Backoff. `Connected` waits until App proves contiguous accepted `CandleSeries` coverage through the latest registered `target_open_time` and `revision`, including targets advanced across multiple REST pages or by racing WS mutations.
+- Tungstenite 0.30 automatic Pong handling is used; application code never emits a duplicate Pong. The socket owner continuously selects over read/flush progress, cancellation, and downstream readiness, using bounded keyed/coalescing candle output and bounded status/error output so a full application channel cannot stop multiple Ping/Pong progress. Production capacities are exactly `KEYED_CANDLE_CAPACITY = 1024`, `CONTROL_CAPACITY = 64`, `EMERGENCY_CONTROL_CAPACITY = 2`, and App-facing `MARKET_EVENT_CHANNEL_CAPACITY = 256`; test-injectable non-emergency capacities accept only `1..=65_536`, while emergency capacity is non-configurable, permanently reserved, and exactly two slots. Queue saturation uses those two slots for exactly one overflow issue plus `Backoff`: atomically invalidate the generation, purge every queued control and unacknowledged candle for it (including a queued `Connected`), close/discard the socket, and deliver the reserved pair in order as `generation: None` controls when capacity returns before starting the next generation. The reducer accepts that out-of-generation pair without reactivating stale data.
+- WebSocket reconnect states are exactly `Connecting`, `GapSync`, `Connected`, `Backoff`, and `Stopped`. The exact closed API is `MarketEvent::Status { generation: Option<GapGeneration>, status: ConnectionStatus } | ReconcileBatch { generation: GapGeneration, revision: ReplayRevision, target_open_time: i64, candles: Vec<Candle> } | Candle { generation: GapGeneration, candle: Candle } | RecoverableError { generation: Option<GapGeneration>, error: ProviderError, rate_gate_deadline: Option<MonoInstant> } | TerminalError(ProviderError)`. Stream `Err` is reserved for supervisor/join/channel failure after no `TerminalError` can be delivered. Producers and the App consumer match `MarketEvent` exhaustively without wildcard; only the App reducer rejects stale/invalid generations. Status transitions, reconnect, reconciliation/backfill, and rate-limit waits/errors never clear already accepted `CandleSeries` data or reset the inspected viewport; only accepted series mutations apply the locked anchor-preserving view update. Reconnect backoff is exactly `1, 2, 4, 8, 16, 30, 30, …` seconds, resets only after acknowledged `Connected`, and wakes at the later of the checked backoff deadline and the current shared rate-gate deadline.
+- One shared cancellation-aware Binance REST rate gate applies to initial, history, and gap requests and exposes a cloneable provider-neutral latest-deadline snapshot/watch handle to the history coordinator and supervisor; every wake rereads it, and receiver closure is terminal and typed. Valid checked delta-seconds for 429 or 418 extend but never shorten the gate. Missing/malformed/negative/overflowing 429 uses the injected fallback, exactly 30 seconds in production. Missing or invalid 418 records a process-lifetime blocker status and disables every automatic REST/history/reconnect retry for that provider process; only explicit process restart can resume. A valid 418 deadline remains retryable only after that deadline.
+- Live-follow starts enabled. Moving left pauses it; reaching the latest boundary restores it. `End` returns to latest while preserving X zoom and Y state; `r` restores interactive-default X span, Y auto-scale, latest position, and live-follow.
+- Keyboard controls are locked: `A/←` older, `D/→` newer, `W/↑` price window up, `S/↓` price window down, `h` X zoom in, `H` X zoom out, `v` Y zoom in, `V` Y zoom out, `q/Esc/Ctrl-C` quit. Lowercase and uppercase WASD both move; `h/H` and `v/V` remain case-sensitive.
+- Keyboard X pan is `max(1, ceil(visible_count × 0.05))`; Y pan is 10% of price span. X/Y zoom-in multiplies range by `0.8`, zoom-out by `1.25`; integer X zoom rounds to nearest with ties away from zero.
+- Snapshot initialization shows the latest `min(series_len, plot_width)`. Interactive empty data stays distinct; lengths `1..=9` initialize to `min(series_len, plot_width)`, and lengths `>= 10` initialize to `min(series_len, plot_width, max(10, ceil(plot_width / 2)))`. For every nonempty interactive series, `min_visible_count = min(series_len, plot_width, 10)`; apply this minimum after every keyboard or mouse X zoom and then reclamp all visibility bounds, so another zoom-in at the minimum is blocked. For chart-content width `W`, `gutter_width = if W >= 2 { 1 } else { 0 }`, `price_label_width = min(14, W.saturating_sub(gutter_width + 1))`, and `plot_width = W - gutter_width - price_label_width`. Header is exactly two rows, interactive footer exactly one row, snapshot footer zero rows; from remaining body height `H`, exactly `volume_height = clamp((H + 2) / 5, 3, H - 1)` and `main_plot_height = H - volume_height`. Width/height arithmetic is checked/saturating; infeasible sizes return a resize-only `LayoutPending` result with no chart rectangles.
+- After that one-time App transition, resize never reinitializes: it preserves logical center/state and reclamps. All exact Y scaling, keyboard/mouse anchors, and status header behavior remain locked.
+- Mouse behavior is locked: left-button plot drag pans X and Y, right price-axis drag scales Y, bottom time-axis drag scales X, and hover displays a crosshair plus nearest-candle UTC OHLCV. Rectangles use half-open containment; nearest-candle ties choose the earlier/left candle.
+- Drag ownership is fixed by the left-button-down region and continues outside it with coordinates clamped to the frame. Plot content follows the pointer: rightward drag shows older indices and downward drag raises the viewed price center so the rendered candle content moves downward.
+- Price-axis upward drag zooms in by `1 / 1.05^rows`; downward drag zooms out by `1.05^rows`. Time-axis rightward drag zooms in and leftward drag zooms out by the corresponding factor. Dragging suppresses the crosshair until release.
+- Style-free output, including every non-TTY snapshot regardless of `NO_COLOR`, uses exact monochrome body glyphs bull=`█`, bear=`▓`, doji=`━` with the existing wick geometry; TTY color output may additionally use green/red styles.
+- Persistent logical X anchors are identified by candle `open_time` or updated through an index-aware mutation mapping, so prepends and middle insertions before/inside/after the viewport preserve the same candle under each anchored column.
+- Interactive event reduction uses the plan's sole canonical bounded two-phase reducer contract, including its complete intra-bucket total order, terminal short-circuit, resize-before-pointer rule, stale-generation rejection, same-time merge precedence, and per-source quota.
+- Snapshot and interactive modes share the same provider-neutral domain models, view state, layout calculation, and custom Ratatui `Buffer` renderer.
+- Rust baseline is Edition 2024 with exact toolchain 1.96.0. Supported platforms are Linux, macOS, and Windows.
+- Automated tests use local REST/WS mocks, injected/manual time, deterministic terminal seams, injected library entry points, and no public Binance or real-terminal access. Real Binance and real-terminal access are explicit smoke checks only.
+- Automated network tests compile/run under an enforced loopback-only transport mode in which production constructors are unavailable, bind mocks to literal loopback endpoints, disable redirects or reject every redirect target before connection, and include a deliberate direct-public-connect attempt blocked by the harness. CI uses an OS-level egress-deny boundary where supported and a separate compile-only production-network build; public hosts, DNS hostnames, and loopback-to-public redirects are rejected.
+- V1 excludes indicators, drawing tools, trading, image export, persistent configuration, disk caching, multiple charts, additional providers, API keys, exchange metadata discovery, generic polling, synthetic candle aggregation, telemetry, compatibility shims, and retry systems beyond the specified REST/WS/backfill behavior.
 
-## Implementation tasks
+## Sequential implementation chunks
 
-- [ ] Initialize the Cargo application and module tree
-  - What to change:
-    - Create a binary package named `fccli` using Rust Edition 2024 and `rust-version = "1.96"`.
-    - Add production dependencies pinned to the approved families: `ratatui 0.30.2`, `crossterm 0.29.0`, `clap 4.6.6`, `tokio 1.53.1`, `reqwest 0.13.4`, `tokio-tungstenite 0.30.0`, `futures-util 0.3.33`, `serde 1.0.229`, `serde_json 1.0.151`, `time 0.3.55`, `thiserror 2.0.20`, and `anyhow 1.0.104`.
-    - Enable only the required features: Ratatui Crossterm 0.29 backend; Crossterm `event-stream`; Clap `derive`; Tokio `macros`, `rt-multi-thread`, `sync`, `time`, and `net`; Reqwest `json` and `query`; Tokio Tungstenite `connect` and `rustls-tls-native-roots`; Time `formatting` and `macros`.
-    - Add `wiremock 0.6.5` and `assert_cmd 2.2.2` as development dependencies.
-    - Create the module declarations and the source/test directory structure from the plan.
-  - Where:
-    - `Cargo.toml`
-    - `Cargo.lock`
-    - `src/main.rs`
-    - `src/lib.rs`
-    - `src/provider/mod.rs`
-    - `src/chart/mod.rs`
-    - `tests/fixtures/`
-  - Definition of done:
-    - `cargo check` succeeds with an otherwise empty application skeleton.
-    - `main.rs` contains only bootstrap, CLI invocation, runtime startup, top-level error reporting, and process exit behavior.
-    - `Cargo.lock` is generated and retained.
+Each chunk is independently reviewable and committable after its definition of done and listed deterministic validation pass. All items remain unchecked until implementation occurs.
 
-- [ ] Implement the CLI and instrument parser
-  - What to change:
-    - Define positional `instrument` and `timeframe` arguments plus `-i` / `--interactive`.
-    - Parse `provider:symbol` at the first colon and default to `binance` when no prefix exists.
-    - Normalize Binance symbols using the locked rules: `/` or `-` separates base/quote; separator-free `*USDT` is treated as a full pair; every other separator-free token receives a `USDT` suffix.
-    - Reject missing base/quote components, additional separators, whitespace, and non-ASCII-alphanumeric symbol components.
-    - Implement a closed, case-sensitive timeframe enum for all 16 approved Binance intervals.
-    - Produce actionable Clap errors for malformed symbols, unknown providers, and unsupported intervals.
-  - Where:
-    - `src/cli.rs`
-    - `src/main.rs`
-    - `src/model.rs`
-    - `tests/cli.rs`
-  - Definition of done:
-    - The command forms in Locked decisions parse into the expected provider, pair, timeframe, and mode.
-    - `1m` and `1M` produce distinct enum values.
-    - Invalid input exits nonzero before any network or terminal operation.
+### 1. Freeze the implementation contract
 
-- [ ] Define provider-neutral market models and invariants
-  - What to change:
-    - Add `ProviderId`, `Market`, `Instrument`, `Timeframe`, `Candle`, `HistoryRequest`, `MarketEvent`, and connection/status types.
-    - Store candle open/close timestamps, OHLC, base volume, and open/closed state.
-    - Validate finite numeric fields, nonnegative volume, `open_time < close_time`, `low <= min(open, close)`, and `high >= max(open, close)`.
-    - Use `f64` for chart data and keep Binance DTOs out of public chart/application types.
-    - Define typed application, provider, payload, HTTP, rate-limit, and terminal errors.
-  - Where:
-    - `src/model.rs`
-    - `src/error.rs`
-  - Definition of done:
-    - Invalid candles cannot enter `CandleSeries` without returning a typed error.
-    - Domain types contain no Binance-specific JSON field names or endpoint assumptions.
-    - Errors preserve enough context to identify provider, symbol, timeframe, operation, and underlying cause.
+- [ ] Confirm `docs/plan/init.plan.md` and this checklist agree on every locked decision above, exact generation-and-revision-tagged `MarketEvent`/ack API, generation-tagged live candles, the canonical reducer order and separate renderer display/final-error precedence, dependency order, ownership boundaries, dynamic reconnect watermark, bounded socket-owner buffering/Ping progress and out-of-generation saturation recovery, absolute deadline units, rate-gate observation/418 blocker policy, deterministic layout/view sequencing, chunk/registry ownership, and explicit exclusions.
+- [ ] Confirm ambiguous behavior is resolved before source work: non-TTY interactive error, footer by mode, complete symbol grammar including quote-only rejection, formatter-safe Unix-ms timestamps, `FinalityAuthority` as the sole stored finality, provisional REST versus series-owned adjacency versus authoritative WS finality, reconnect reset/rate-gate/status-specific `Retry-After` rules, exact snapshot/interactive initialization and global plot-width ceiling, 5% auto-Y padding, viewport rounding/anchors, mouse signs/ties/price anchor and outside-plot hover clearing, tiny/large price and compact-volume formatting, style-free direction glyphs, effective dimensions, terminal unwind/final-error accounting, durable validation ledger, and every original validation expectation.
+- Definition of done: no implementation behavior is left to be selected ad hoc during coding; the plan and todo use the same exact types/states/tables, and every task remains unchecked until implementation.
 
-- [ ] Add the provider interface and registry
-  - What to change:
-    - Define an object-safe `MarketDataProvider: Send + Sync` interface.
-    - Return boxed futures for instrument resolution/history requests and a boxed stream for live market events.
-    - Add a provider registry that maps `ProviderId::Binance` to one shared `BinanceProvider` instance.
-    - Keep the interface capable of supporting a future REST-polling live stream without implementing unused polling code in v1.
-  - Where:
-    - `src/provider/mod.rs`
-    - `src/lib.rs`
-  - Definition of done:
-    - Application and chart modules can fetch history and receive live events through the trait without importing `BinanceProvider` or Binance DTOs.
-    - Adding a future provider requires a new provider implementation and registry entry, not changes to chart state or rendering APIs.
+### 2. Create the reproducible application skeleton
 
-- [ ] Implement Binance REST Kline history
-  - What to change:
-    - Build `BinanceProvider` with injectable REST and WebSocket base URLs; production REST defaults to `https://data-api.binance.vision`.
-    - Add a reusable Reqwest client with a 10-second timeout and an identifying user agent.
-    - Implement `/api/v3/klines` requests for latest history, older history, and reconnect gap ranges.
-    - Deserialize each 12-element Binance Kline array through a typed tuple/newtype rather than untyped JSON indexing.
-    - Parse price/volume strings with field-specific error context and convert them to validated domain candles.
-    - Mark REST candles closed by comparing `close_time` to current UTC time.
-    - Decode Binance error JSON and distinguish invalid symbol, rate-limit, client, server, timeout, transport, and malformed-payload failures.
-    - Preserve `Retry-After` for HTTP 429 responses.
-  - Where:
-    - `src/provider/binance.rs`
-    - `tests/binance_rest.rs`
-    - `tests/fixtures/binance_klines.json`
-  - Definition of done:
-    - Initial requests use `limit=500`.
-    - Older requests use `limit=1000` and `endTime=oldest_open_time - 1`.
-    - Reconnect range requests can start from the last known candle open time.
-    - Valid fixtures become ordered domain candles; malformed fixtures return typed errors without panic.
+- [ ] Create binary package `fccli`, Edition 2024, `rust-version = "1.96"`, exact Rust 1.96.0 toolchain configuration, generated retained `Cargo.lock`, and only the chunk-2 module/test paths needed now, plus the target-specific Linux PTY harness dependency `nix = "=0.30.1"` with `default-features = false` and features `term`, `process`, and `fs`, using `openpty`/spawn so macOS/Windows all-target builds remain clean. The plan's final tree is an end-state inventory and MUST NOT pre-create files assigned to later chunks.
+- [ ] Pin the exact direct dependencies and minimal features listed by `init.plan.md` § Reproducible baseline, including the canonical cancellation-token dependency; do not maintain a second version/feature inventory here.
+- [ ] Define mutually exclusive Cargo features `test-transport` and `production-transport`, with `production-transport` the default used by ordinary `cargo run`. Under `test-transport`, production constructors/hosts are not compiled and the `fccli` binary remains buildable for Assert Cmd help/version/invalid-input tests without obtaining production transport. In this chunk validate only feature mutual exclusion, default selection, and successful test-/production-feature compilation; do not add a constructor compile-fail fixture before a real constructor exists.
+- [ ] Establish `src/main.rs`, `src/lib.rs`, `src/provider/mod.rs`, `src/chart/mod.rs`, support-module locations needed by the skeleton, `tests/feature_selection.rs`, and `tests/fixtures/`; keep `main.rs` limited to bootstrap, CLI dispatch, runtime startup, top-level reporting, and final process status. Do not create `tests/app_live_contract.rs` in this chunk; chunk 17 creates it with the real App/dispatcher contract.
+- Definition of done: the empty architecture checks with Rust 1.96.0, exact pins resolve into the lockfile, feature mutual exclusion/default/API visibility and TLS/backend features are unambiguous, and no application logic or compatibility shim is hidden in bootstrap.
 
-- [ ] Implement Binance WebSocket decoding and supervision
-  - What to change:
-    - Connect to `wss://data-stream.binance.vision/ws/<lowercase-symbol>@kline_<timeframe>` using injected base URL support for tests.
-    - Deserialize Binance Kline stream payloads into provider-neutral candles and status events.
-    - Upsert updates sharing an `open_time`; append only when a new interval begins.
-    - Reply explicitly to ping frames with pong frames.
-    - Treat close frames, transport failures, 24-hour expiry, and `serverShutdown` as reconnect conditions.
-    - Emit `Connected`, `Reconnecting`, `Disconnected`, and provider error events.
-    - Implement reconnect delays of 1, 2, 4, 8, 16, and then 30 seconds.
-    - During reconnect, begin receiving WS messages, fetch REST from the last known candle, merge the gap, replay buffered WS events, then resume normal streaming.
-  - Where:
-    - `src/provider/binance.rs`
-    - `tests/binance_live.rs`
-    - `tests/fixtures/binance_kline_open.json`
-    - `tests/fixtures/binance_kline_closed.json`
-  - Definition of done:
-    - A local test WebSocket can drive current-candle mutation, closed-candle append, ping/pong, forced disconnect, reconnect status, and gap reconciliation.
-    - Overlapping REST and WS events produce one candle per `open_time` in chronological order.
+### 3. Define provider-neutral domain and events
 
-- [ ] Implement the candle store
-  - What to change:
-    - Add `CandleSeries` backed by `VecDeque<Candle>`.
-    - Implement initial replacement, older-page prepend, newest-candle upsert, new-candle append, indexed access, visible-range iteration, oldest/newest timestamp access, and end-of-history state.
-    - Filter duplicate/overlapping history before insertion.
-    - Return the count of actually prepended candles so view indices can be shifted without visual jumps.
-  - Where:
-    - `src/model.rs`
-    - `tests/chart_state.rs`
-  - Definition of done:
-    - The series remains strictly chronological and unique after arbitrary initial, backfill, live, and reconnect batches.
-    - Prepending overlapping pages does not duplicate or reorder existing data.
-    - Empty, one-candle, and current-open-candle cases are supported without panic.
+- [ ] Define non-circular typed error taxonomy for application, provider, payload, HTTP/status, invalid symbol, rate limit, timeout, transport, terminal, and rendering failures with provider/symbol/timeframe/operation/cause context and no raw payload dumps. `RecoverableError` and `TerminalError` are distinct event data; stream `Err` is only supervisor/join/channel failure.
+- [ ] Define only chunk-3 domain/event/value foundations, including exact `MonoInstant` and every absolute-deadline value used by `MarketEvent`/`RateGateState`; provider aliases/traits/channels, cancellation, `Clock`, scheduler/conversion/task seams belong to chunk 7. `RendererSnapshot` belongs to chunk 12 and dispatch belongs to chunk 17.
+- [ ] Store candle OHLC, unchanged base volume, open/close Unix-ms timestamps, and authority only; derive open/closed finality from `FinalityAuthority` and never store a second boolean/state. Reject non-finite numbers, negative volume, invalid timestamp order/body bounds, timestamps outside the shared `time::OffsetDateTime`-format/calendar/pagination-safe millisecond domain, and values outside the precisely defined chart-safe finite domain. Define REST input as provisional only and freeze the complete merge/adjacency rules for chunk 4 without performing series-level closure here.
+- [ ] Give `HistoryRequest` validated latest/older/gap constructors, checked timestamp subtraction/addition within the same formatter-safe domain, allowed limits/ranges, `start <= end`, inclusive watermark overlap, checked next-page `last_returned_open_time + 1` millisecond, and no-progress safeguards that do not use fixed timeframe duration for `1M`.
+- [ ] Freeze only domain-level validation and checked timestamp arithmetic needed by these values; do not introduce provider task/runtime seams or chart-state formulas in this chunk.
+- Definition of done: domain tests include `MonoInstant`/deadline values; provider task behavior and `Clock` abstraction start in chunk 7.
 
-- [ ] Implement history backfill coordination
-  - What to change:
-    - Track backfill-in-flight, retry deadline, end-of-history, and last error state.
-    - Trigger a backfill when the visible left edge reaches the first 10% of loaded candles.
-    - Serialize backfill requests so only one request exists at a time.
-    - Shift the logical viewport index by the number of prepended candles.
-    - Stop future requests after an empty Binance page.
-    - On 429, defer until `Retry-After`; on other failures, keep current data visible and expose status text while allowing a later boundary-triggered retry.
-  - Where:
-    - `src/app.rs`
-    - `src/model.rs`
-    - `tests/chart_state.rs`
-  - Definition of done:
-    - Reaching the boundary requests exactly one page.
-    - Successful prepend leaves the same candles under the same screen columns.
-    - Empty, failed, and rate-limited responses do not cause request loops or terminate the TUI.
+### 4. Implement pure candle storage
 
-- [ ] Implement chart view state and auto-scaling
-  - What to change:
-    - Add `ChartViewState` fields for rightmost logical candle index, visible candle count, price center/span, Y auto-scale, live-follow, hover state, and active drag state.
-    - Add separate snapshot and interactive initializers.
-    - Snapshot initialization fits one latest candle per plot column.
-    - Interactive initialization targets one latest candle per two plot columns.
-    - Clamp horizontal visibility between 10 candles and one candle per plot column.
-    - Auto-scale Y from visible low/high plus 5% padding; provide a magnitude-based nonzero fallback for flat prices.
-    - Implement X pan, Y pan, X/Y zoom, `End`, `r`, live append behavior, prepend index shifting, and resize re-clamping using the locked factors.
-    - Disable Y auto-scale after any manual Y pan or zoom.
-    - Disable live-follow after movement away from the latest boundary and restore it at the latest boundary.
-  - Where:
-    - `src/chart/state.rs`
-    - `tests/chart_state.rs`
-  - Definition of done:
-    - Every key transform changes the intended state by the locked amount and respects bounds.
-    - Live appends move the view only when live-follow is active.
-    - `End` and `r` have their distinct locked behaviors.
-    - All range calculations remain finite for empty, one-candle, flat, tiny-price, and very large-price data.
+- [ ] Implement store-only `CandleSeries` with `VecDeque<Candle>`: initial replacement, older prepend, indexed/visible access, exact `open_time` lookup, oldest/newest timestamps, live upsert/append, arbitrary batch merge, and calendar-aware continuity query. It owns no end-of-history/no-progress latch and no view anchor, drag, or hover state.
+- [ ] Accept and stably sort unsorted input, preserving acceptance order among equal `open_time`; deduplicate overlaps, enforce strict chronological uniqueness, apply the exact four-state precedence, and after every mutation recompute provider-successor REST adjacency over the complete merged series, promoting or demoting provisional closure independently of HTTP pages.
+- [ ] Return exactly the canonical `MutationSummary { inserted, replaced, unchanged, old_to_new, resolved, empty_input, duplicate_only, no_progress }`, with `ResolvedMutation { open_time, final_index, kind }` and `MutationKind { Inserted, Replaced, Unchanged }`; consumers derive prepended/inserted ranges and appended/updated facts rather than storing a competing taxonomy.
+- Definition of done: deterministic store tests cover empty, one/current-open candle, malformed, out-of-order batches, overlaps, REST/WS clock skew, the complete four-state table, authoritative regression, arbitrary reconnect batches, duplicate-only signals, adjacency appearing/disappearing across older and later pages, exact-1000 boundaries, missing-middle continuity, exact open-time lookup/index mapping, and checked oldest-minus-one without panic or reordering. Anchor preservation before/inside/after the viewport belongs only to chunk 5; the sole end/no-progress latch belongs only to chunk 16.
 
-- [ ] Implement deterministic chart layout regions
-  - What to change:
-    - Compute and retain rectangles for the two-line header, main candle plot, right price axis, volume pane, UTC time axis, and interactive footer.
-    - Allocate roughly 20% of graph height to volume with a minimum of three rows.
-    - Exclude the footer in snapshot mode without changing renderer internals.
-    - Add the 60×18 minimum-size state.
-    - Expose the plot/price-axis/time-axis rectangles for mouse hit-testing.
-  - Where:
-    - `src/chart/layout.rs`
-    - `tests/chart_render.rs`
-  - Definition of done:
-    - Layout rectangles never overlap or exceed the frame.
-    - Both 80×24 and 120×36 layouts contain every required region.
-    - Undersized frames produce only the resize/error layout, not partial chart geometry.
+### 5. Implement pure chart view state and numerical invariants
 
-- [ ] Implement price, volume, and UTC label formatting
-  - What to change:
-    - Calculate price tick spacing and adaptive decimal precision from the effective Y range and axis height.
-    - Prevent tiny assets from rendering all labels as `0.00`.
-    - Format volume compactly without changing the stored base volume.
-    - Select 4–8 time ticks according to plot width and visible candle count.
-    - Format intraday, daily, weekly, and monthly labels in UTC and suppress labels that would overlap.
-  - Where:
-    - `src/chart/format.rs`
-    - `tests/chart_render.rs`
-  - Definition of done:
-    - Price labels are monotonic, fit the price-axis width, and remain distinguishable for tiny and large values.
-    - UTC labels remain non-overlapping at all supported fixed test sizes and timeframe categories.
+- [ ] Define `ChartViewState` logical states/initializers, including distinct empty-data state; `InteractiveChartState::LayoutPending` is App state owned by chunk 17, not a dummy chart view, while chunk 11 only supplies pure layout results.
+- [ ] Pure view initialization requires explicit positive `plot_width`; chunk 17 performs the sole first-adequate transition using chunk 11's `ChartLayoutResult::Ready`, and later resizes preserve/reclamp.
+- [ ] Retain exact snapshot and interactive count formulas, the exact nonempty interactive `min_visible_count = min(series_len, plot_width, 10)`, and the global plot-width invariant.
+- [ ] Implement visibility bounds, pan/zoom rounding, keyboard zoom anchors, live-follow/latest invariant, `End`, distinct `r`, live append, resize center preservation/re-clamping, and every index-aware series mutation. After every keyboard or mouse X zoom, enforce `min_visible_count` and then reclamp all visibility bounds; a further zoom-in at that minimum is a no-op.
+- [ ] On every series mutation, preserve persistent logical X/right-edge/center references through candle `open_time`, `MutationSummary.old_to_new`, and `MutationSummary.resolved`; test insertions before, inside, and after the viewport. Cancel active drag and set coordinate-derived hover to `None`; chunk 5 performs no retained-coordinate projection.
+- [ ] Implement overflow-resistant visible-extrema math with exactly 5% auto-Y padding on each side, deterministic flat/tiny fallback, finite projection for zero/negative/tiny/large values, and manual Y pan/zoom disabling auto-scale even when clamped.
+- [ ] Own the flat/tiny Y epsilon, minimum/maximum manual span formulas, checked exponent short-circuit, and every chart-state numeric boundary assigned by the canonical plan.
+- Definition of done: pure tests with explicit plot widths prove exact initial counts, distinct empty state, exact 5% padding, every factor/sign/rounding/bound, 1–9 behavior, global plot-width ceiling after every mutation/zoom/resize, exact `min_visible_count = min(series_len, plot_width, 10)` after keyboard and mouse X zoom plus reclamping, and a blocked next zoom-in at that exact minimum, live follow, open-time/index-mapped anchor preservation for insertions before/inside/after the viewport, and post-mutation drag cancellation/hover invalidation. No layout, hit testing, retained-coordinate hover reprojection, or formatter integration is implemented in this chunk.
 
-- [ ] Implement the custom candlestick and volume renderer
-  - What to change:
-    - Implement a Ratatui widget that writes directly into `Buffer`; do not use `cli-candlestick-chart`, Ratatui `Canvas`, or another candlestick widget.
-    - Project high/open/close/low into rows using Unicode wick/body-edge glyphs including `│`, `┃`, `╷`, `╵`, `╻`, `╹`, `╽`, and `╿`.
-    - Center the wick in each candle slot and repeat the body across multi-column slots.
-    - Render horizontal price ticks/grid, right-axis labels, volume bars, and UTC time labels from the shared layout/state.
-    - Use Ratatui green/red colors and apply a deterministic monochrome bull/bear glyph distinction under `NO_COLOR`.
-  - Where:
-    - `src/chart/widget.rs`
-    - `src/chart/mod.rs`
-    - `tests/chart_render.rs`
-  - Definition of done:
-    - Fixed Buffer tests prove bullish/bearish bodies, wicks, volume bars, axes, colors, monochrome glyphs, and slot alignment.
-    - No renderer path aggregates multiple source candles into one display candle.
-    - Snapshot and interactive callers invoke the same widget API.
+### 6. Implement CLI parsing and pure Binance canonicalization
 
-- [ ] Render header, status, footer, and crosshair overlays
-  - What to change:
-    - Render source, market, normalized pair, timeframe, connection state, and latest/hovered candle UTC OHLCV in the two-line header.
-    - Use hovered candle data only while the pointer is inside the plot and no drag is active.
-    - Render the crosshair after candles/grid: vertical line at the nearest candle center, horizontal line at hovered price, time label on the X axis, and price label on the Y axis.
-    - Add the locked shortcut legend and live/backfill/reconnect/rate-limit status to the interactive footer.
-    - Suppress the crosshair during drag and restore it after release.
-  - Where:
-    - `src/chart/widget.rs`
-    - `src/chart/state.rs`
-    - `tests/chart_render.rs`
-  - Definition of done:
-    - Moving the hover point changes the header and crosshair to the nearest candle and mapped price.
-    - Leaving the plot restores latest-candle details.
-    - Status text reflects live, reconnecting, backfilling, rate-limited, and disconnected states without hiding the chart.
+- [ ] Define positional `instrument`, `timeframe`, and `-i`/`--interactive`; parse generic provider prefix and pair grammar into `InstrumentSpec`, with explicit error precedence. Chunk 6 parses `ProviderId` only; concrete registry lookup/selection occurs only after full Binance REST/live implementations in chunk 10.
+- [ ] Reject malformed symbols/providers/timeframes before terminal, runtime, or network work; preserve case-sensitive `1m`/`1M` and exact intervals. Reject quote-only suffix tokens after canonical splitting; require nonempty canonical base and quote.
+- [ ] Implement Binance-local pure uppercase/canonical resolution and display/provider symbol fields without network access, including the shortest valid suffixed pair.
+- [ ] Use only `Cli::try_parse_from`/command rendering library tests. No Assert Cmd or binary path in chunk 6; binary help/version/argument errors begin only in chunk 17.
+- Definition of done: parser/canonicalization library behavior only; valid modes are later direct `run_with_dependencies` tests, never child-process injection.
 
-- [ ] Implement keyboard interaction mapping
-  - What to change:
-    - Map `A/D/W/S`, arrow keys, `h/H`, `v/V`, `End`, `r`, `q`, `Esc`, and `Ctrl-C` to the locked view/application actions.
-    - Accept both lowercase and uppercase WASD as movement while preserving the case-sensitive `h/H` and `v/V` zoom controls.
-    - Process key press and repeat events; ignore key release events to prevent Windows duplicate actions.
-  - Where:
-    - `src/chart/interaction.rs`
-    - `src/app.rs`
-    - `tests/chart_state.rs`
-  - Definition of done:
-    - Synthetic Crossterm key events produce exactly one expected action.
-    - Every navigation/zoom action has the correct sign and factor.
-    - Quit actions reach the common terminal-shutdown path rather than exiting directly.
+### 7. Define provider interface and task ownership
 
-- [ ] Implement mouse hover, pan, and axis scaling
-  - What to change:
-    - Map `Moved` events inside the plot to the nearest candle and price.
-    - On left-button down, capture drag region, starting coordinates, starting view state, and axis anchor.
-    - Plot drag maps column delta to candle offset and row delta to price offset, with chart content following the pointer.
-    - Price-axis drag applies `1.05^|row_delta|` around the initial cursor price; upward is zoom in.
-    - Time-axis drag applies `1.05^|column_delta|` around the initial cursor candle; rightward is zoom in.
-    - Mouse up commits the view and recomputes hover.
-    - Ignore drag events outside the retained plot/axis rectangles.
-  - Where:
-    - `src/chart/interaction.rs`
-    - `src/chart/state.rs`
-    - `tests/chart_state.rs`
-  - Definition of done:
-    - Region tests distinguish plot, price axis, time axis, and outside areas.
-    - Anchor values remain under the same cursor cell after axis scaling, subject only to clamping.
-    - Plot drag changes both X and Y and never activates axis scaling.
+- [ ] Implement exact chunk-7 aliases, provider traits, non-`Clone` `LiveRequest`, `LiveFeed`, `ProducerCompletionReceiver`, `RateGateSnapshot`, and every canonical latest-value endpoint/error symbol from the sole plan block. Keep `ReconcileAckReceiver` non-cloneable and sole: App retains `ReconcileAckSender`, while the consuming supervisor receives the receiver through `LiveRequest`.
+- [ ] Construct `accepted_watermark_channel(initial)` and initially-empty `reconcile_ack_channel()`; verify synchronous publication, awaitable `changed`, per-clone cursors, expectation registration, matching proof-only ack, every exact closure/publication/expectation error, and no polling.
+- [ ] Define cancellation, `Clock`, manual scheduler, checked duration-to-`MonoInstant` conversion, and task timeout seams; do not redefine chunk-3 deadline values.
+- [ ] Fake-provider tests prove one-way `ProducerCompletion::Running`→`Finished`, active non-consuming observation, and later consuming join returning the same result without duplicate accounting.
+- [ ] Preserve request-shutdown-before-restoration and consuming bounded join after restoration.
+- Definition of done: exact canonical APIs and symbols compile with no aliases or invented channels; no concrete Binance/registry exists yet.
 
-- [ ] Implement snapshot terminal output
-  - What to change:
-    - Fetch the latest 500 candles before performing terminal rendering.
-    - For TTY stdout, calculate terminal size, reserve one shell row, render once with Ratatui `Viewport::Inline`, place the cursor below the chart, and exit.
-    - Never enable raw mode, alternate screen, hidden cursor, or mouse capture in snapshot mode.
-    - For non-TTY stdout, render the shared widget into `TestBackend` at 120×36 and serialize plain Unicode rows without style escape sequences.
-    - Return exit code 1 for provider/render failures and a clear minimum-size error for TTYs smaller than 60×18.
-  - Where:
-    - `src/snapshot.rs`
-    - `src/lib.rs`
-    - `tests/chart_render.rs`
-  - Definition of done:
-    - Successful TTY execution leaves a complete chart in scrollback and returns immediately.
-    - Non-TTY output contains exactly 36 lines, no ANSI escape bytes, and the expected normalized symbol/timeframe header.
-    - Snapshot execution does not alter terminal input mode or screen buffer.
+### 8. Implement deterministic Binance REST
 
-- [ ] Implement panic-safe interactive terminal lifecycle
-  - What to change:
-    - Require both stdin and stdout to be TTYs and direct non-TTY users to snapshot mode.
-    - Add an RAII `TerminalSession` that enables raw mode, enters alternate screen, enables mouse capture, and hides the cursor.
-    - Restore cursor visibility, mouse capture, alternate screen, and raw mode in reverse order on normal return, error propagation, and panic unwinding.
-    - Keep all quit inputs on the same cleanup path.
-  - Where:
-    - `src/app.rs`
-    - `src/error.rs`
-  - Definition of done:
-    - Normal exit, provider-task error, render error, `q`, `Esc`, and `Ctrl-C` all restore the terminal.
-    - No code path calls `process::exit` while the terminal session is active.
+- [ ] Build private Binance foundations with exact production REST base `https://data-api.binance.vision`, injectable literal-loopback test base, one shared Reqwest client/gate, exact REST timeout/cap, the identifying `fccli` User-Agent, and production constructor boundary.
+- [ ] Implement exact `/api/v3/klines` latest/older/gap queries and checked pagination.
+- [ ] Decode validated 12-element arrays into immutable `RestProvisionalOpen` candles only.
+- [ ] Enforce exact matrix: invalid-symbol HTTP 400 sanitized Binance code/message; every other non-418/non-429 HTTP 4xx (including non-invalid-symbol 400 and 403) maps to the sanitized typed non-retryable HTTP/client-status error; 429 valid `Retry-After` or exact 30 s invalid/missing fallback; 418 valid deadline or absorbing `InvalidBanExpiry`; generic 5xx recoverable status; typed request timeout/transport failure; typed malformed JSON/non-array/wrong-arity/invalid-field/over-budget payload failure.
+- [ ] Add independent local Wiremock cases for every matrix row, including generic non-special 4xx/client status, plus exact endpoint/query, identifying `fccli` User-Agent, isolation, redirects/public-connect negatives, and production-constructor boundary assertions.
+- Definition of done: every matrix row, exact endpoint/query, and identifying `fccli` User-Agent is independently covered; invalid-symbol 400 is distinguished from other 400 responses, generic client status is terminal/non-retryable, and no “original cases” reference is needed.
 
-- [ ] Implement the asynchronous interactive application loop
-  - What to change:
-    - Resolve the instrument and load the initial 500 candles before entering the alternate screen.
-    - Start the Binance live supervisor after the TUI session is established.
-    - Use `crossterm::event::EventStream` and `tokio::select!` for terminal events, live provider events, history results, and retry/status timers.
-    - Maintain one application state containing `CandleSeries`, `ChartViewState`, connection status, history state, and dirty/redraw state.
-    - Redraw only after data, view, hover, connection status, history status, or terminal size changes.
-    - Keep the last valid chart visible while reconnecting.
-    - Re-clamp state on resize and request older data through the history coordinator near the left boundary.
-    - Abort and join live/history tasks during shutdown.
-  - Where:
-    - `src/app.rs`
-    - `src/lib.rs`
-  - Definition of done:
-    - Live events update the chart without blocking keyboard/mouse processing.
-    - Historical inspection remains stationary while live data updates offscreen.
-    - Resize, backfill, reconnect, hover, and quit events can occur in any order without deadlock, duplicate tasks, or terminal corruption.
+### 9. Implement the WebSocket codec and local harness
 
-- [ ] Finalize user-facing error and compatibility behavior
-  - What to change:
-    - Ensure provider, symbol, timeframe, HTTP status, timeout, malformed payload, WebSocket, TTY, terminal-size, and rendering errors use concise actionable messages.
-    - Preserve snapshot exit code 1 for runtime/provider failures and Clap’s argument-error exit behavior for invalid input.
-    - Honor `NO_COLOR` consistently in TTY and non-TTY output.
-    - Keep all production endpoints unauthenticated; do not add API key configuration.
-    - Exercise Crossterm press/repeat/release handling in platform-neutral tests.
-  - Where:
-    - `src/error.rs`
-    - `src/main.rs`
-    - `src/snapshot.rs`
-    - `src/app.rs`
-  - Definition of done:
-    - Every expected failure returns a stable nonzero status without panic or raw payload dumps.
-    - Error messages identify the failed operation and contain no secrets or internal debug representation.
+- [ ] Decode private Binance kline payloads into a closed internal decoded-frame outcome covering validated open/closed candle data, ignorable/provider frames, close, `serverShutdown`, malformed/provider error, and terminal configuration/invariant failure. The codec does not construct `MarketEvent`, choose generation tags, transition connection status, set retry deadlines, or decide in-band terminal delivery; chunk 10 owns all such mappings.
+- [ ] Construct exact `wss://data-stream.binance.vision/ws/<lowercase-symbol>@kline_<timeframe>`; validate byte sizes, frame ≤ message, and strictly `write_buffer_size < max_write_buffer_size` before Tungstenite. Equality must return typed configuration error. Chunk 9 exclusively owns/validates `WS_STALLED_WRITE_TIMEOUT = 5 s` over `1 ms..=60 s`.
+- [ ] Continuously poll/flush so Tungstenite automatic Pong works; never manually duplicate it. Chunk 9 owns only raw socket behavior without the application channel: prove automatic Pong while ordinary application writes are stalled. The real bounded downstream queues, sender-readiness selection, and full-channel behavior belong only to chunk 10.
+- [ ] Add open/closed/malformed/serverShutdown/oversized fixtures and a loopback `TcpListener` + `accept_async` WebSocket harness (Wiremock remains REST-only).
+- Definition of done: local codec tests cover every timeframe mapping, open/closed candle decoding and authority, field and configured-budget failures, close/serverShutdown internal outcomes, oversized fragmented input, raw-socket stalled writes, and exactly one automatic Pong per Ping without an application queue. Generation/status/retry/`MarketEvent`, full-downstream, and multiple-Ping progress tests belong only to chunk 10.
 
-- [ ] Add deterministic fixtures and integration test seams
-  - What to change:
-    - Add representative REST history, open Kline, and closed Kline JSON fixtures.
-    - Ensure `BinanceProvider` constructors accept local REST and WS endpoints for tests without hidden production CLI flags.
-    - Add helpers for deterministic candle sets, fixed UTC timestamps, fixed terminal buffers, and synthetic Crossterm events.
-    - Keep all automated tests isolated from the public internet.
-  - Where:
-    - `tests/fixtures/binance_klines.json`
-    - `tests/fixtures/binance_kline_open.json`
-    - `tests/fixtures/binance_kline_closed.json`
-    - test support code within `tests/*.rs`
-  - Definition of done:
-    - Tests can reproduce REST pagination, WS updates/reconnect, view transforms, mouse input, and rendering without wall-clock or network nondeterminism.
+### 10. Implement the WebSocket supervisor and reconciliation state machine
 
-- [ ] Add Linux, macOS, and Windows CI
-  - What to change:
-    - Create a GitHub Actions matrix for `ubuntu-latest`, `macos-latest`, and `windows-latest` using Rust 1.96.
-    - Run `cargo test` and `cargo clippy --all-targets -- -D warnings` on every platform.
-    - Run `cargo fmt --check` on Linux.
-    - Do not provide Binance credentials or allow public network tests in CI.
-  - Where:
-    - `.github/workflows/ci.yml`
-  - Definition of done:
-    - All matrix jobs pass from a clean checkout.
-    - Windows builds use the same Crossterm/Ratatui code path and pass key-event tests.
+- [ ] Implement exact state transitions with cancellation dominant and construct every exact generation-tagged `MarketEvent`, including `Candle { generation, candle }`, from chunk-9 decoded-frame outcomes. During gap synchronization, every non-special HTTP 4xx from REST emits `MarketEvent::TerminalError` with the sanitized typed non-retryable HTTP/client-status `ProviderError` and terminates the producer; emit other `TerminalError` values only for unrecoverable provider configuration/invariants, and use terminal stream `Err` only after in-band delivery is impossible.
+- [ ] Every generation, including `Some(confirmed)`, waits for a first decoded WS kline under `FIRST_KLINE_HANDSHAKE_TIMEOUT` before REST reconciliation can complete; event-at-deadline wins. Every reconciliation WS candle mutation advances `revision` and sets `target_open_time = max(current_target_open_time, candle.open_time)`, including accepted or coalesced mutations between or during paginated REST requests. Register the exact latest `ReconcileExpectation` before each batch; matching proof-only ack of App continuity through that latest target/revision gates `Connected`.
+- [ ] Missing-middle no-ack reaches chunk-10-owned `RECONCILE_ACK_TIMEOUT = 10 s` (`1 ms..=60 s`, ack-at-deadline wins), emits exact `ProviderError::ReconcileAckTimeout`, invalidates/purges/closes, then enters Backoff. Retain exact gap no-progress and invalid-418 producer transitions.
+- [ ] Select over awaitable watermark/ack changes, read/flush, gate, work, and bounded sender readiness. Use exact production capacities `KEYED_CANDLE_CAPACITY = 1024`, `CONTROL_CAPACITY = 64`, `MARKET_EVENT_CHANNEL_CAPACITY = 256`, and non-configurable `EMERGENCY_CONTROL_CAPACITY = 2`; test-injectable non-emergency values validate only over `1..=65_536`, and normal traffic can never consume the two emergency slots reserved for the overflow error/`Backoff` pair.
+- [ ] Own/validate only those supervisor capacities, `FIRST_KLINE_HANDSHAKE_TIMEOUT = 10 s`, `RECONCILE_ACK_TIMEOUT = 10 s`, max age, and reconnect backoff `1, 2, 4, 8, 16, 30, 30, … s`. Reset backoff only after acknowledged `Connected`; each retry waits until `max(checked_backoff_deadline, current_rate_gate_deadline)`. Consume chunk-9 validated stalled-write timeout and own only recovery transition/integration. REST timeout is chunk 8; App quota/join timeouts chunk 17.
+- [ ] Complete concrete shared Binance registry only after producer behavior passes.
+- Definition of done: manual-clock and boundary producer tests cover the advancing current-target barrier, WS mutations before/between/after multiple REST pages, a `1M` timeframe page-boundary race, App continuity required through the latest target/revision before `Connected`, expectation channel errors, no-ack timeout/equality, gap-sync non-special HTTP 4xx in-band `MarketEvent::TerminalError` delivery followed by producer termination, producer completion, every capacity bound and permanently reserved emergency pair, saturation, the full reconnect sequence/repeat/reset, rate-gate maximum interaction, multiple-Ping progress under full downstream capacity, and registry; stalled-write configuration validation remains solely chunk 9. Consumer handling and state-preservation proof belong solely to chunk 17.
 
-## Validation
+### 11. Implement deterministic layout and formatting
 
-- [ ] Run CLI contract tests
-  - Execute the `tests/cli.rs` suite.
-  - Cover snapshot/interactive parsing, default/explicit provider, all symbol forms, all official timeframes, `1m` versus `1M`, unknown provider, malformed pair, and unsupported timeframe.
-  - Pass condition: every valid command parses to the exact locked model and every invalid command exits before network access.
+- [ ] Purely calculate retained layout from the actual frame origin/size. The sole canonical enum is exactly `ChartLayoutResult::LayoutPending { required: Size, actual: Size } | ChartLayoutResult::Ready { layout: ChartLayout }`: pending contains `required = Size { width: 60, height: 18 }` and the actual effective frame size, while ready contains only `layout`. No variant or `ChartLayout` stores a duplicate `plot_width`; every consumer derives it from `layout.main_plot.width`. Adequate input retains exactly `ChartLayout { frame, header, main_plot, volume, gutter, price_axis, utc_axis, footer }`, where `footer: Option<Rect>` and every other named field is a retained `Rect`. Chunk 11 only computes layout and related pure formatting/slot geometry: it does not render, define/construct renderer snapshots, mutate `InteractiveChartState`, or perform the first-adequate App transition.
+- [ ] For input `frame = Rect { x: x0, y: y0, width: W, height: T }`, return `LayoutPending { required: Size { width: 60, height: 18 }, actual: Size { width: W, height: T } }` whenever effective `W < 60 || T < 18`, before evaluating any reservation equation. Otherwise let `header_h = 2`, `utc_h = 1`, `footer_h = if interactive { 1 } else { 0 }`, `gutter_w = if W >= 2 { 1 } else { 0 }`, `price_w = min(14, W.saturating_sub(gutter_w + 1))`, `plot_w = W - gutter_w - price_w`, and checked/saturating `H = T - header_h - utc_h - footer_h`; the adequate-frame guard guarantees `H >= 4`. Let `volume_h = clamp((H + 2) / 5, 3, H - 1)` and `main_h = H - volume_h`. The exact retained rectangles are `frame = input`, `header = Rect(x0, y0, W, 2)`, `main_plot = Rect(x0, y0 + 2, plot_w, main_h)`, `volume = Rect(x0, y0 + 2 + main_h, plot_w, volume_h)`, `gutter = Rect(x0 + plot_w, y0 + 2, gutter_w, H)`, `price_axis = Rect(x0 + plot_w + gutter_w, y0 + 2, price_w, H)`, `utc_axis = Rect(x0, y0 + 2 + H, plot_w, 1)`, and `footer = if interactive { Some(Rect(x0, y0 + 2 + H + 1, W, 1)) } else { None }`. All additions are checked/u16-safe after the adequate-frame guard and every rectangle remains inside `frame` at nonzero origins.
+- [ ] Freeze universal half-open containment and hit regions from those exact retained rectangles: `main_plot` alone owns candle hover and left plot-pan drag; the full `price_axis` alone owns Y-scale drag; `utc_axis` alone owns X-scale drag; `header`, `volume`, `gutter`, and `footer` are noninteractive; any coordinate outside `frame`, on a rectangle's right edge, or on its bottom edge is outside that region. Own the sole `CandleSlotGeometry` half-open equal-partition/remainder-left/center-floor formula and tests for renderer and interaction consumers.
+- [ ] Implement only pure price/volume/UTC formatting and retained layout/slot projection helpers; no Buffer rendering or App/view-state transition belongs here.
+- Definition of done: pure tests prove exact `LayoutPending { required, actual }` values for effective 59×18 and 60×17 frames, `Ready { layout }` for effective 60×18, exactly the canonical `ChartLayout` fields, exact adequate rectangles/consumer-derived `layout.main_plot.width`, and universal half-open hit regions at nonzero origins and fixed 60×18/80×24/120×36 frames, the pre-equation minimum guard, `H >= 4`, the complete reservation equations, exact volume/main split, formatting, and sole slot geometry. No competing layout result/type, duplicate stored plot width, dummy empty/zero-width view, renderer snapshot construction, resize-only rendering, first-adequate App transition, or interactive state mutation exists in chunk 11.
 
-- [ ] Run Binance REST mock tests
-  - Execute `tests/binance_rest.rs` against Wiremock.
-  - Assert initial and backfill query parameters, tuple decoding, invariant validation, invalid-symbol 400, 429 with `Retry-After`, 500, timeout, and malformed JSON behavior.
-  - Pass condition: no test accesses Binance; all failures return the expected typed error and no test panics unexpectedly.
+### 12. Implement the shared custom Buffer renderer and overlays
 
-- [ ] Run Binance WebSocket integration tests
-  - Execute `tests/binance_live.rs` against a local Tokio WebSocket server.
-  - Cover open-candle mutation, closed-candle append, ping/pong, forced disconnect, reconnect delays/status, REST gap fill, buffered WS replay, and overlap deduplication.
-  - Pass condition: emitted candles are chronological and unique and the stream returns to `Connected` after the simulated outage.
+- [ ] Implement one Ratatui widget writing directly into `Buffer`, with public input `RenderPolicy`; do not use `cli-candlestick-chart`, Ratatui `Canvas`, or another candlestick widget.
+- [ ] Project candles with the complete style-free wick/body-edge glyph inventory `│`, `┃`, `╷`, `╵`, `╻`, `╹`, `╽`, `╿`, plus bull body `█`, bear body `▓`, and doji `━`. Name and implement the exact single-row/two-row wick-only, wick-to-body edge, body-interior, clipped top/bottom wick, body/wick overlap, and doji projection cases; use chunk 11's sole `CandleSlotGeometry` for centered wicks and repeated bodies/directional volume, never aggregate source candles, and enforce `visible_count <= plot_width`.
+- [ ] Freeze grid drawing before candles/overlays: each horizontal price-tick row writes glyph `─` with `Style::default().fg(Color::DarkGray)` across every `main_plot` cell in color policy and glyph `─` with exactly `Style::default()` in style-free policy; no vertical grid is drawn. Candles and volume then overwrite grid cells they occupy.
+- [ ] Introduce and own canonical `RendererSnapshot` with `chart_state` and no `layout_result` field; no `RendererFrameState` exists. The renderer receives a complete `RendererSnapshot` and a separate canonical `ChartLayoutResult` argument. Render `ChartLayoutResult::LayoutPending { required, actual }` as resize-only with no chart rectangles, and render `ChartLayoutResult::Ready { layout }` as the chart; consumers derive plot width only from `layout.main_plot.width`, without requiring a placeholder view or performing initialization. Preserve exact status/header/footer contracts. The `InteractiveChartState::LayoutPending`→`Ready` first-adequate transition remains exclusively in chunk 17.
+- [ ] Render crosshair last and never in `volume`, `header`, or `footer`: vertical glyph `┆`, horizontal glyph `┄`, and their intersection glyph `┼`; color policy uses `Style::default().fg(Color::Yellow)` for all three, while style-free policy uses the identical glyphs/order with exactly `Style::default()` and no ANSI. The vertical segment covers `main_plot` only. The horizontal segment replaces grid/candle cells across `main_plot` and continues as `┄` through `gutter`. The crosshair intersection is `┼` and wins over both segments.
+- [ ] Axis overlays are final: center the complete UTC label on the hovered candle center, then clamp the whole label inside `utc_axis`; it replaces underlying UTC ticks. Left-align the complete Y-price label and space-pad it to exactly `price_axis.width`; it replaces the entire corresponding `price_axis` row. Both labels use `Style::default().fg(Color::Black).bg(Color::Yellow)` in color policy and exactly `Style::default()` in style-free policy, remain clipped to their retained axis rectangles, and never spill into gutter/frame. When `hover = None`, including after an outside-plot move or chunk-5 mutation invalidation, no crosshair/axis overlay remains and the two-line header shows latest-candle details rather than stale hovered OHLCV.
+- [ ] Apply only `RenderPolicy`; test exact green/red candle and volume styles, the frozen grid/crosshair/axis-overlay styles, and every style-free glyph `│`, `┃`, `╷`, `╵`, `╻`, `╹`, `╽`, `╿`, `█`, `▓`, `━`, `─`, `┆`, `┄`, and `┼` regardless of `NO_COLOR`.
+- Definition of done: pure fixed-`Buffer` tests pass a canonical already-reduced `RendererSnapshot` and separate `ChartLayoutResult` argument and assert exact glyphs and complete `Style` values for grid-before-candle, crosshair-over-grid/candle, `┼` intersection, horizontal `┄` gutter continuation, UTC whole-label centering/clamping, Y-label left alignment/space padding/full-row replacement, color and style-free policies, nonzero origins, and unchanged cells outside retained rectangles; they also cover every wick/body-edge/body/doji projection case, exact layout/time/empty formulas, exact `SNAPSHOT`, tiny/large price precision, compact volume bounds, directional volume, plot-width ceiling, hover-clear/latest-header reversion, and canonical statuses. `RendererSnapshot` contains `chart_state` and no `layout_result`; no `RendererFrameState` or stale-generation/control/candle reduction belongs in the renderer.
 
-- [ ] Run series and viewport state tests
-  - Execute `tests/chart_state.rs`.
-  - Cover prepend stability, live-follow pause/resume, `End`, `r`, WASD/arrows, `h/H`, `v/V`, all clamp boundaries, resize, empty data, one candle, flat prices, tiny prices, and large prices.
-  - Pass condition: transforms match the locked factors and all resulting indices/ranges are finite and valid.
+### 13. Implement keyboard and mouse interaction mapping
 
-- [ ] Run mouse interaction tests
-  - Cover region hit-testing, hover selection, crosshair suppression during drag, plot X/Y pan signs, price-axis anchor stability, time-axis anchor stability, out-of-region events, and release behavior.
-  - Pass condition: every synthetic mouse sequence produces the exact intended view transition without activating the wrong interaction mode.
+- [ ] Map press/repeat events for every locked key; ignore releases to prevent Windows duplicates; quit returns an action to the common shutdown path rather than exiting directly.
+- [ ] Map hover to nearest candle/price through the permanent chunk-11 `ChartLayout` rectangles and sole `CandleSlotGeometry`, with half-open containment and earlier/left ties; an unowned mouse move outside the plot emits explicit hover clear. Retain pointer coordinates, left-button drag ownership, starting state, initial cursor-candle X anchor, and initial-row mapped-price Y anchor.
+- [ ] Implement plot X/Y content-following pan, with downward plot drag raising the viewed price center; time-axis zoom around the initial cursor candle; price-axis zoom around the initial button-down price; fixed ownership outside the region; frame clamping; and mouse-up commit. Every mouse X zoom applies the chunk-5 nonempty `min_visible_count = min(series_len, plot_width, 10)` and then reclamps all visibility bounds; another zoom-in at that minimum is blocked. Chunk 13 exclusively owns coordinate projection but never a second slot partition: ordinary movement and release use the chunk-11 helper to compute or clear hover, and after chunk-5 mutation invalidation the next reducer pass may reuse it when retained coordinates remain inside the new plot.
+- Definition of done: synthetic platform-neutral tests prove exactly one action, every sign/factor/rounding, region distinction, downward-drag content following, X/price anchors, suppression during drag, inside→outside clearing, owned outside movement, release projection/clear, post-mutation retained-coordinate reprojection only through the permanent chunk-11/13 path, and mouse X zoom reaching the exact chunk-5 minimum, reclamping, and blocking the next zoom-in.
 
-- [ ] Run fixed Buffer rendering tests
-  - Execute `tests/chart_render.rs` at 80×24 and 120×36.
-  - Assert header content, bullish/bearish glyphs and colors, wick/body geometry, volume alignment, price labels, UTC labels, crosshair labels, status/footer text, `NO_COLOR`, and terminal-too-small output.
-  - Pass condition: rendered cells and styles match the expected deterministic buffers and labels do not overlap.
+### 14. Implement snapshot output
 
-- [ ] Validate snapshot TTY and non-TTY behavior
-  - Exercise TTY inline rendering and non-TTY 120×36 serialization using mocked market data.
-  - Pass condition: TTY mode leaves the chart in scrollback without entering raw/alternate mode; non-TTY output has 36 lines and no ANSI escapes.
+- [ ] Expose and directly test the permanent injected snapshot runner as a library API only. It must request `HistoryRequest::latest(..., limit=500)` and the injected provider/runner test must assert the exact latest limit `500`. No Assert Cmd, binary help/version/invalid, dispatcher, `RunDependencies`, or `run_with_dependencies` in chunk 14.
+- [ ] Preserve exact TTY inline sizing behavior: one physical shell row is reserved before pure layout, so physical 60×18 produces effective 60×17 and fails with resize-only `LayoutPending`, while physical 60×19 produces effective 60×18 and passes with `Ready { layout }`.
+- [ ] Preserve exact non-TTY 120×36 serialization.
+- [ ] Preserve exit/error semantics.
+- Definition of done: library-only real snapshot path and renderer behavior, including physical TTY 60×18 fail/60×19 pass boundary coverage; all binary early-exit coverage waits for chunk 17.
 
-- [ ] Run formatting, linting, and full tests
-  - Run `cargo fmt --check`.
-  - Run `cargo clippy --all-targets -- -D warnings`.
-  - Run `cargo test`.
-  - Pass condition: every command exits zero and the test logs show no public network requests.
+### 15. Implement transactional `TerminalSession`
 
-- [ ] Validate the cross-platform CI matrix
-  - Run the GitHub Actions workflow on Ubuntu, macOS, and Windows.
-  - Pass condition: tests and Clippy pass on all three OS families and formatting passes on Linux.
+- [ ] Separate session mechanics from `App`; require both TTYs and enter only after CLI validation and initial REST success. Use mandatory Linux-only Nix 0.30.1 (`term`, `process`, `fs`) `openpty`/spawn for real kernel coverage plus a supplementary injected terminal-command driver for deterministic faults.
+- [ ] Track each raw/alternate/mouse/cursor setup step as `NotAttempted`, `AttemptedOrActive`, or `Restored`, marking it attempted before issuing the mutation so side-effect-then-error remains rollback-eligible; inverse commands are idempotent best effort.
+- [ ] Explicit teardown is non-short-circuiting: attempt every undo in reverse order, aggregate failures, mark only successful restoration, and retain a preexisting application/provider/render error as the returned primary error with cleanup aggregate attached/reported as secondary. If otherwise-successful quit has cleanup failure, cleanup aggregate is primary and exit is nonzero. Best-effort non-panicking `Drop` retries uncertain state.
+- [ ] Inject pre-side-effect and side-effect-then-error for every setup plus every teardown failure; mandatory real PTY separately proves kernel modes/echo/inline/process restoration.
+- Definition of done: tests prove exact setup/reverse teardown for every exit/fault path, later undos run, returned-error/secondary attachment and exit status follow the locked rule, Drop retries without panic, and no active-session `process::exit`.
 
-- [ ] Smoke-test a real Binance snapshot
-  - Run `cargo run -- btc 1h` in a supported TTY with public network access.
-  - Check normalized `BTC/USDT`, Binance Spot source, `1h`, UTC labels, OHLCV header, candles, volume, price axis, shell-row preservation, and zero exit status.
-  - Pass condition: exactly one chart remains in scrollback and the process exits without changing terminal mode.
+### 16. Implement history coordination after store and view state
 
-- [ ] Smoke-test the real interactive Binance feed
-  - Run `cargo run -- binance:btc 1m --interactive`.
-  - Check that the header reaches `LIVE` and the current candle updates within Binance’s documented stream interval.
-  - Exercise hover crosshair/OHLCV, WASD/arrows, `h/H`, `v/V`, plot drag, price-axis drag, time-axis drag, left-boundary backfill, live-follow pause, `End`, `r`, and resize.
-  - Pass condition: each interaction matches the locked direction/factor, backfill does not shift the viewed candles, and live updates continue while historical follow is paused.
+- [ ] Implement the sole end/no-progress history latch in a pure coordinator tracking in-flight task, current observable rate-gate handle, retry deadline, one deferred arm, process-blocking 418 status, persistent typed non-retryable-client-4xx no-further-history-request state, last error/status, cancellation, and boundary state. Neither `CandleSeries` nor `ChartViewState` stores a duplicate latch or failure state.
+- [ ] Set `threshold = max(1, ceil(loaded_len × 0.10))`; trigger only when visible-left source index crosses to `< threshold`, never for empty data, in flight, before the current observed shared-gate deadline, after the coordinator's end/no-progress latch, while process-blocking 418 status is active, or after entering the typed non-retryable-client-4xx no-further-history-request state. Every wake rereads the provider-neutral gate observer, and observer closure is terminal typed state.
+- [ ] Serialize requests. Consume `MutationSummary`: empty-input or duplicate-only/no-progress sets the sole latch; actual older insertion clears/re-evaluates it only for the newly accepted request result. A 429 or valid-deadline 418 arms exactly one retry at the current gate if still inside; concurrent extension moves it, moving outside disarms, cancellation suppresses. Invalid/missing 418 records blocker status and permanently disables automatic history retry for this process. Only typed recoverable failures permit a later retry or boundary re-crossing. A typed non-retryable client HTTP 4xx enters the persistent no-further-history-request state, preserves every already accepted candle and the current view, and never issues another history request.
+- [ ] Ask `ChartViewState` to apply canonical `MutationSummary.old_to_new`/`resolved` anchors and the global `visible_count <= plot_width` clamp; cancel drag and clear coordinate-derived hover there. The coordinator never owns anchors or hover reprojection.
+- Definition of done: manual-clock tests prove single flight, the sole exact end/no-progress latch from empty/duplicate-only summaries, exact 429 30-second fallback, valid 418 deadline, invalid/missing 418 blocker/no automatic retry, retries only for typed recoverable failures, typed non-retryable client 4xx entering persistent no-further-history-request state with accepted data/view preserved and no later request after time, wake, or boundary re-crossing, current-gate extension/non-shortening, observer closure, boundary/disarm/mutations/underflow/cancellation/no loops. Anchor behavior remains chunk-5 coverage.
 
-- [ ] Validate every terminal restoration path
-  - Exit interactive mode separately with `q`, `Esc`, and `Ctrl-C`; also induce a controlled provider/render error in a local test session.
-  - Pass condition: the cursor is visible, mouse capture is disabled, the alternate screen is left, raw mode is disabled, and normal shell input/echo work after every exit.
+### 17. Implement the asynchronous interactive application loop
 
-- [ ] Run release-level terminal checks on each platform
-  - Linux: test a modern terminal and tmux.
-  - macOS: test Terminal.app or iTerm2.
-  - Windows: test Windows Terminal.
-  - Pass condition: keyboard navigation works everywhere; mouse hover/drag works wherever the terminal emits Crossterm mouse events; unsupported mouse reporting does not affect keyboard use or cleanup.
+- [ ] Build interactive App, then sole `RunDependencies`/`run_with_dependencies`/main dispatch. Assert Cmd is restricted to help/version/argument-error paths before dependencies; valid modes call `run_with_dependencies` directly with local dependencies. Create `tests/app_live_contract.rs` here for the first time and place all live App contract integration coverage there, matching the authoritative ledger command.
+- [ ] App owns `InteractiveChartState::LayoutPending | Ready`, latest-value senders, reconciliation keys, status and renderer snapshot. It publishes only proof-valid matching acks.
+- [ ] Undersized startup remains `InteractiveChartState::LayoutPending`; chunk 17 exclusively consumes the first adequate `ChartLayoutResult::Ready` to initialize once, while later resizes preserve/reclamp and never reinitialize. Redraw only on changes. Status transitions, reconnect, reconciliation/backfill, and rate-limit waits/errors preserve every accepted candle and the inspected viewport; only accepted series mutations use the canonical anchor-preserving update.
+- [ ] Reducer uses `ProducerCompletionReceiver` for the active producer-join bucket and preserves every canonical order/short-circuit.
+- [ ] Shutdown restores terminal before consuming joins; already-reduced producer completion is not duplicated, while join timeout/mechanics remain cleanup detail.
+- Definition of done: `tests/app_live_contract.rs` covers direct valid-mode dispatcher behavior, early-exit-only Assert Cmd, advancing current-target/ack-timeout flows including multi-page and `1M` WS races, App consumption of a gap-sync non-special HTTP 4xx `MarketEvent::TerminalError` with terminal shutdown and no retry, exclusive first-adequate `ChartLayoutResult::Ready` transition and LayoutPending recovery, deterministic proof that status/reconnect/backfill/rate-limit paths preserve accepted `CandleSeries` and inspected viewport, real producer-completion ordering, and restoration-before-join.
 
-- [ ] Review delivered scope against locked decisions
-  - Confirm that both modes share one renderer and provider-neutral domain model.
-  - Confirm that v1 contains no indicators, trading, export, persistent configuration, disk cache, multiple charts, futures market, or additional providers.
-  - Pass condition: every locked behavior is implemented and no out-of-scope feature or compatibility shim remains.
+### 18. Finalize errors, compatibility, and deterministic isolation
+
+- [ ] Stabilize actionable errors and exit semantics. Keep UI display precedence separate from returned-error precedence: preexisting application/provider/render error remains primary with teardown aggregate secondary; cleanup failure after successful quit is primary nonzero. Preserve Clap and snapshot exit rules; sanitize payloads/secrets.
+- [ ] Detect `NO_COLOR` once into `RenderPolicy`; every style-free path forces directional monochrome.
+- [ ] Ensure cross-platform input/TLS and no API keys.
+- [ ] Keep fixtures/helpers with consuming features, including the combined non-vacuous REST/WS/provider production-constructor compile-fail boundary introduced alongside the real constructors, and formatter-safe timestamp/tiny-price/large-price/large-volume fixtures.
+- Definition of done: failures are stable/no-panic; isolation and dependency/source review confirm no excluded behavior, hidden seam, or compatibility code.
+
+### 19. Add CI and complete final verification
+
+- [ ] Track deterministic verification only by these authoritative plan-ledger record IDs: `DET-FMT`, `DET-TEST-LINUX`, `DET-CLIPPY-LINUX`, `DET-TEST-MACOS`, `DET-CLIPPY-MACOS`, `DET-TEST-WINDOWS`, `DET-CLIPPY-WINDOWS`, `DET-PRODUCTION-CHECK`, `DET-LINUX-PTY`, `DET-DEFAULT-FEATURE`, `DET-MUTUAL-EXCLUSION`, `DET-CONSTRUCTOR-BOUNDARY`, and `DET-RECONCILIATION-STATE`.
+- [ ] Track environment-dependent and final verification only by these authoritative plan-ledger record IDs: `REAL-SNAPSHOT`, `REAL-INTERACTIVE`, `REAL-INTERACTIVE-MOUSE`, `RESTORE-Q`, `RESTORE-ESC`, `RESTORE-CTRL-C`, `RESTORE-PROVIDER-ERROR`, `RESTORE-RENDER-ERROR`, `RESTORE-PANIC`, `TERM-LINUX`, `TERM-TMUX`, `TERM-MACOS-TERMINAL`, `TERM-MACOS-ITERM2`, `TERM-WINDOWS`, `MOUSE-LINUX`, `MOUSE-TMUX`, `MOUSE-MACOS-TERMINAL`, `MOUSE-MACOS-ITERM2`, `MOUSE-WINDOWS`, and `FINAL-SCOPE`.
+- Definition of done: `FINAL-SCOPE`.
