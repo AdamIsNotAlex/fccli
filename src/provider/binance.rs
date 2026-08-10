@@ -1,10 +1,23 @@
-//! Binance Spot REST history transport.
+//! Binance Spot REST history and raw WebSocket transport.
 
 use std::{sync::Arc, time::Duration};
 
+use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode, Url, header::RETRY_AFTER};
-use serde::de::{IgnoredAny, SeqAccess, Visitor};
+use serde::{
+    Deserialize,
+    de::{IgnoredAny, SeqAccess, Visitor},
+};
 use serde_json::Value;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
+    tungstenite::{
+        Message,
+        error::CapacityError,
+        protocol::{WebSocketConfig, frame::coding::CloseCode},
+    },
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -28,6 +41,400 @@ pub const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "production-transport")]
 const PRODUCTION_REST_BASE: &str = "https://data-api.binance.vision";
+
+const PRODUCTION_WS_BASE: &str = "wss://data-stream.binance.vision";
+const WS_BYTE_LIMIT_MAX: usize = 16 * 1024 * 1024;
+pub const WS_READ_BUFFER_SIZE: usize = 128 * 1024;
+pub const WS_MESSAGE_SIZE: usize = 1024 * 1024;
+pub const WS_FRAME_SIZE: usize = 256 * 1024;
+pub const WS_WRITE_BUFFER_SIZE: usize = 64 * 1024;
+pub const WS_MAX_WRITE_BUFFER_SIZE: usize = 1024 * 1024;
+pub const WS_STALLED_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub type RawWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WsConfig {
+    pub read_buffer_size: usize,
+    pub max_message_size: usize,
+    pub max_frame_size: usize,
+    pub write_buffer_size: usize,
+    pub max_write_buffer_size: usize,
+    pub stalled_write_timeout: Duration,
+}
+
+impl WsConfig {
+    #[must_use]
+    pub const fn production() -> Self {
+        Self {
+            read_buffer_size: WS_READ_BUFFER_SIZE,
+            max_message_size: WS_MESSAGE_SIZE,
+            max_frame_size: WS_FRAME_SIZE,
+            write_buffer_size: WS_WRITE_BUFFER_SIZE,
+            max_write_buffer_size: WS_MAX_WRITE_BUFFER_SIZE,
+            stalled_write_timeout: WS_STALLED_WRITE_TIMEOUT,
+        }
+    }
+
+    pub fn validate(self) -> Result<Self, ProviderError> {
+        let byte_sizes = [
+            self.read_buffer_size,
+            self.max_message_size,
+            self.max_frame_size,
+            self.write_buffer_size,
+            self.max_write_buffer_size,
+        ];
+        if byte_sizes
+            .into_iter()
+            .any(|size| !(1..=WS_BYTE_LIMIT_MAX).contains(&size))
+        {
+            return Err(ProviderError::Configuration(
+                "WebSocket byte limits must be within 1..=16 MiB",
+            ));
+        }
+        if self.max_frame_size > self.max_message_size {
+            return Err(ProviderError::Configuration(
+                "WebSocket frame limit must not exceed message limit",
+            ));
+        }
+        if self.write_buffer_size >= self.max_write_buffer_size {
+            return Err(ProviderError::Configuration(
+                "WebSocket write buffer must be smaller than max write buffer",
+            ));
+        }
+        if !(Duration::from_millis(1)..=Duration::from_secs(60))
+            .contains(&self.stalled_write_timeout)
+        {
+            return Err(ProviderError::Configuration(
+                "WebSocket stalled-write timeout must be within 1 ms..=60 s",
+            ));
+        }
+        Ok(self)
+    }
+
+    fn tungstenite(self) -> Result<WebSocketConfig, ProviderError> {
+        let validated = self.validate()?;
+        Ok(WebSocketConfig::default()
+            .read_buffer_size(validated.read_buffer_size)
+            .write_buffer_size(validated.write_buffer_size)
+            .max_write_buffer_size(validated.max_write_buffer_size)
+            .max_message_size(Some(validated.max_message_size))
+            .max_frame_size(Some(validated.max_frame_size)))
+    }
+}
+
+impl Default for WsConfig {
+    fn default() -> Self {
+        Self::production()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DecodedFrame {
+    Candle(Candle),
+    Ignored,
+    ProviderError(ProviderError),
+    ServerShutdown,
+    Close(Option<CloseCode>),
+}
+
+#[derive(Deserialize)]
+struct WsEnvelope {
+    #[serde(rename = "e")]
+    event: Option<String>,
+    #[serde(default)]
+    code: Option<i64>,
+    #[serde(default)]
+    msg: Option<String>,
+    #[serde(default)]
+    k: Option<WsKline>,
+}
+
+#[derive(Deserialize)]
+struct WsKline {
+    #[serde(rename = "t")]
+    open_time: i64,
+    #[serde(rename = "T")]
+    close_time: i64,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "i")]
+    interval: String,
+    #[serde(rename = "o")]
+    open: String,
+    #[serde(rename = "c")]
+    close: String,
+    #[serde(rename = "h")]
+    high: String,
+    #[serde(rename = "l")]
+    low: String,
+    #[serde(rename = "v")]
+    volume: String,
+    #[serde(rename = "x")]
+    closed: bool,
+}
+
+#[cfg(feature = "production-transport")]
+pub fn websocket_url(instrument: &Instrument, timeframe: Timeframe) -> Result<Url, ProviderError> {
+    websocket_url_from_base(PRODUCTION_WS_BASE, instrument, timeframe, false)
+}
+
+#[cfg(feature = "test-transport")]
+pub fn test_websocket_url(
+    base_url: &str,
+    instrument: &Instrument,
+    timeframe: Timeframe,
+) -> Result<Url, ProviderError> {
+    websocket_url_from_base(base_url, instrument, timeframe, true)
+}
+
+fn websocket_url_from_base(
+    base_url: &str,
+    instrument: &Instrument,
+    timeframe: Timeframe,
+    loopback_only: bool,
+) -> Result<Url, ProviderError> {
+    let mut url = Url::parse(base_url)
+        .map_err(|_| ProviderError::Configuration("invalid WebSocket base URL"))?;
+    let valid_scheme = if loopback_only {
+        url.scheme() == "ws"
+    } else {
+        url.scheme() == "wss"
+    };
+    if !valid_scheme || url.query().is_some() || url.fragment().is_some() {
+        return Err(ProviderError::Configuration("invalid WebSocket base URL"));
+    }
+    if loopback_only {
+        let host = url.host_str().ok_or(ProviderError::Configuration(
+            "WebSocket test URL requires a host",
+        ))?;
+        let ip_literal = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        let ip = ip_literal.parse::<std::net::IpAddr>().map_err(|_| {
+            ProviderError::Configuration("WebSocket test URL must use a literal loopback host")
+        })?;
+        if !ip.is_loopback() {
+            return Err(ProviderError::Configuration(
+                "WebSocket test URL must use a literal loopback host",
+            ));
+        }
+    }
+    let stream = format!(
+        "{}@kline_{}",
+        instrument.provider_symbol().to_ascii_lowercase(),
+        timeframe.as_str()
+    );
+    url.set_path(&format!("/ws/{stream}"));
+    Ok(url)
+}
+
+pub fn decode_ws_frame(
+    message: Message,
+    instrument: &Instrument,
+    timeframe: Timeframe,
+    config: &WsConfig,
+) -> DecodedFrame {
+    if let Err(error) = config.validate() {
+        return DecodedFrame::ProviderError(error);
+    }
+    match message {
+        Message::Text(text) => decode_ws_payload(text.as_bytes(), instrument, timeframe, config),
+        Message::Binary(bytes) => decode_ws_payload(&bytes, instrument, timeframe, config),
+        Message::Close(frame) => DecodedFrame::Close(frame.map(|frame| frame.code)),
+        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => DecodedFrame::Ignored,
+    }
+}
+
+fn decode_ws_payload(
+    bytes: &[u8],
+    instrument: &Instrument,
+    timeframe: Timeframe,
+    config: &WsConfig,
+) -> DecodedFrame {
+    let context =
+        ErrorContext::operation(ErrorOperation::WebSocket).with_market(instrument, timeframe);
+    if bytes.len() > config.max_message_size {
+        return DecodedFrame::ProviderError(payload(
+            &context,
+            PayloadError::OverBudget {
+                limit_bytes: config.max_message_size,
+            },
+        ));
+    }
+    let envelope: WsEnvelope = match serde_json::from_slice(bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return DecodedFrame::ProviderError(payload(&context, PayloadError::MalformedProtocol));
+        }
+    };
+    if envelope.event.as_deref() == Some("serverShutdown") {
+        return DecodedFrame::ServerShutdown;
+    }
+    if envelope.code.is_some() || envelope.msg.is_some() {
+        return DecodedFrame::ProviderError(ProviderError::Protocol {
+            context,
+            detail: "provider reported a WebSocket error",
+        });
+    }
+    if envelope.event.as_deref() != Some("kline") {
+        return DecodedFrame::Ignored;
+    }
+    let Some(kline) = envelope.k else {
+        return DecodedFrame::ProviderError(payload(&context, PayloadError::MalformedProtocol));
+    };
+    if kline.symbol != instrument.provider_symbol() || kline.interval != timeframe.as_str() {
+        return DecodedFrame::ProviderError(ProviderError::Protocol {
+            context,
+            detail: "WebSocket kline market does not match subscription",
+        });
+    }
+    let parse = |value: &str| {
+        value
+            .parse::<f64>()
+            .ok()
+            .filter(|number| number.is_finite())
+    };
+    let Some((open, high, low, close, volume)) = parse(&kline.open)
+        .zip(parse(&kline.high))
+        .zip(parse(&kline.low))
+        .zip(parse(&kline.close))
+        .zip(parse(&kline.volume))
+        .map(|((((open, high), low), close), volume)| (open, high, low, close, volume))
+    else {
+        return DecodedFrame::ProviderError(payload(
+            &context,
+            PayloadError::InvalidField {
+                field: "kline numeric field",
+            },
+        ));
+    };
+    match Candle::from_ws(
+        kline.open_time,
+        kline.close_time,
+        open,
+        high,
+        low,
+        close,
+        volume,
+        kline.closed,
+    ) {
+        Ok(candle) => DecodedFrame::Candle(candle),
+        Err(source) => DecodedFrame::ProviderError(ProviderError::Domain { context, source }),
+    }
+}
+
+#[cfg(feature = "production-transport")]
+pub async fn connect_websocket(
+    instrument: &Instrument,
+    timeframe: Timeframe,
+    config: WsConfig,
+) -> Result<RawWebSocket, ProviderError> {
+    let url = websocket_url(instrument, timeframe)?;
+    connect_websocket_url(&url, config).await
+}
+
+#[cfg(feature = "test-transport")]
+pub async fn connect_test_websocket(
+    base_url: &str,
+    instrument: &Instrument,
+    timeframe: Timeframe,
+    config: WsConfig,
+) -> Result<RawWebSocket, ProviderError> {
+    let url = test_websocket_url(base_url, instrument, timeframe)?;
+    connect_websocket_url(&url, config).await
+}
+
+async fn connect_websocket_url(url: &Url, config: WsConfig) -> Result<RawWebSocket, ProviderError> {
+    let tungstenite = config.tungstenite()?;
+    connect_async_with_config(url.as_str(), Some(tungstenite), false)
+        .await
+        .map(|(socket, _)| socket)
+        .map_err(|_| ProviderError::Transport {
+            context: ErrorContext::operation(ErrorOperation::WebSocket),
+            cause: SanitizedCause::Connection,
+        })
+}
+
+pub async fn read_raw_websocket(
+    socket: &mut RawWebSocket,
+    instrument: &Instrument,
+    timeframe: Timeframe,
+    config: &WsConfig,
+) -> Result<DecodedFrame, ProviderError> {
+    config.validate()?;
+    let context =
+        ErrorContext::operation(ErrorOperation::WebSocket).with_market(instrument, timeframe);
+    let message = socket
+        .next()
+        .await
+        .ok_or_else(|| ProviderError::Transport {
+            context: context.clone(),
+            cause: SanitizedCause::Closed,
+        })?
+        .map_err(|error| match error {
+            tokio_tungstenite::tungstenite::Error::Capacity(CapacityError::MessageTooLong {
+                max_size,
+                ..
+            }) => payload(
+                &context,
+                PayloadError::OverBudget {
+                    limit_bytes: max_size,
+                },
+            ),
+            _ => ProviderError::Transport {
+                context: context.clone(),
+                cause: SanitizedCause::Connection,
+            },
+        })?;
+    tokio::time::timeout(config.stalled_write_timeout, socket.flush())
+        .await
+        .map_err(|_| ProviderError::Timeout {
+            context: context.clone(),
+            kind: TimeoutKind::StalledWrite,
+        })?
+        .map_err(|_| ProviderError::Transport {
+            context,
+            cause: SanitizedCause::Connection,
+        })?;
+    Ok(decode_ws_frame(message, instrument, timeframe, config))
+}
+pub async fn send_raw_websocket(
+    socket: &mut RawWebSocket,
+    message: Message,
+    config: &WsConfig,
+) -> Result<(), ProviderError> {
+    config.validate()?;
+    let context = ErrorContext::operation(ErrorOperation::WebSocket);
+    tokio::time::timeout(config.stalled_write_timeout, socket.send(message))
+        .await
+        .map_err(|_| ProviderError::Timeout {
+            context: context.clone(),
+            kind: TimeoutKind::StalledWrite,
+        })?
+        .map_err(|_| ProviderError::Transport {
+            context,
+            cause: SanitizedCause::Connection,
+        })
+}
+pub async fn flush_raw_websocket(
+    socket: &mut RawWebSocket,
+    config: &WsConfig,
+) -> Result<(), ProviderError> {
+    config.validate()?;
+    let context = ErrorContext::operation(ErrorOperation::WebSocket);
+    tokio::time::timeout(config.stalled_write_timeout, socket.flush())
+        .await
+        .map_err(|_| ProviderError::Timeout {
+            context: context.clone(),
+            kind: TimeoutKind::StalledWrite,
+        })?
+        .map_err(|_| ProviderError::Transport {
+            context,
+            cause: SanitizedCause::Connection,
+        })
+}
 
 #[derive(Clone)]
 pub struct BinanceProvider {
