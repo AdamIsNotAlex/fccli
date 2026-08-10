@@ -1,8 +1,14 @@
 //! Binance Spot REST history and raw WebSocket transport.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, Stream};
 use reqwest::{Client, StatusCode, Url, header::RETRY_AFTER};
 use serde::{
     Deserialize,
@@ -13,7 +19,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
     tungstenite::{
-        Message,
+        Error as WebSocketError, Message,
         error::CapacityError,
         protocol::{WebSocketConfig, frame::coding::CloseCode},
     },
@@ -42,6 +48,7 @@ pub const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(30);
 #[cfg(feature = "production-transport")]
 const PRODUCTION_REST_BASE: &str = "https://data-api.binance.vision";
 
+#[cfg(feature = "production-transport")]
 const PRODUCTION_WS_BASE: &str = "wss://data-stream.binance.vision";
 const WS_BYTE_LIMIT_MAX: usize = 16 * 1024 * 1024;
 pub const WS_READ_BUFFER_SIZE: usize = 128 * 1024;
@@ -50,8 +57,7 @@ pub const WS_FRAME_SIZE: usize = 256 * 1024;
 pub const WS_WRITE_BUFFER_SIZE: usize = 64 * 1024;
 pub const WS_MAX_WRITE_BUFFER_SIZE: usize = 1024 * 1024;
 pub const WS_STALLED_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-
-pub type RawWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub const WS_MESSAGE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WsConfig {
@@ -61,6 +67,7 @@ pub struct WsConfig {
     pub write_buffer_size: usize,
     pub max_write_buffer_size: usize,
     pub stalled_write_timeout: Duration,
+    pub message_inactivity_timeout: Duration,
 }
 
 impl WsConfig {
@@ -73,6 +80,7 @@ impl WsConfig {
             write_buffer_size: WS_WRITE_BUFFER_SIZE,
             max_write_buffer_size: WS_MAX_WRITE_BUFFER_SIZE,
             stalled_write_timeout: WS_STALLED_WRITE_TIMEOUT,
+            message_inactivity_timeout: WS_MESSAGE_INACTIVITY_TIMEOUT,
         }
     }
 
@@ -102,11 +110,30 @@ impl WsConfig {
                 "WebSocket write buffer must be smaller than max write buffer",
             ));
         }
+        let largest_control_payload = self.max_frame_size.min(125);
+        let required_control_headroom = self
+            .write_buffer_size
+            .checked_add(largest_control_payload + 6)
+            .ok_or(ProviderError::Configuration(
+                "WebSocket control-frame headroom overflowed",
+            ))?;
+        if self.max_write_buffer_size < required_control_headroom {
+            return Err(ProviderError::Configuration(
+                "WebSocket max write buffer lacks automatic control-frame headroom",
+            ));
+        }
         if !(Duration::from_millis(1)..=Duration::from_secs(60))
             .contains(&self.stalled_write_timeout)
         {
             return Err(ProviderError::Configuration(
                 "WebSocket stalled-write timeout must be within 1 ms..=60 s",
+            ));
+        }
+        if !(Duration::from_millis(1)..=Duration::from_secs(120))
+            .contains(&self.message_inactivity_timeout)
+        {
+            return Err(ProviderError::Configuration(
+                "WebSocket message-inactivity timeout must be within 1 ms..=120 s",
             ));
         }
         Ok(self)
@@ -142,6 +169,8 @@ pub enum DecodedFrame {
 struct WsEnvelope {
     #[serde(rename = "e")]
     event: Option<String>,
+    #[serde(rename = "s")]
+    symbol: Option<String>,
     #[serde(default)]
     code: Option<i64>,
     #[serde(default)]
@@ -173,10 +202,10 @@ struct WsKline {
     #[serde(rename = "x")]
     closed: bool,
 }
-
 #[cfg(feature = "production-transport")]
 pub fn websocket_url(instrument: &Instrument, timeframe: Timeframe) -> Result<Url, ProviderError> {
     websocket_url_from_base(PRODUCTION_WS_BASE, instrument, timeframe, false)
+        .map_err(|error| contextualize_websocket_configuration(error, instrument, timeframe))
 }
 
 #[cfg(feature = "test-transport")]
@@ -186,8 +215,8 @@ pub fn test_websocket_url(
     timeframe: Timeframe,
 ) -> Result<Url, ProviderError> {
     websocket_url_from_base(base_url, instrument, timeframe, true)
+        .map_err(|error| contextualize_websocket_configuration(error, instrument, timeframe))
 }
-
 fn websocket_url_from_base(
     base_url: &str,
     instrument: &Instrument,
@@ -215,9 +244,13 @@ fn websocket_url_from_base(
         let ip = ip_literal.parse::<std::net::IpAddr>().map_err(|_| {
             ProviderError::Configuration("WebSocket test URL must use a literal loopback host")
         })?;
-        if !ip.is_loopback() {
+        if !ip.is_loopback()
+            || url.port().is_none_or(|port| port == 0)
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
             return Err(ProviderError::Configuration(
-                "WebSocket test URL must use a literal loopback host",
+                "WebSocket test URL must be plain WS on a literal loopback host with an explicit nonzero port",
             ));
         }
     }
@@ -284,7 +317,10 @@ fn decode_ws_payload(
     let Some(kline) = envelope.k else {
         return DecodedFrame::ProviderError(payload(&context, PayloadError::MalformedProtocol));
     };
-    if kline.symbol != instrument.provider_symbol() || kline.interval != timeframe.as_str() {
+    if envelope.symbol.as_deref() != Some(instrument.provider_symbol())
+        || kline.symbol != instrument.provider_symbol()
+        || kline.interval != timeframe.as_str()
+    {
         return DecodedFrame::ProviderError(ProviderError::Protocol {
             context,
             detail: "WebSocket kline market does not match subscription",
@@ -325,6 +361,157 @@ fn decode_ws_payload(
     }
 }
 
+pub struct RawWebSocket {
+    stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    config: WsConfig,
+    context: ErrorContext,
+    instrument: Instrument,
+    timeframe: Timeframe,
+    decoded: VecDeque<Result<DecodedFrame, ProviderError>>,
+    outbound: VecDeque<Message>,
+    flush_pending: bool,
+    last_data_message: tokio::time::Instant,
+    prioritize_inbound_after_stall: bool,
+}
+
+impl RawWebSocket {
+    #[must_use]
+    pub const fn config(&self) -> &WsConfig {
+        &self.config
+    }
+
+    pub async fn read(&mut self) -> Result<DecodedFrame, ProviderError> {
+        loop {
+            if (self.prioritize_inbound_after_stall || !self.flush_pending)
+                && let Some(outcome) = self.decoded.pop_front()
+            {
+                return outcome;
+            }
+            self.pump(false).await?;
+        }
+    }
+
+    pub async fn send(&mut self, message: Message) -> Result<(), ProviderError> {
+        self.outbound.push_back(message);
+        while !self.outbound.is_empty() || self.flush_pending {
+            if let Err(error) = self.pump(true).await {
+                self.release_retained_outcomes_after_stall(&error);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn flush(&mut self) -> Result<(), ProviderError> {
+        while !self.outbound.is_empty() || self.flush_pending {
+            if let Err(error) = self.pump(true).await {
+                self.release_retained_outcomes_after_stall(&error);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn release_retained_outcomes_after_stall(&mut self, error: &ProviderError) {
+        if matches!(
+            error,
+            ProviderError::Timeout {
+                kind: TimeoutKind::StalledWrite,
+                ..
+            }
+        ) {
+            self.flush_pending = false;
+            self.prioritize_inbound_after_stall = true;
+        }
+    }
+
+    async fn pump(&mut self, writing: bool) -> Result<(), ProviderError> {
+        let inactivity_deadline = self.last_data_message + self.config.message_inactivity_timeout;
+        let stalled_write_timeout = self.config.stalled_write_timeout;
+        let write_progress_required = writing || self.flush_pending;
+        let inactivity_context = self.context.clone();
+        let stalled_write_context = self.context.clone();
+        tokio::select! {
+            biased;
+            result = futures_util::future::poll_fn(|cx| self.poll_io(cx)) => result,
+            () = tokio::time::sleep_until(inactivity_deadline) => Err(ProviderError::Timeout {
+                context: inactivity_context,
+                kind: TimeoutKind::WebSocketInactivity,
+            }),
+            () = tokio::time::sleep(stalled_write_timeout), if write_progress_required => {
+                Err(ProviderError::Timeout {
+                    context: stalled_write_context,
+                    kind: TimeoutKind::StalledWrite,
+                })
+            },
+        }
+    }
+
+    fn poll_io(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ProviderError>> {
+        let mut made_progress = false;
+        match Stream::poll_next(Pin::new(&mut self.stream), cx) {
+            Poll::Ready(Some(Ok(message))) => {
+                if matches!(message, Message::Text(_) | Message::Binary(_)) {
+                    self.last_data_message = tokio::time::Instant::now();
+                }
+                self.flush_pending = true;
+                self.decoded.push_back(Ok(decode_ws_frame(
+                    message,
+                    &self.instrument,
+                    self.timeframe,
+                    &self.config,
+                )));
+                made_progress = true;
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.decoded
+                    .push_back(Err(map_websocket_error(error, &self.context)));
+                made_progress = true;
+            }
+            Poll::Ready(None) => {
+                self.decoded.push_back(Err(ProviderError::Transport {
+                    context: self.context.clone(),
+                    cause: SanitizedCause::Closed,
+                }));
+                made_progress = true;
+            }
+            Poll::Pending => {}
+        }
+        if let Some(message) = self.outbound.pop_front() {
+            let mut stream = Pin::new(&mut self.stream);
+            match Sink::<Message>::poll_ready(stream.as_mut(), cx) {
+                Poll::Ready(Ok(())) => match Sink::<Message>::start_send(stream, message) {
+                    Ok(()) => {
+                        self.flush_pending = true;
+                        made_progress = true;
+                    }
+                    Err(error) => {
+                        return Poll::Ready(Err(map_websocket_error(error, &self.context)));
+                    }
+                },
+                Poll::Ready(Err(error)) => {
+                    return Poll::Ready(Err(map_websocket_error(error, &self.context)));
+                }
+                Poll::Pending => self.outbound.push_front(message),
+            }
+        }
+
+        match Sink::<Message>::poll_flush(Pin::new(&mut self.stream), cx) {
+            Poll::Ready(Ok(())) => {
+                self.flush_pending = false;
+                if made_progress || !self.decoded.is_empty() {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(map_websocket_error(error, &self.context))),
+            Poll::Pending if made_progress => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 #[cfg(feature = "production-transport")]
 pub async fn connect_websocket(
     instrument: &Instrument,
@@ -332,7 +519,7 @@ pub async fn connect_websocket(
     config: WsConfig,
 ) -> Result<RawWebSocket, ProviderError> {
     let url = websocket_url(instrument, timeframe)?;
-    connect_websocket_url(&url, config).await
+    connect_websocket_url(&url, instrument, timeframe, config).await
 }
 
 #[cfg(feature = "test-transport")]
@@ -343,97 +530,118 @@ pub async fn connect_test_websocket(
     config: WsConfig,
 ) -> Result<RawWebSocket, ProviderError> {
     let url = test_websocket_url(base_url, instrument, timeframe)?;
-    connect_websocket_url(&url, config).await
+    connect_websocket_url(&url, instrument, timeframe, config).await
 }
 
-async fn connect_websocket_url(url: &Url, config: WsConfig) -> Result<RawWebSocket, ProviderError> {
-    let tungstenite = config.tungstenite()?;
-    connect_async_with_config(url.as_str(), Some(tungstenite), false)
-        .await
-        .map(|(socket, _)| socket)
-        .map_err(|_| ProviderError::Transport {
-            context: ErrorContext::operation(ErrorOperation::WebSocket),
-            cause: SanitizedCause::Connection,
-        })
-}
-
-pub async fn read_raw_websocket(
-    socket: &mut RawWebSocket,
+async fn connect_websocket_url(
+    url: &Url,
     instrument: &Instrument,
     timeframe: Timeframe,
-    config: &WsConfig,
-) -> Result<DecodedFrame, ProviderError> {
-    config.validate()?;
+    config: WsConfig,
+) -> Result<RawWebSocket, ProviderError> {
     let context =
         ErrorContext::operation(ErrorOperation::WebSocket).with_market(instrument, timeframe);
-    let message = socket
-        .next()
+    let config = config
+        .validate()
+        .map_err(|error| contextualize_websocket_configuration(error, instrument, timeframe))?;
+    let tungstenite = config
+        .tungstenite()
+        .map_err(|error| contextualize_websocket_configuration(error, instrument, timeframe))?;
+    let stream = connect_async_with_config(url.as_str(), Some(tungstenite), false)
         .await
-        .ok_or_else(|| ProviderError::Transport {
-            context: context.clone(),
-            cause: SanitizedCause::Closed,
-        })?
-        .map_err(|error| match error {
-            tokio_tungstenite::tungstenite::Error::Capacity(CapacityError::MessageTooLong {
-                max_size,
-                ..
-            }) => payload(
-                &context,
-                PayloadError::OverBudget {
-                    limit_bytes: max_size,
-                },
-            ),
-            _ => ProviderError::Transport {
-                context: context.clone(),
-                cause: SanitizedCause::Connection,
-            },
-        })?;
-    tokio::time::timeout(config.stalled_write_timeout, socket.flush())
-        .await
-        .map_err(|_| ProviderError::Timeout {
-            context: context.clone(),
-            kind: TimeoutKind::StalledWrite,
-        })?
-        .map_err(|_| ProviderError::Transport {
-            context,
-            cause: SanitizedCause::Connection,
-        })?;
-    Ok(decode_ws_frame(message, instrument, timeframe, config))
+        .map(|(socket, _)| socket)
+        .map_err(|error| map_websocket_error(error, &context))?;
+    Ok(RawWebSocket {
+        stream,
+        config,
+        context,
+        instrument: instrument.clone(),
+        timeframe,
+        decoded: VecDeque::new(),
+        outbound: VecDeque::new(),
+        prioritize_inbound_after_stall: false,
+        flush_pending: false,
+        last_data_message: tokio::time::Instant::now(),
+    })
 }
+
+pub async fn read_raw_websocket(socket: &mut RawWebSocket) -> Result<DecodedFrame, ProviderError> {
+    socket.read().await
+}
+
 pub async fn send_raw_websocket(
     socket: &mut RawWebSocket,
     message: Message,
-    config: &WsConfig,
 ) -> Result<(), ProviderError> {
-    config.validate()?;
-    let context = ErrorContext::operation(ErrorOperation::WebSocket);
-    tokio::time::timeout(config.stalled_write_timeout, socket.send(message))
-        .await
-        .map_err(|_| ProviderError::Timeout {
-            context: context.clone(),
-            kind: TimeoutKind::StalledWrite,
-        })?
-        .map_err(|_| ProviderError::Transport {
-            context,
-            cause: SanitizedCause::Connection,
-        })
+    socket.send(message).await
 }
-pub async fn flush_raw_websocket(
-    socket: &mut RawWebSocket,
-    config: &WsConfig,
-) -> Result<(), ProviderError> {
-    config.validate()?;
-    let context = ErrorContext::operation(ErrorOperation::WebSocket);
-    tokio::time::timeout(config.stalled_write_timeout, socket.flush())
-        .await
-        .map_err(|_| ProviderError::Timeout {
-            context: context.clone(),
-            kind: TimeoutKind::StalledWrite,
-        })?
-        .map_err(|_| ProviderError::Transport {
+
+pub async fn flush_raw_websocket(socket: &mut RawWebSocket) -> Result<(), ProviderError> {
+    socket.flush().await
+}
+
+fn map_websocket_error(error: WebSocketError, context: &ErrorContext) -> ProviderError {
+    match error {
+        WebSocketError::Capacity(CapacityError::MessageTooLong { max_size, .. }) => payload(
             context,
-            cause: SanitizedCause::Connection,
-        })
+            PayloadError::OverBudget {
+                limit_bytes: max_size,
+            },
+        ),
+        WebSocketError::Protocol(_) => ProviderError::Protocol {
+            context: context.clone(),
+            detail: "invalid WebSocket framing",
+        },
+        WebSocketError::Utf8(_) => ProviderError::Protocol {
+            context: context.clone(),
+            detail: "invalid WebSocket UTF-8",
+        },
+        WebSocketError::AttackAttempt => ProviderError::Protocol {
+            context: context.clone(),
+            detail: "WebSocket attack attempt rejected",
+        },
+        WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed => {
+            ProviderError::Transport {
+                context: context.clone(),
+                cause: SanitizedCause::Closed,
+            }
+        }
+        WebSocketError::Tls(_) => ProviderError::Transport {
+            context: context.clone(),
+            cause: SanitizedCause::Tls,
+        },
+        WebSocketError::Io(_) => ProviderError::Transport {
+            context: context.clone(),
+            cause: SanitizedCause::Io,
+        },
+        WebSocketError::Url(_) | WebSocketError::Http(_) | WebSocketError::HttpFormat(_) => {
+            ProviderError::Transport {
+                context: context.clone(),
+                cause: SanitizedCause::Connection,
+            }
+        }
+        WebSocketError::Capacity(_) | WebSocketError::WriteBufferFull(_) => {
+            ProviderError::Protocol {
+                context: context.clone(),
+                detail: "WebSocket capacity invariant failed",
+            }
+        }
+    }
+}
+
+fn contextualize_websocket_configuration(
+    error: ProviderError,
+    instrument: &Instrument,
+    timeframe: Timeframe,
+) -> ProviderError {
+    match error {
+        ProviderError::Configuration(detail) => ProviderError::WebSocketConfiguration {
+            context: ErrorContext::operation(ErrorOperation::WebSocket)
+                .with_market(instrument, timeframe),
+            detail,
+        },
+        other => other,
+    }
 }
 
 #[derive(Clone)]

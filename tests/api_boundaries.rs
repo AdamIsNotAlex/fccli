@@ -93,6 +93,43 @@ fn assert_constructor_is_compiled_out(
     );
 }
 
+fn assert_function_is_compiled_out(
+    fixture_name: &str,
+    dependency_feature: &str,
+    forbidden_function: &str,
+    source: &str,
+) {
+    let fixture = CompileFixture::new(fixture_name, dependency_feature, source);
+    let output = fixture.check();
+    assert!(
+        !output.status.success(),
+        "the forbidden {forbidden_function} function compiled under {dependency_feature}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let named_function = format!("`{forbidden_function}`");
+    let matching_diagnostic = stderr.match_indices("error[E0425]").any(|(start, _)| {
+        let diagnostic_tail = &stderr[start..];
+        let end = [
+            diagnostic_tail.find("\n\n"),
+            diagnostic_tail.find("\nnote:"),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(diagnostic_tail.len());
+        let diagnostic = &diagnostic_tail[..end];
+
+        diagnostic.contains("cannot find function")
+            && diagnostic.contains(&named_function)
+            && diagnostic.contains("in module `fccli::provider::binance`")
+    });
+    assert!(
+        matching_diagnostic,
+        "fixture failed for a reason other than the missing {forbidden_function} function in fccli::provider::binance:\n{stderr}"
+    );
+}
+
 #[cfg(feature = "test-transport")]
 #[test]
 fn test_transport_cannot_construct_the_production_rest_client() {
@@ -112,6 +149,21 @@ fn main() {
     );
 }
 
+#[cfg(feature = "test-transport")]
+#[test]
+fn test_transport_cannot_connect_the_production_websocket() {
+    assert_function_is_compiled_out(
+        "test-cannot-use-production-websocket",
+        "test-transport",
+        "connect_websocket",
+        r#"
+fn main() {
+    let _ = fccli::provider::binance::connect_websocket();
+}
+"#,
+    );
+}
+
 #[cfg(feature = "production-transport")]
 #[test]
 fn production_transport_cannot_use_the_loopback_test_constructor() {
@@ -126,6 +178,21 @@ use fccli::{clock::SystemClock, provider::binance::BinanceProvider};
 
 fn main() {
     let _ = BinanceProvider::new_test("http://127.0.0.1:1", Arc::new(SystemClock));
+}
+"#,
+    );
+}
+
+#[cfg(feature = "production-transport")]
+#[test]
+fn production_transport_cannot_connect_the_loopback_test_websocket() {
+    assert_function_is_compiled_out(
+        "production-cannot-use-loopback-websocket",
+        "production-transport",
+        "connect_test_websocket",
+        r#"
+fn main() {
+    let _ = fccli::provider::binance::connect_test_websocket();
 }
 "#,
     );

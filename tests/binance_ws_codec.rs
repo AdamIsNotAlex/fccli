@@ -3,16 +3,16 @@
 use std::time::Duration;
 
 use fccli::{
-    error::{PayloadError, ProviderError, TimeoutKind},
+    error::{PayloadError, ProviderError, SanitizedCause, TimeoutKind},
     model::{FinalityAuthority, Instrument, Market, ProviderId, Timeframe},
     provider::binance::{
-        DecodedFrame, WS_FRAME_SIZE, WS_MAX_WRITE_BUFFER_SIZE, WS_MESSAGE_SIZE,
-        WS_READ_BUFFER_SIZE, WS_STALLED_WRITE_TIMEOUT, WS_WRITE_BUFFER_SIZE, WsConfig,
-        decode_ws_frame, read_raw_websocket, test_websocket_url,
+        DecodedFrame, WS_FRAME_SIZE, WS_MAX_WRITE_BUFFER_SIZE, WS_MESSAGE_INACTIVITY_TIMEOUT,
+        WS_MESSAGE_SIZE, WS_READ_BUFFER_SIZE, WS_STALLED_WRITE_TIMEOUT, WS_WRITE_BUFFER_SIZE,
+        WsConfig, decode_ws_frame, read_raw_websocket, test_websocket_url,
     },
 };
 use futures_util::{SinkExt, StreamExt};
-use tokio::{net::TcpListener, time::timeout};
+use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
 use tokio_tungstenite::{
     accept_async,
     tungstenite::{
@@ -57,6 +57,10 @@ fn production_config_and_all_timeframe_stream_paths_are_exact() {
     assert_eq!(config.write_buffer_size, WS_WRITE_BUFFER_SIZE);
     assert_eq!(config.max_write_buffer_size, WS_MAX_WRITE_BUFFER_SIZE);
     assert_eq!(config.stalled_write_timeout, WS_STALLED_WRITE_TIMEOUT);
+    assert_eq!(
+        config.message_inactivity_timeout,
+        WS_MESSAGE_INACTIVITY_TIMEOUT
+    );
     assert_eq!(config.validate(), Ok(config));
 
     for timeframe in Timeframe::ALL {
@@ -104,6 +108,16 @@ fn websocket_config_rejects_every_invalid_boundary_before_connect() {
     let mut equal_write_limits = production;
     equal_write_limits.write_buffer_size = 4096;
     equal_write_limits.max_write_buffer_size = 4096;
+
+    let mut minimum_headroom = production;
+    minimum_headroom.write_buffer_size = 1024;
+    minimum_headroom.max_write_buffer_size = 1024 + 131;
+    assert_eq!(minimum_headroom.validate(), Ok(minimum_headroom));
+    minimum_headroom.max_write_buffer_size -= 1;
+    assert!(matches!(
+        minimum_headroom.validate(),
+        Err(ProviderError::Configuration(_))
+    ));
     assert!(matches!(
         equal_write_limits.validate(),
         Err(ProviderError::Configuration(_))
@@ -119,6 +133,24 @@ fn websocket_config_rejects_every_invalid_boundary_before_connect() {
             config.validate(),
             Err(ProviderError::Configuration(_))
         ));
+    }
+
+    for invalid in [
+        Duration::ZERO,
+        Duration::from_secs(120) + Duration::from_nanos(1),
+    ] {
+        let mut config = production;
+        config.message_inactivity_timeout = invalid;
+        assert!(matches!(
+            config.validate(),
+            Err(ProviderError::Configuration(_))
+        ));
+    }
+
+    for valid in [Duration::from_millis(1), Duration::from_secs(120)] {
+        let mut config = production;
+        config.message_inactivity_timeout = valid;
+        assert_eq!(config.validate(), Ok(config));
     }
 
     for valid in [Duration::from_millis(1), Duration::from_secs(60)] {
@@ -143,7 +175,10 @@ async fn equal_write_limits_fail_before_tcp_connect() {
         config,
     )
     .await;
-    assert!(matches!(result, Err(ProviderError::Configuration(_))));
+    assert!(matches!(
+        result,
+        Err(ProviderError::WebSocketConfiguration { .. })
+    ));
     assert!(
         timeout(Duration::from_millis(75), listener.accept())
             .await
@@ -173,7 +208,7 @@ fn loopback_test_urls_are_exact_and_public_hosts_are_rejected() {
         assert!(
             matches!(
                 test_websocket_url(unsafe_base, &instrument(), Timeframe::Minute1),
-                Err(ProviderError::Configuration(_))
+                Err(ProviderError::WebSocketConfiguration { .. })
             ),
             "accepted unsafe test WebSocket base {unsafe_base}"
         );
@@ -189,7 +224,10 @@ async fn test_connector_rejects_public_hosts_before_network_io() {
         WsConfig::production(),
     )
     .await;
-    assert!(matches!(result, Err(ProviderError::Configuration(_))));
+    assert!(matches!(
+        result,
+        Err(ProviderError::WebSocketConfiguration { .. })
+    ));
 }
 
 #[test]
@@ -258,16 +296,42 @@ fn malformed_oversized_mismatched_and_provider_frames_are_typed() {
         PayloadError::OverBudget { limit_bytes: 32 }
     );
 
-    let wrong_market = OPEN.replace("BTCUSDT", "ETHUSDT");
-    assert!(matches!(
-        decode_ws_frame(
-            Message::Text(wrong_market.into()),
-            &instrument(),
-            Timeframe::Minute1,
-            &config
-        ),
-        DecodedFrame::ProviderError(ProviderError::Protocol { .. })
-    ));
+    let parsed: serde_json::Value = serde_json::from_str(OPEN).expect("fixture JSON");
+    for (label, pointer, replacement) in [
+        ("outer symbol missing", "/s", None),
+        ("outer symbol mismatch", "/s", Some("ETHUSDT")),
+        ("nested symbol missing", "/k/s", None),
+        ("nested symbol mismatch", "/k/s", Some("ETHUSDT")),
+    ] {
+        let mut value = parsed.clone();
+        let (parent_pointer, key) = pointer.rsplit_once('/').expect("JSON pointer");
+        let parent = value
+            .pointer_mut(parent_pointer)
+            .expect("symbol parent")
+            .as_object_mut()
+            .expect("symbol object");
+        if let Some(symbol) = replacement {
+            parent.insert(key.to_owned(), serde_json::Value::String(symbol.to_owned()));
+        } else {
+            parent.remove(key);
+        }
+        assert!(
+            matches!(
+                decode_ws_frame(
+                    Message::Text(serde_json::to_string(&value).expect("encode").into()),
+                    &instrument(),
+                    Timeframe::Minute1,
+                    &config
+                ),
+                DecodedFrame::ProviderError(ProviderError::Protocol { .. })
+                    | DecodedFrame::ProviderError(ProviderError::Payload {
+                        source: PayloadError::MalformedProtocol,
+                        ..
+                    })
+            ),
+            "accepted {label}"
+        );
+    }
     assert!(matches!(
         decode_ws_frame(
             Message::Text(r#"{"code":-1121,"msg":"Invalid symbol; api_key_SECRET"}"#.into()),
@@ -369,7 +433,7 @@ async fn fragmented_message_over_configured_budget_is_rejected() {
     )
     .await
     .expect("client handshake");
-    let error = read_raw_websocket(&mut socket, &instrument(), Timeframe::Minute1, &config)
+    let error = read_raw_websocket(&mut socket)
         .await
         .expect_err("fragmented message exceeds aggregate budget");
     assert!(matches!(
@@ -418,9 +482,7 @@ async fn local_raw_socket_flushes_exactly_one_automatic_pong_for_one_ping() {
     .await
     .expect("client handshake");
     assert_eq!(
-        read_raw_websocket(&mut socket, &instrument(), Timeframe::Minute1, &config)
-            .await
-            .expect("read ping"),
+        read_raw_websocket(&mut socket).await.expect("read ping"),
         DecodedFrame::Ignored
     );
     server.await.expect("server task");
@@ -454,7 +516,6 @@ async fn raw_socket_reports_stalled_application_write() {
             match fccli::provider::binance::send_raw_websocket(
                 &mut socket,
                 Message::Binary(vec![0; 64 * 1024].into()),
-                &config,
             )
             .await
             {
@@ -474,4 +535,309 @@ async fn raw_socket_reports_stalled_application_write() {
     ));
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn failed_connect_carries_sanitized_market_context_in_display_and_debug() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    drop(listener);
+
+    let error = match fccli::provider::binance::connect_test_websocket(
+        &format!("ws://{address}"),
+        &instrument(),
+        Timeframe::Minute1,
+        WsConfig::production(),
+    )
+    .await
+    {
+        Ok(_) => panic!("closed listener must reject connect"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        &error,
+        ProviderError::Transport {
+            cause: SanitizedCause::Io,
+            ..
+        }
+    ));
+    let display = error.to_string();
+    assert_eq!(
+        display,
+        "transport failed (operation websocket, provider binance, instrument BTC/USDT, timeframe 1m): I/O failure"
+    );
+    assert!(!display.contains(&address.to_string()));
+    assert!(!display.contains("secret"));
+
+    let debug = format!("{error:?}");
+    assert_eq!(
+        debug,
+        "Transport { context: ErrorContext { provider: Some(ProviderId(\"binance\")), instrument: Some(\"BTC/USDT\"), timeframe: Some(Minute1), operation: WebSocket }, cause: Io }"
+    );
+    assert!(!debug.contains(&address.to_string()));
+    assert!(!debug.contains("secret"));
+}
+
+#[tokio::test]
+async fn socket_binds_immutable_validated_config_and_minimum_headroom_flushes_pong() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = accept_async(stream).await.expect("server handshake");
+        socket
+            .send(Message::Ping(vec![0; 125].into()))
+            .await
+            .expect("largest control payload");
+        let pong = timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("pong timeout")
+            .expect("socket open")
+            .expect("pong");
+        assert_eq!(pong, Message::Pong(vec![0; 125].into()));
+    });
+
+    let mut config = WsConfig::production();
+    config.write_buffer_size = 1024;
+    config.max_write_buffer_size = 1024 + 131;
+    let mut socket = fccli::provider::binance::connect_test_websocket(
+        &format!("ws://{address}"),
+        &instrument(),
+        Timeframe::Minute1,
+        config,
+    )
+    .await
+    .expect("client handshake");
+    assert_eq!(socket.config(), &config);
+    assert_eq!(
+        read_raw_websocket(&mut socket).await.expect("read ping"),
+        DecodedFrame::Ignored
+    );
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn stalled_write_still_flushes_one_pong_and_retains_data_and_close() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = accept_async(stream).await.expect("server handshake");
+        socket
+            .send(Message::Ping(vec![4, 5, 6].into()))
+            .await
+            .expect("ping");
+        socket.send(Message::Text(OPEN.into())).await.expect("data");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Away,
+                reason: "maintenance".into(),
+            })))
+            .await
+            .expect("close");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut pong_count = 0;
+        while let Ok(Some(Ok(message))) = timeout(Duration::from_millis(250), socket.next()).await {
+            if message == Message::Pong(vec![4, 5, 6].into()) {
+                pong_count += 1;
+            }
+        }
+        assert_eq!(pong_count, 1, "automatic Pong must be emitted exactly once");
+    });
+
+    let mut config = WsConfig::production();
+    config.write_buffer_size = 64 * 1024;
+    config.max_write_buffer_size = 128 * 1024;
+    config.stalled_write_timeout = Duration::from_millis(10);
+    let mut socket = fccli::provider::binance::connect_test_websocket(
+        &format!("ws://{address}"),
+        &instrument(),
+        Timeframe::Minute1,
+        config,
+    )
+    .await
+    .expect("client handshake");
+
+    let error = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Err(error) = fccli::provider::binance::send_raw_websocket(
+                &mut socket,
+                Message::Binary(vec![0; 64 * 1024].into()),
+            )
+            .await
+            {
+                break error;
+            }
+        }
+    })
+    .await
+    .expect("ordinary writes should stall");
+    assert!(matches!(
+        &error,
+        ProviderError::Timeout {
+            kind: TimeoutKind::StalledWrite,
+            ..
+        }
+    ));
+    let display = error.to_string();
+    assert_eq!(
+        display,
+        "stalled write timed out (operation websocket, provider binance, instrument BTC/USDT, timeframe 1m)"
+    );
+    assert!(!display.contains(&address.to_string()));
+    assert!(!display.contains("secret"));
+
+    let debug = format!("{error:?}");
+    assert_eq!(
+        debug,
+        "Timeout { context: ErrorContext { provider: Some(ProviderId(\"binance\")), instrument: Some(\"BTC/USDT\"), timeframe: Some(Minute1), operation: WebSocket }, kind: StalledWrite }"
+    );
+    assert!(!debug.contains(&address.to_string()));
+    assert!(!debug.contains("secret"));
+
+    assert_eq!(
+        read_raw_websocket(&mut socket)
+            .await
+            .expect("retained ping"),
+        DecodedFrame::Ignored
+    );
+    assert!(matches!(
+        read_raw_websocket(&mut socket)
+            .await
+            .expect("retained candle"),
+        DecodedFrame::Candle(_)
+    ));
+    assert_eq!(
+        read_raw_websocket(&mut socket)
+            .await
+            .expect("retained close"),
+        DecodedFrame::Close(Some(CloseCode::Away))
+    );
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn invalid_utf8_and_protocol_raw_frames_are_typed_and_contextual() {
+    for (label, bytes, detail) in [
+        (
+            "invalid UTF-8",
+            vec![0x81, 0x01, 0xff],
+            "invalid WebSocket UTF-8",
+        ),
+        (
+            "masked server frame",
+            vec![0x81, 0x80, 0x00, 0x00, 0x00, 0x00],
+            "invalid WebSocket framing",
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut socket = accept_async(stream).await.expect("server handshake");
+            socket
+                .get_mut()
+                .write_all(&bytes)
+                .await
+                .expect("raw invalid frame");
+        });
+        let mut socket = fccli::provider::binance::connect_test_websocket(
+            &format!("ws://{address}"),
+            &instrument(),
+            Timeframe::Minute1,
+            WsConfig::production(),
+        )
+        .await
+        .expect("client handshake");
+        let error = read_raw_websocket(&mut socket).await.expect_err(label);
+        assert!(matches!(
+            &error,
+            ProviderError::Protocol {
+                detail: actual_detail,
+                ..
+            } if *actual_detail == detail
+        ));
+        let display = error.to_string();
+        assert_eq!(
+            display,
+            format!(
+                "protocol failure (operation websocket, provider binance, instrument BTC/USDT, timeframe 1m): {detail}"
+            ),
+            "{label}"
+        );
+        assert!(!display.contains(&address.to_string()), "{label}");
+        assert!(!display.contains("secret"), "{label}");
+
+        let debug = format!("{error:?}");
+        assert_eq!(
+            debug,
+            format!(
+                "Protocol {{ context: ErrorContext {{ provider: Some(ProviderId(\"binance\")), instrument: Some(\"BTC/USDT\"), timeframe: Some(Minute1), operation: WebSocket }}, detail: \"{detail}\" }}"
+            ),
+            "{label}"
+        );
+        assert!(!debug.contains(&address.to_string()), "{label}");
+        assert!(!debug.contains("secret"), "{label}");
+        server.await.expect("server task");
+    }
+}
+
+#[tokio::test]
+async fn unfinished_fragment_with_control_activity_hits_nonresetting_inactivity_bound() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = accept_async(stream).await.expect("server handshake");
+        socket
+            .send(Message::Frame(Frame::message(
+                Vec::new(),
+                OpCode::Data(Data::Text),
+                false,
+            )))
+            .await
+            .expect("empty initial fragment");
+        for value in 0..8_u8 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if socket
+                .send(Message::Ping(vec![value].into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let mut config = WsConfig::production();
+    config.message_inactivity_timeout = Duration::from_millis(40);
+    let mut socket = fccli::provider::binance::connect_test_websocket(
+        &format!("ws://{address}"),
+        &instrument(),
+        Timeframe::Minute1,
+        config,
+    )
+    .await
+    .expect("client handshake");
+    let error = timeout(Duration::from_secs(1), async {
+        loop {
+            match read_raw_websocket(&mut socket).await {
+                Ok(DecodedFrame::Ignored) => {}
+                Ok(other) => panic!("unexpected decoded frame before inactivity: {other:?}"),
+                Err(error) => break error,
+            }
+        }
+    })
+    .await
+    .expect("inactivity deadline");
+    assert!(matches!(
+        error,
+        ProviderError::Timeout {
+            kind: TimeoutKind::WebSocketInactivity,
+            ..
+        }
+    ));
+    server.await.expect("server task");
 }

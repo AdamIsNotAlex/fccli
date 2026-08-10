@@ -234,6 +234,7 @@ pub enum TimeoutKind {
     Request,
     FirstKline,
     StalledWrite,
+    WebSocketInactivity,
     ProducerJoin,
     HistoryJoin,
 }
@@ -244,6 +245,7 @@ impl fmt::Display for TimeoutKind {
             Self::Request => "request",
             Self::FirstKline => "first kline",
             Self::StalledWrite => "stalled write",
+            Self::WebSocketInactivity => "websocket message inactivity",
             Self::ProducerJoin => "producer join",
             Self::HistoryJoin => "history join",
         })
@@ -352,6 +354,11 @@ pub enum ProviderError {
     },
     #[error("provider configuration is invalid: {0}")]
     Configuration(&'static str),
+    #[error("WebSocket configuration is invalid ({context}): {detail}")]
+    WebSocketConfiguration {
+        context: ErrorContext,
+        detail: &'static str,
+    },
     #[error("provider invariant failed: {0}")]
     Invariant(&'static str),
     #[error("provider event queue saturated")]
