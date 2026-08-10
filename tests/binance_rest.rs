@@ -2,10 +2,14 @@
 
 use std::{
     io::{Read, Write},
-    net::TcpListener,
-    sync::{Arc, Mutex},
+    net::{Shutdown, TcpListener},
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use fccli::{
@@ -115,15 +119,93 @@ fn chunked_over_cap_server() -> (String, thread::JoinHandle<()>) {
     });
     (format!("http://{address}"), join)
 }
+fn declared_length_server(body: String) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind declared-length server");
+    let address = listener
+        .local_addr()
+        .expect("declared-length server address");
+    let join = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write declared-length headers");
+        stream.flush().expect("flush declared-length headers");
+        let _ = stream.write_all(body.as_bytes());
+    });
+    (format!("http://{address}"), join)
+}
 
-unsafe fn restore_environment(key: &str, value: Option<std::ffi::OsString>) {
-    if let Some(value) = value {
-        // SAFETY: caller owns the process-environment serialization guard.
-        unsafe { std::env::set_var(key, value) };
-    } else {
-        // SAFETY: caller owns the process-environment serialization guard.
-        unsafe { std::env::remove_var(key) };
-    }
+fn accepting_close_server() -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind closing server");
+    let address = listener.local_addr().expect("closing server address");
+    let join = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept request");
+        stream
+            .shutdown(Shutdown::Both)
+            .expect("reset accepted connection");
+    });
+    (format!("http://{address}"), join)
+}
+
+fn observable_server(
+    response: Option<&'static str>,
+    observed: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind observable server");
+    listener
+        .set_nonblocking(true)
+        .expect("make observable server nonblocking");
+    let address = listener.local_addr().expect("observable server address");
+    let join = thread::spawn(move || {
+        let safety_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if stop.load(Ordering::SeqCst) || Instant::now() >= safety_deadline {
+                return;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    observed.store(true, Ordering::SeqCst);
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request);
+                    if let Some(body) = response {
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .expect("write observable response");
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept observable request: {error}"),
+            }
+        }
+    });
+    (format!("http://{address}"), join)
+}
+
+#[test]
+fn hostile_proxy_subprocess_helper() {
+    let Some(base_url) = std::env::var_os("FCCLI_PROXY_HELPER_TARGET") else {
+        return;
+    };
+    let runtime = tokio::runtime::Runtime::new().expect("helper runtime");
+    runtime.block_on(async {
+        let provider =
+            BinanceProvider::new_test(base_url.into_string().expect("UTF-8 target"), clock())
+                .expect("loopback provider");
+        history(&provider, HistoryRequest::latest(1).expect("latest"))
+            .await
+            .expect("provider bypasses hostile proxy");
+    });
 }
 
 fn payload_source(error: ProviderError) -> PayloadError {
@@ -506,14 +588,12 @@ async fn server_status_timeout_and_transport_are_typed_and_recoverable() {
     ));
     assert!(error.is_recoverable_for_history());
 
-    let socket = TcpListener::bind("127.0.0.1:0").expect("ephemeral loopback socket");
-    let address = socket.local_addr().expect("socket address");
-    drop(socket);
-    let dead =
-        BinanceProvider::new_test(format!("http://{address}"), clock()).expect("loopback provider");
+    let (base_url, join) = accepting_close_server();
+    let dead = BinanceProvider::new_test(base_url, clock()).expect("loopback provider");
     let error = history(&dead, HistoryRequest::latest(1).expect("latest"))
         .await
         .expect_err("transport");
+    join.join().expect("closing server");
     assert!(matches!(&error, ProviderError::Transport { .. }));
     assert!(error.is_recoverable_for_history());
 }
@@ -780,6 +860,53 @@ async fn stalled_client_error_body_preserves_known_status() {
 }
 
 #[tokio::test]
+async fn declared_content_length_accepts_exact_limit_and_rejects_one_over() {
+    let exact_body = format!("[]{}", " ".repeat(REST_BODY_LIMIT - 2));
+    let (base_url, join) = declared_length_server(exact_body);
+    let provider = BinanceProvider::new_test_with_config_and_clock(
+        BinanceTestConfig {
+            base_url,
+            request_timeout: Duration::from_secs(30),
+            body_limit: REST_BODY_LIMIT,
+            rate_limit_fallback: Duration::from_secs(30),
+        },
+        clock(),
+    )
+    .expect("provider");
+    assert!(
+        history(&provider, HistoryRequest::latest(1).expect("latest"))
+            .await
+            .expect("body exactly at production limit")
+            .is_empty()
+    );
+    join.join().expect("exact-length server");
+
+    let over_body = " ".repeat(REST_BODY_LIMIT + 1);
+    let (base_url, join) = declared_length_server(over_body);
+    let provider = BinanceProvider::new_test_with_config_and_clock(
+        BinanceTestConfig {
+            base_url,
+            request_timeout: Duration::from_secs(30),
+            body_limit: REST_BODY_LIMIT,
+            rate_limit_fallback: Duration::from_secs(30),
+        },
+        clock(),
+    )
+    .expect("provider");
+    assert_eq!(
+        payload_source(
+            history(&provider, HistoryRequest::latest(1).expect("latest"))
+                .await
+                .expect_err("declared body over production cap")
+        ),
+        PayloadError::OverBudget {
+            limit_bytes: REST_BODY_LIMIT,
+        }
+    );
+    join.join().expect("over-length server");
+}
+
+#[tokio::test]
 async fn chunked_response_without_length_is_capped() {
     let (base_url, join) = chunked_over_cap_server();
     let provider = BinanceProvider::new_test_with_config_and_clock(
@@ -805,36 +932,56 @@ async fn chunked_response_without_length_is_capped() {
     join.join().expect("chunked server");
 }
 
-#[tokio::test]
-async fn hostile_proxy_environment_does_not_capture_loopback_request() {
-    static ENVIRONMENT: Mutex<()> = Mutex::new(());
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(EMPTY, "application/json"))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let previous_all = std::env::var_os("ALL_PROXY");
-    let previous_http = std::env::var_os("HTTP_PROXY");
-    let previous_no = std::env::var_os("NO_PROXY");
-    // SAFETY: this test serializes and restores its temporary process-environment mutation.
-    unsafe {
-        std::env::set_var("ALL_PROXY", "http://203.0.113.1:1");
-        std::env::set_var("HTTP_PROXY", "http://203.0.113.1:1");
-        std::env::remove_var("NO_PROXY");
+#[test]
+fn hostile_proxy_environment_does_not_capture_loopback_request() {
+    let target_observed = Arc::new(AtomicBool::new(false));
+    let proxy_observed = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (target_url, target_join) =
+        observable_server(Some(EMPTY), Arc::clone(&target_observed), Arc::clone(&stop));
+    let (proxy_url, proxy_join) =
+        observable_server(None, Arc::clone(&proxy_observed), Arc::clone(&stop));
+
+    let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+    command
+        .args(["--exact", "hostile_proxy_subprocess_helper", "--nocapture"])
+        .env("FCCLI_PROXY_HELPER_TARGET", target_url);
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "REQUEST_METHOD",
+    ] {
+        command.env_remove(key);
     }
-    let result = history(
-        &provider(&server, clock()),
-        HistoryRequest::latest(1).expect("latest"),
-    )
-    .await;
-    // SAFETY: restore every prior value before releasing the serialization guard.
-    unsafe {
-        restore_environment("ALL_PROXY", previous_all);
-        restore_environment("HTTP_PROXY", previous_http);
-        restore_environment("NO_PROXY", previous_no);
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        command.env(key, &proxy_url);
     }
-    result.expect("loopback request bypasses hostile proxy");
+
+    let output = command.output().expect("run isolated proxy helper");
+    stop.store(true, Ordering::SeqCst);
+    target_join.join().expect("target server");
+    proxy_join.join().expect("proxy server");
+    assert!(
+        output.status.success(),
+        "proxy helper failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(target_observed.load(Ordering::SeqCst));
+    assert!(!proxy_observed.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
