@@ -1,5 +1,6 @@
 use fccli::model::{
-    Candle, CandleSeries, FinalityAuthority, MutationKind, ResolvedMutation, Timeframe,
+    Candle, CandleSeries, FinalityAuthority, IndexMapping, MutationKind, ResolvedMutation,
+    Timeframe,
 };
 
 const MINUTE: i64 = 60_000;
@@ -40,9 +41,28 @@ fn assert_strict_chronology(series: &CandleSeries) {
     let times = open_times(series);
     assert!(times.windows(2).all(|pair| pair[0] < pair[1]), "{times:?}");
 }
+fn mapped_indices(summary: &fccli::model::MutationSummary) -> Vec<usize> {
+    (0..summary.old_to_new.len())
+        .map(|old_index| {
+            summary
+                .old_to_new
+                .map(old_index)
+                .expect("every valid prior index maps to a final index")
+        })
+        .collect()
+}
+
+fn assert_mapping_eq(summary: &fccli::model::MutationSummary, expected: &[usize]) {
+    assert_eq!(summary.old_to_new.len(), expected.len());
+    assert_eq!(mapped_indices(summary), expected);
+    assert_eq!(summary.old_to_new.map(expected.len()), None);
+}
+
 fn assert_valid_old_to_new(summary: &fccli::model::MutationSummary, series: &CandleSeries) {
     assert!(
-        summary.old_to_new.iter().all(|&index| index < series.len()),
+        mapped_indices(summary)
+            .into_iter()
+            .all(|index| index < series.len()),
         "all old_to_new entries must be valid final indices: {:?}",
         summary.old_to_new
     );
@@ -57,13 +77,13 @@ fn replacement_is_initial_only_including_empty_initialization() {
     assert!(empty.is_empty());
     assert!(empty_summary.empty_input);
     assert!(empty_summary.no_progress);
-    assert!(empty_summary.old_to_new.is_empty());
+    assert_eq!(empty_summary.old_to_new.len(), 0);
 
     let initialized = empty
         .replace(vec![rest(BASE + MINUTE, 11.0), rest(BASE, 10.0)])
         .expect("first nonempty replacement initializes the series");
     assert_eq!((initialized.inserted, initialized.replaced), (2, 0));
-    assert!(initialized.old_to_new.is_empty());
+    assert_eq!(initialized.old_to_new.len(), 0);
     assert_eq!(open_times(&empty), vec![BASE, BASE + MINUTE]);
 
     let mut authoritative = CandleSeries::new(Timeframe::Minute1);
@@ -159,7 +179,7 @@ fn unsorted_overlapping_duplicates_are_stably_normalized() {
         (2, 2, 0)
     );
     assert_eq!(summary.resolved.len(), 4, "equal input keys resolve once");
-    assert_eq!(summary.old_to_new, vec![0, 1]);
+    assert_mapping_eq(&summary, &[0, 1]);
     assert!(!summary.empty_input);
     assert!(!summary.duplicate_only);
     assert!(!summary.no_progress);
@@ -355,7 +375,8 @@ fn prepend_middle_append_report_exact_mapping_and_resolutions() {
         rest(BASE, 10.0),
         rest(BASE + 2 * MINUTE, 12.0),
     ]);
-    assert_eq!(summary.old_to_new, vec![1, 3]);
+    assert!(matches!(&summary.old_to_new, IndexMapping::Explicit(_)));
+    assert_mapping_eq(&summary, &[1, 3]);
     assert_valid_old_to_new(&summary, &series);
     assert_eq!(
         summary.resolved,
@@ -383,7 +404,11 @@ fn prepend_middle_append_report_exact_mapping_and_resolutions() {
     );
 
     let update = series.upsert(ws(BASE + 2 * MINUTE, 22.0, false));
-    assert_eq!(update.old_to_new, vec![0, 1, 2, 3, 4]);
+    assert!(matches!(
+        &update.old_to_new,
+        IndexMapping::Identity { len: 5 }
+    ));
+    assert_mapping_eq(&update, &[0, 1, 2, 3, 4]);
     assert_valid_old_to_new(&update, &series);
     assert_eq!(
         update.resolved,
@@ -412,7 +437,7 @@ fn empty_duplicate_and_no_progress_signals_are_distinct() {
     assert!(empty.empty_input);
     assert!(!empty.duplicate_only);
     assert!(empty.no_progress);
-    assert_eq!(empty.old_to_new, vec![0, 1]);
+    assert_mapping_eq(&empty, &[0, 1]);
     assert!(empty.resolved.is_empty());
 
     let duplicate = series.merge(vec![rest(BASE, 10.0), rest(BASE, 10.0)]);
@@ -489,39 +514,155 @@ fn exact_successor_closes_rest_predecessor_even_with_intervening_off_grid_row() 
 }
 
 #[test]
-fn hot_append_and_upsert_keep_exact_mappings_and_authority() {
+fn hot_append_and_upsert_keep_compact_exact_mappings_and_authority() {
+    const LARGE_LEN: usize = 10_000;
+
     let mut series = CandleSeries::new(Timeframe::Minute1);
     series
-        .replace(vec![rest(BASE, 10.0), rest(BASE + MINUTE, 11.0)])
-        .expect("initial replacement succeeds");
+        .replace(
+            (0..LARGE_LEN)
+                .map(|index| rest(BASE + index as i64 * MINUTE, index as f64 + 10.0))
+                .collect(),
+        )
+        .expect("large initial replacement succeeds");
 
-    let appended = series.append(ws(BASE + 2 * MINUTE, 12.0, false));
-    assert_eq!(appended.old_to_new, vec![0, 1]);
+    let newest_open_time = BASE + (LARGE_LEN as i64 - 1) * MINUTE;
+    let replaced = series.upsert(ws(newest_open_time, 20_001.0, true));
+    assert!(matches!(
+        &replaced.old_to_new,
+        IndexMapping::Identity { len } if *len == LARGE_LEN
+    ));
+    assert_eq!(replaced.old_to_new.len(), LARGE_LEN);
+    assert_eq!(replaced.old_to_new.map(0), Some(0));
+    assert_eq!(replaced.old_to_new.map(LARGE_LEN - 1), Some(LARGE_LEN - 1));
+    assert_eq!(replaced.old_to_new.map(LARGE_LEN), None);
+    assert_eq!(replaced.resolved[0].final_index, LARGE_LEN - 1);
+    assert_eq!(
+        series
+            .get(LARGE_LEN - 1)
+            .expect("closed live update")
+            .authority(),
+        FinalityAuthority::WsAuthoritativeClosed
+    );
+
+    let appended_open_time = BASE + LARGE_LEN as i64 * MINUTE;
+    let appended = series.append(ws(appended_open_time, 20_002.0, false));
+    assert!(matches!(
+        &appended.old_to_new,
+        IndexMapping::Identity { len } if *len == LARGE_LEN
+    ));
+    assert_eq!(appended.old_to_new.len(), LARGE_LEN);
+    assert_eq!(appended.old_to_new.map(0), Some(0));
+    assert_eq!(appended.old_to_new.map(LARGE_LEN - 1), Some(LARGE_LEN - 1));
+    assert_eq!(appended.old_to_new.map(LARGE_LEN), None);
     assert_valid_old_to_new(&appended, &series);
     assert_eq!(
         appended.resolved,
         vec![ResolvedMutation {
-            open_time: BASE + 2 * MINUTE,
-            final_index: 2,
+            open_time: appended_open_time,
+            final_index: LARGE_LEN,
             kind: MutationKind::Inserted,
         }]
     );
 
-    let replaced = series.upsert(ws(BASE + MINUTE, 21.0, true));
-    assert_eq!(replaced.old_to_new, vec![0, 1, 2]);
-    assert_valid_old_to_new(&replaced, &series);
-    assert_eq!(replaced.resolved[0].kind, MutationKind::Replaced);
-    assert_eq!(replaced.resolved[0].final_index, 1);
-    assert_eq!(
-        series.get(1).expect("closed live update").authority(),
-        FinalityAuthority::WsAuthoritativeClosed
-    );
-
-    let rejected = series.upsert(rest(BASE + MINUTE, 99.0));
-    assert_eq!(rejected.old_to_new, vec![0, 1, 2]);
+    let rejected = series.upsert(rest(newest_open_time, 99.0));
+    assert!(matches!(
+        &rejected.old_to_new,
+        IndexMapping::Identity { len } if *len == LARGE_LEN + 1
+    ));
+    assert_eq!(rejected.old_to_new.len(), LARGE_LEN + 1);
+    assert_eq!(rejected.old_to_new.map(LARGE_LEN), Some(LARGE_LEN));
+    assert_eq!(rejected.old_to_new.map(LARGE_LEN + 1), None);
     assert_valid_old_to_new(&rejected, &series);
     assert_eq!(rejected.resolved[0].kind, MutationKind::Unchanged);
-    assert_eq!(series.get(1).expect("authority retained").open(), 21.0);
+    assert_eq!(
+        series
+            .get(LARGE_LEN - 1)
+            .expect("authority retained")
+            .open(),
+        20_001.0
+    );
+}
+#[test]
+fn appended_successor_rechecks_the_previous_back_element() {
+    let mut series = CandleSeries::new(Timeframe::Minute1);
+    series
+        .replace(vec![rest(BASE, 10.0)])
+        .expect("initial replacement succeeds");
+    assert_eq!(
+        series.get(0).expect("initial back element").authority(),
+        FinalityAuthority::RestProvisionalOpen
+    );
+
+    let appended = series.append(rest(BASE + MINUTE, 11.0));
+
+    assert!(matches!(
+        &appended.old_to_new,
+        IndexMapping::Identity { len: 1 }
+    ));
+    assert_mapping_eq(&appended, &[0]);
+    assert_eq!(
+        series.get(0).expect("previous back element").authority(),
+        FinalityAuthority::RestProvisionalClosed
+    );
+    assert_eq!(
+        series.get(1).expect("new back element").authority(),
+        FinalityAuthority::RestProvisionalOpen
+    );
+}
+
+#[test]
+fn prepend_middle_and_general_batches_choose_exact_mapping_forms() {
+    let mut prepended = CandleSeries::new(Timeframe::Minute1);
+    prepended
+        .replace(vec![
+            rest(BASE + MINUTE, 11.0),
+            rest(BASE + 2 * MINUTE, 12.0),
+        ])
+        .expect("initial replacement succeeds");
+    let prepend = prepended.prepend(vec![rest(BASE, 10.0)]);
+    assert!(matches!(
+        &prepend.old_to_new,
+        IndexMapping::ShiftSuffix {
+            len: 2,
+            from: 0,
+            delta: 1
+        }
+    ));
+    assert_mapping_eq(&prepend, &[1, 2]);
+    assert_valid_old_to_new(&prepend, &prepended);
+
+    let mut middle = CandleSeries::new(Timeframe::Minute1);
+    middle
+        .replace(vec![rest(BASE, 10.0), rest(BASE + 2 * MINUTE, 12.0)])
+        .expect("initial replacement succeeds");
+    let inserted = middle.upsert(rest(BASE + MINUTE, 11.0));
+    assert!(matches!(
+        &inserted.old_to_new,
+        IndexMapping::ShiftSuffix {
+            len: 2,
+            from: 1,
+            delta: 1
+        }
+    ));
+    assert_mapping_eq(&inserted, &[0, 2]);
+    assert_valid_old_to_new(&inserted, &middle);
+
+    let mut general = CandleSeries::new(Timeframe::Minute1);
+    general
+        .replace(vec![
+            rest(BASE + MINUTE, 11.0),
+            rest(BASE + 3 * MINUTE, 13.0),
+        ])
+        .expect("initial replacement succeeds");
+    let batch = general.merge(vec![
+        rest(BASE, 10.0),
+        rest(BASE + 2 * MINUTE, 12.0),
+        rest(BASE + 4 * MINUTE, 14.0),
+    ]);
+    assert!(matches!(&batch.old_to_new, IndexMapping::Explicit(_)));
+    assert_mapping_eq(&batch, &[1, 3]);
+    assert_valid_old_to_new(&batch, &general);
 }
 
 #[test]

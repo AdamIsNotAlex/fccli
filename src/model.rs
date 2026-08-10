@@ -496,11 +496,56 @@ pub struct ResolvedMutation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IndexMapping {
+    Identity {
+        len: usize,
+    },
+    ShiftSuffix {
+        len: usize,
+        from: usize,
+        delta: isize,
+    },
+    Explicit(Vec<usize>),
+}
+
+impl IndexMapping {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Identity { len } | Self::ShiftSuffix { len, .. } => *len,
+            Self::Explicit(indices) => indices.len(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[must_use]
+    pub fn map(&self, old_index: usize) -> Option<usize> {
+        match self {
+            Self::Identity { len } => (old_index < *len).then_some(old_index),
+            Self::ShiftSuffix { len, from, delta } => {
+                if old_index >= *len {
+                    return None;
+                }
+                if old_index < *from {
+                    return Some(old_index);
+                }
+                old_index.checked_add_signed(*delta)
+            }
+            Self::Explicit(indices) => indices.get(old_index).copied(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MutationSummary {
     pub inserted: usize,
     pub replaced: usize,
     pub unchanged: usize,
-    pub old_to_new: Vec<usize>,
+    pub old_to_new: IndexMapping,
     pub resolved: Vec<ResolvedMutation>,
     pub empty_input: bool,
     pub duplicate_only: bool,
@@ -669,7 +714,7 @@ impl CandleSeries {
             inserted,
             replaced: 0,
             unchanged: 0,
-            old_to_new: Vec::new(),
+            old_to_new: IndexMapping::Identity { len: 0 },
             resolved,
             empty_input: false,
             duplicate_only: false,
@@ -699,7 +744,7 @@ impl CandleSeries {
                     inserted: 0,
                     replaced,
                     unchanged,
-                    old_to_new: (0..old_len).collect(),
+                    old_to_new: IndexMapping::Identity { len: old_len },
                     resolved: vec![ResolvedMutation {
                         open_time,
                         final_index: index,
@@ -715,6 +760,18 @@ impl CandleSeries {
                 }
             }
             Err(index) => {
+                let predecessor =
+                    timeframe_predecessor(self.timeframe, open_time).and_then(|predecessor_time| {
+                        self.candles
+                            .back()
+                            .filter(|candle| candle.open_time() == predecessor_time)
+                            .map(|_| old_len - 1)
+                            .or_else(|| {
+                                self.candles
+                                    .binary_search_by_key(&predecessor_time, Candle::open_time)
+                                    .ok()
+                            })
+                    });
                 if index == old_len {
                     self.candles.push_back(candidate);
                 } else if index == 0 {
@@ -722,24 +779,29 @@ impl CandleSeries {
                 } else {
                     self.candles.insert(index, candidate);
                 }
-                let mut affected = vec![index];
-                if let Some(predecessor_time) = timeframe_predecessor(self.timeframe, open_time)
-                    && let Ok(predecessor) = self
-                        .candles
-                        .binary_search_by_key(&predecessor_time, Candle::open_time)
-                {
-                    affected.push(predecessor);
-                    affected.sort_unstable();
-                    affected.dedup();
-                }
-                recompute_rest_adjacency(self.timeframe, &mut self.candles, &affected);
+                let affected = match predecessor {
+                    Some(predecessor) => [predecessor, index],
+                    None => [index, index],
+                };
+                let affected_len = usize::from(affected[0] != affected[1]) + 1;
+                recompute_rest_adjacency(
+                    self.timeframe,
+                    &mut self.candles,
+                    &affected[..affected_len],
+                );
                 MutationSummary {
                     inserted: 1,
                     replaced: 0,
                     unchanged: 0,
-                    old_to_new: (0..old_len)
-                        .map(|old_index| old_index + usize::from(old_index >= index))
-                        .collect(),
+                    old_to_new: if index == old_len {
+                        IndexMapping::Identity { len: old_len }
+                    } else {
+                        IndexMapping::ShiftSuffix {
+                            len: old_len,
+                            from: index,
+                            delta: 1,
+                        }
+                    },
                     resolved: vec![ResolvedMutation {
                         open_time,
                         final_index: index,
@@ -849,7 +911,7 @@ impl CandleSeries {
             inserted,
             replaced,
             unchanged,
-            old_to_new,
+            old_to_new: IndexMapping::Explicit(old_to_new),
             resolved,
             empty_input: false,
             duplicate_only: inserted == 0 && replaced == 0,
@@ -863,7 +925,7 @@ fn empty_summary(old_len: usize) -> MutationSummary {
         inserted: 0,
         replaced: 0,
         unchanged: 0,
-        old_to_new: (0..old_len).collect(),
+        old_to_new: IndexMapping::Identity { len: old_len },
         resolved: Vec::new(),
         empty_input: true,
         duplicate_only: false,
