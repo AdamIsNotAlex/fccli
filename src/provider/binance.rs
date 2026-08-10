@@ -1,21 +1,21 @@
 //! Binance Spot REST history and raw WebSocket transport.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
 
-use futures_util::{Sink, Stream};
+use futures_util::{Sink, Stream, stream};
 use reqwest::{Client, StatusCode, Url, header::RETRY_AFTER};
 use serde::{
     Deserialize,
     de::{IgnoredAny, SeqAccess, Visitor},
 };
 use serde_json::Value;
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, sync::mpsc};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
     tungstenite::{
@@ -34,10 +34,14 @@ use crate::{
         SanitizedMessage, TimeoutKind,
     },
     model::{
-        Candle, HistoryRequest, Instrument, InstrumentSpec, ProcessBlocker, RateGateState,
+        Candle, ConnectionStatus, GapGeneration, HistoryRequest, Instrument, InstrumentSpec,
+        MarketEvent, MonoInstant, ProcessBlocker, ProviderId, RateGateState, ReplayRevision,
         Timeframe,
     },
-    provider::{RateGateSender, RateGateSnapshot, rate_gate_channel},
+    provider::{
+        LiveFeed, LiveRequest, MarketDataProvider, ProviderFuture, RateGateSender,
+        RateGateSnapshot, ReconcileAck, ReconcileExpectation, rate_gate_channel,
+    },
 };
 
 const KLINES_PATH: &str = "/api/v3/klines";
@@ -58,6 +62,71 @@ pub const WS_WRITE_BUFFER_SIZE: usize = 64 * 1024;
 pub const WS_MAX_WRITE_BUFFER_SIZE: usize = 1024 * 1024;
 pub const WS_STALLED_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const WS_MESSAGE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub const KEYED_CANDLE_CAPACITY: usize = 1024;
+pub const CONTROL_CAPACITY: usize = 64;
+pub const EMERGENCY_CONTROL_CAPACITY: usize = 2;
+pub const MARKET_EVENT_CHANNEL_CAPACITY: usize = 256;
+pub const FIRST_KLINE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const RECONCILE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+pub const MAX_CONNECTION_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_SUPERVISOR_CAPACITY: usize = 65_536;
+const GAP_PAGE_LIMIT: u16 = 1000;
+
+#[derive(Clone, Debug)]
+pub struct LiveSupervisorConfig {
+    pub keyed_candle_capacity: usize,
+    pub control_capacity: usize,
+    pub market_event_capacity: usize,
+    pub first_kline_timeout: Duration,
+    pub reconcile_ack_timeout: Duration,
+    pub max_connection_age: Duration,
+    pub ws_config: WsConfig,
+}
+
+impl Default for LiveSupervisorConfig {
+    fn default() -> Self {
+        Self {
+            keyed_candle_capacity: KEYED_CANDLE_CAPACITY,
+            control_capacity: CONTROL_CAPACITY,
+            market_event_capacity: MARKET_EVENT_CHANNEL_CAPACITY,
+            first_kline_timeout: FIRST_KLINE_HANDSHAKE_TIMEOUT,
+            reconcile_ack_timeout: RECONCILE_ACK_TIMEOUT,
+            max_connection_age: MAX_CONNECTION_AGE,
+            ws_config: WsConfig::default(),
+        }
+    }
+}
+
+impl LiveSupervisorConfig {
+    pub fn validate(&self) -> Result<(), ProviderError> {
+        for capacity in [
+            self.keyed_candle_capacity,
+            self.control_capacity,
+            self.market_event_capacity,
+        ] {
+            if !(1..=MAX_SUPERVISOR_CAPACITY).contains(&capacity) {
+                return Err(ProviderError::Configuration(
+                    "live supervisor capacity is outside 1..=65536",
+                ));
+            }
+        }
+        for timeout in [self.first_kline_timeout, self.reconcile_ack_timeout] {
+            if !(Duration::from_millis(1)..=Duration::from_secs(60)).contains(&timeout) {
+                return Err(ProviderError::Configuration(
+                    "live supervisor timeout is outside 1ms..=60s",
+                ));
+            }
+        }
+        if self.max_connection_age.is_zero() {
+            return Err(ProviderError::Configuration(
+                "live connection max age must be positive",
+            ));
+        }
+        self.ws_config.validate()?;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WsConfig {
@@ -808,6 +877,9 @@ pub struct BinanceProvider {
     gate_snapshot: RateGateSnapshot,
     body_limit: usize,
     rate_limit_fallback: Duration,
+    live: LiveSupervisorConfig,
+    #[cfg(feature = "test-transport")]
+    ws_base_url: Option<String>,
 }
 
 #[cfg(feature = "test-transport")]
@@ -830,6 +902,23 @@ impl BinanceTestConfig {
             rate_limit_fallback: RATE_LIMIT_FALLBACK,
         }
     }
+
+    #[must_use]
+    pub fn with_websocket_base(self, base_url: impl Into<String>) -> BinanceLiveTestConfig {
+        BinanceLiveTestConfig {
+            rest: self,
+            ws_base_url: base_url.into(),
+            live: LiveSupervisorConfig::default(),
+        }
+    }
+}
+
+#[cfg(feature = "test-transport")]
+#[derive(Clone, Debug)]
+pub struct BinanceLiveTestConfig {
+    pub rest: BinanceTestConfig,
+    pub ws_base_url: String,
+    pub live: LiveSupervisorConfig,
 }
 
 impl BinanceProvider {
@@ -842,6 +931,7 @@ impl BinanceProvider {
             REST_REQUEST_TIMEOUT,
             REST_BODY_LIMIT,
             RATE_LIMIT_FALLBACK,
+            LiveSupervisorConfig::default(),
         )
     }
 
@@ -865,6 +955,26 @@ impl BinanceProvider {
             config.request_timeout,
             config.body_limit,
             config.rate_limit_fallback,
+            LiveSupervisorConfig::default(),
+            None,
+        )
+    }
+
+    #[cfg(feature = "test-transport")]
+    pub fn new_test_live(
+        config: BinanceLiveTestConfig,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, ProviderError> {
+        let base_url = validate_loopback_base(&config.rest.base_url)?;
+        validate_loopback_ws_base(&config.ws_base_url)?;
+        Self::build(
+            base_url,
+            clock,
+            config.rest.request_timeout,
+            config.rest.body_limit,
+            config.rest.rate_limit_fallback,
+            config.live,
+            Some(config.ws_base_url),
         )
     }
 
@@ -874,12 +984,15 @@ impl BinanceProvider {
         request_timeout: Duration,
         body_limit: usize,
         rate_limit_fallback: Duration,
+        live: LiveSupervisorConfig,
+        #[cfg(feature = "test-transport")] ws_base_url: Option<String>,
     ) -> Result<Self, ProviderError> {
         if request_timeout.is_zero() || body_limit == 0 || rate_limit_fallback.is_zero() {
             return Err(ProviderError::Configuration(
                 "REST timeout, body limit, and fallback must be positive",
             ));
         }
+        live.validate()?;
         let client = Client::builder()
             .no_proxy()
             .timeout(request_timeout)
@@ -896,6 +1009,9 @@ impl BinanceProvider {
             gate_snapshot,
             body_limit,
             rate_limit_fallback,
+            live,
+            #[cfg(feature = "test-transport")]
+            ws_base_url,
         })
     }
 
@@ -1048,6 +1164,411 @@ impl BinanceProvider {
             status: status.as_u16(),
         })
     }
+
+    async fn connect_live_socket(
+        &self,
+        instrument: &Instrument,
+        timeframe: Timeframe,
+    ) -> Result<RawWebSocket, ProviderError> {
+        #[cfg(feature = "production-transport")]
+        {
+            connect_websocket(instrument, timeframe, self.live.ws_config).await
+        }
+        #[cfg(feature = "test-transport")]
+        {
+            let base = self
+                .ws_base_url
+                .as_deref()
+                .ok_or(ProviderError::Configuration(
+                    "test WebSocket base URL is required for live feeds",
+                ))?;
+            connect_test_websocket(base, instrument, timeframe, self.live.ws_config).await
+        }
+    }
+
+    async fn supervise_live(
+        self,
+        mut request: LiveRequest,
+        sender: mpsc::Sender<Result<MarketEvent, ProviderError>>,
+    ) -> Result<(), ProviderError> {
+        let mut generation_number = 0_u64;
+        let mut backoff_index = 0_usize;
+        loop {
+            if request.cancellation.is_cancelled() {
+                let _ = sender
+                    .send(Ok(MarketEvent::Status {
+                        generation: None,
+                        status: ConnectionStatus::Stopped,
+                    }))
+                    .await;
+                return Ok(());
+            }
+            if matches!(
+                self.gate_snapshot.current(),
+                Ok(RateGateState::ProcessBlocked(_))
+            ) {
+                self.send_invalid_ban_and_stop(&sender).await;
+                return Err(ProviderError::InvalidBanExpiry);
+            }
+            generation_number = generation_number
+                .checked_add(1)
+                .ok_or(ProviderError::Invariant("gap generation overflow"))?;
+            let generation = GapGeneration(generation_number);
+            send_market(
+                &sender,
+                &request.cancellation,
+                MarketEvent::Status {
+                    generation: Some(generation),
+                    status: ConnectionStatus::Connecting,
+                },
+            )
+            .await?;
+            let mut socket = match self
+                .connect_live_socket(&request.instrument, request.timeframe)
+                .await
+            {
+                Ok(socket) => socket,
+                Err(error) if is_terminal_live_error(&error) => {
+                    send_market(
+                        &sender,
+                        &request.cancellation,
+                        MarketEvent::TerminalError(error.clone()),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.recover_and_backoff(
+                        &sender,
+                        &request.cancellation,
+                        Some(generation),
+                        error,
+                        &mut backoff_index,
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+            let age_deadline = checked_deadline(self.clock.now(), self.live.max_connection_age)
+                .map_err(|_| ProviderError::Invariant("live connection age deadline overflow"))?;
+            let outcome = self
+                .run_generation(&mut request, &sender, &mut socket, generation, age_deadline)
+                .await;
+            match outcome {
+                Ok(GenerationOutcome::Cancelled) => {
+                    let _ = sender
+                        .send(Ok(MarketEvent::Status {
+                            generation: Some(generation),
+                            status: ConnectionStatus::Stopped,
+                        }))
+                        .await;
+                    return Ok(());
+                }
+                Ok(GenerationOutcome::AcknowledgedReconnect(error)) => {
+                    backoff_index = 0;
+                    self.recover_and_backoff(
+                        &sender,
+                        &request.cancellation,
+                        Some(generation),
+                        error,
+                        &mut backoff_index,
+                    )
+                    .await?;
+                }
+                Ok(GenerationOutcome::Reconnect(error)) => {
+                    self.recover_and_backoff(
+                        &sender,
+                        &request.cancellation,
+                        Some(generation),
+                        error,
+                        &mut backoff_index,
+                    )
+                    .await?;
+                }
+                Err(error) if matches!(error, ProviderError::InvalidBanExpiry) => {
+                    self.send_invalid_ban_and_stop(&sender).await;
+                    return Err(error);
+                }
+                Err(error) if is_terminal_live_error(&error) => {
+                    send_market(
+                        &sender,
+                        &request.cancellation,
+                        MarketEvent::TerminalError(error.clone()),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.recover_and_backoff(
+                        &sender,
+                        &request.cancellation,
+                        Some(generation),
+                        error,
+                        &mut backoff_index,
+                    )
+                    .await?
+                }
+            }
+        }
+    }
+
+    async fn run_generation(
+        &self,
+        request: &mut LiveRequest,
+        sender: &mpsc::Sender<Result<MarketEvent, ProviderError>>,
+        socket: &mut RawWebSocket,
+        generation: GapGeneration,
+        age_deadline: MonoInstant,
+    ) -> Result<GenerationOutcome, ProviderError> {
+        send_market(
+            sender,
+            &request.cancellation,
+            MarketEvent::Status {
+                generation: Some(generation),
+                status: ConnectionStatus::GapSync,
+            },
+        )
+        .await?;
+        let first_deadline = checked_deadline(self.clock.now(), self.live.first_kline_timeout)
+            .map_err(|_| ProviderError::Invariant("first-kline deadline overflow"))?;
+        let first = loop {
+            tokio::select! {
+                biased;
+                () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
+                frame = socket.read() => match frame? {
+                    DecodedFrame::Candle(candle) => break candle,
+                    DecodedFrame::Ignored => {}
+                    DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => return Ok(GenerationOutcome::Reconnect(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" })),
+                    DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
+                    DecodedFrame::ProviderError(error) => return Ok(GenerationOutcome::Reconnect(error)),
+                },
+                () = self.clock.sleep_until(first_deadline) => {
+                    return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), kind: TimeoutKind::FirstKline }));
+                }
+            }
+        };
+        let confirmed = request
+            .accepted_watermark_rx
+            .current()
+            .map_err(|_| ProviderError::ChannelClosed {
+                context: ErrorContext::operation(ErrorOperation::Reconciliation)
+                    .with_market(&request.instrument, request.timeframe),
+            })?
+            .or(request.startup_watermark);
+        let start = confirmed.unwrap_or_else(|| first.open_time());
+        let mut target = first.open_time().max(start);
+        let mut revision = ReplayRevision(1);
+        let mut buffered = BTreeMap::new();
+        buffered.insert(first.open_time(), first);
+        let mut deferred_reconnect: Option<ProviderError> = None;
+
+        loop {
+            let mut cursor = start;
+            let mut page_candles = Vec::new();
+            while cursor <= target {
+                let history_request = HistoryRequest::gap(cursor, target, GAP_PAGE_LIMIT)
+                    .map_err(|_| ProviderError::Invariant("invalid gap history request"))?;
+                let history_cancel = request.cancellation.child_token();
+                let history = self.history(
+                    &request.instrument,
+                    request.timeframe,
+                    history_request,
+                    history_cancel,
+                );
+                tokio::pin!(history);
+                let page = loop {
+                    tokio::select! {
+                        biased;
+                        () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
+                        page = &mut history => break page,
+                        frame = socket.read(), if deferred_reconnect.is_none() => match frame? {
+                            DecodedFrame::Candle(candle) => {
+                                revision.0 = revision.0.checked_add(1).ok_or(ProviderError::Invariant("replay revision overflow"))?;
+                                target = target.max(candle.open_time());
+                                buffered.insert(candle.open_time(), candle);
+                            }
+                            DecodedFrame::Ignored => {}
+                            DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => deferred_reconnect = Some(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" }),
+                            DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
+                            DecodedFrame::ProviderError(error) => deferred_reconnect = Some(error),
+                        },
+                    }
+                }?;
+                let last = page.last().map(Candle::open_time);
+                if page.is_empty() || last.is_some_and(|value| value < cursor) {
+                    return Ok(GenerationOutcome::Reconnect(
+                        ProviderError::GapSyncNoProgress {
+                            target_open_time: target,
+                            last_open_time: last,
+                        },
+                    ));
+                }
+                let page_len = page.len();
+                page_candles.extend(page);
+                let Some(last) = last else { unreachable!() };
+                if last >= target {
+                    break;
+                }
+                if page_len < usize::from(GAP_PAGE_LIMIT) {
+                    return Ok(GenerationOutcome::Reconnect(
+                        ProviderError::GapSyncNoProgress {
+                            target_open_time: target,
+                            last_open_time: Some(last),
+                        },
+                    ));
+                }
+                cursor = checked_next_millis(last)?;
+            }
+            page_candles.extend(buffered.values().cloned());
+            page_candles.sort_by_key(Candle::open_time);
+            page_candles.dedup_by_key(|candle| candle.open_time());
+            let expected = ReconcileExpectation {
+                generation,
+                revision,
+                target_open_time: target,
+            };
+            request
+                .reconcile_ack_rx
+                .register_expectation(expected)
+                .map_err(|_| ProviderError::ChannelClosed {
+                    context: ErrorContext::operation(ErrorOperation::Reconciliation)
+                        .with_market(&request.instrument, request.timeframe),
+                })?;
+            send_market(
+                sender,
+                &request.cancellation,
+                MarketEvent::ReconcileBatch {
+                    generation,
+                    revision,
+                    target_open_time: target,
+                    candles: page_candles,
+                },
+            )
+            .await?;
+            let ack_deadline = checked_deadline(self.clock.now(), self.live.reconcile_ack_timeout)
+                .map_err(|_| ProviderError::Invariant("ack deadline overflow"))?;
+            loop {
+                tokio::select! {
+                    biased;
+                    () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
+                    frame = socket.read(), if deferred_reconnect.is_none() => match frame? {
+                        DecodedFrame::Candle(candle) => { revision.0 = revision.0.checked_add(1).ok_or(ProviderError::Invariant("replay revision overflow"))?; target = target.max(candle.open_time()); buffered.insert(candle.open_time(), candle); break; }
+                        DecodedFrame::Ignored => {}
+                        DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => deferred_reconnect = Some(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" }),
+                        DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
+                        DecodedFrame::ProviderError(error) => deferred_reconnect = Some(error),
+                    },
+                    ack = request.reconcile_ack_rx.changed() => {
+                        let ReconcileAck { generation: ack_generation, revision: ack_revision, through } = ack.map_err(|_| ProviderError::ChannelClosed { context: ErrorContext::operation(ErrorOperation::Reconciliation).with_market(&request.instrument, request.timeframe) })?;
+                        if ack_generation == generation && ack_revision == revision && through >= target {
+                            send_market(sender, &request.cancellation, MarketEvent::Status { generation: Some(generation), status: ConnectionStatus::Connected }).await?;
+                            if let Some(error) = deferred_reconnect.take() { return Ok(GenerationOutcome::AcknowledgedReconnect(error)); }
+                            return self.connected_loop(request, sender, socket, generation, age_deadline).await;
+                        }
+                    },
+                    () = self.clock.sleep_until(ack_deadline) => {
+                        if let Ok(Some(ack)) = request.reconcile_ack_rx.current() && ack.generation == generation && ack.revision == revision && ack.through >= target {
+                            send_market(sender, &request.cancellation, MarketEvent::Status { generation: Some(generation), status: ConnectionStatus::Connected }).await?;
+                            if let Some(error) = deferred_reconnect.take() { return Ok(GenerationOutcome::AcknowledgedReconnect(error)); }
+                            return self.connected_loop(request, sender, socket, generation, age_deadline).await;
+                        }
+                        return Ok(GenerationOutcome::Reconnect(ProviderError::ReconcileAckTimeout { generation, revision, target_open_time: target }));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn connected_loop(
+        &self,
+        request: &mut LiveRequest,
+        sender: &mpsc::Sender<Result<MarketEvent, ProviderError>>,
+        socket: &mut RawWebSocket,
+        generation: GapGeneration,
+        age_deadline: MonoInstant,
+    ) -> Result<GenerationOutcome, ProviderError> {
+        loop {
+            tokio::select! {
+                biased;
+                () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
+                () = self.clock.sleep_until(age_deadline) => return Ok(GenerationOutcome::AcknowledgedReconnect(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::LiveFeed).with_market(&request.instrument, request.timeframe), detail: "24-hour WebSocket connection age reached" })),
+                changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| ProviderError::ChannelClosed { context: ErrorContext::operation(ErrorOperation::Reconciliation).with_market(&request.instrument, request.timeframe) })?; }
+                frame = socket.read() => match frame? {
+                    DecodedFrame::Candle(candle) => send_market(sender, &request.cancellation, MarketEvent::Candle { generation, candle }).await?,
+                    DecodedFrame::Ignored => {}
+                    DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => return Ok(GenerationOutcome::AcknowledgedReconnect(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" })),
+                    DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
+                    DecodedFrame::ProviderError(error) => return Ok(GenerationOutcome::AcknowledgedReconnect(error)),
+                }
+            }
+        }
+    }
+
+    async fn recover_and_backoff(
+        &self,
+        sender: &mpsc::Sender<Result<MarketEvent, ProviderError>>,
+        cancellation: &CancellationToken,
+        generation: Option<GapGeneration>,
+        error: ProviderError,
+        backoff_index: &mut usize,
+    ) -> Result<(), ProviderError> {
+        let gate_deadline = match self
+            .gate_snapshot
+            .current()
+            .map_err(|_| ProviderError::Invariant("rate gate closed"))?
+        {
+            RateGateState::ProcessBlocked(_) => return Err(ProviderError::InvalidBanExpiry),
+            RateGateState::TimedUntil(deadline) => Some(deadline),
+            RateGateState::Open => None,
+        };
+        send_market(
+            sender,
+            cancellation,
+            MarketEvent::RecoverableError {
+                generation,
+                error,
+                rate_gate_deadline: gate_deadline,
+            },
+        )
+        .await?;
+        send_market(
+            sender,
+            cancellation,
+            MarketEvent::Status {
+                generation,
+                status: ConnectionStatus::Backoff,
+            },
+        )
+        .await?;
+        let seconds = [1_u64, 2, 4, 8, 16, 30]
+            .get(*backoff_index)
+            .copied()
+            .unwrap_or(30);
+        *backoff_index = backoff_index.saturating_add(1);
+        let backoff = checked_deadline(self.clock.now(), Duration::from_secs(seconds))
+            .map_err(|_| ProviderError::Invariant("backoff deadline overflow"))?;
+        let deadline = gate_deadline.map_or(backoff, |gate| gate.max(backoff));
+        tokio::select! { biased; () = cancellation.cancelled() => Ok(()), () = self.clock.sleep_until(deadline) => Ok(()) }
+    }
+
+    async fn send_invalid_ban_and_stop(
+        &self,
+        sender: &mpsc::Sender<Result<MarketEvent, ProviderError>>,
+    ) {
+        let _ = sender
+            .send(Ok(MarketEvent::RecoverableError {
+                generation: None,
+                error: ProviderError::InvalidBanExpiry,
+                rate_gate_deadline: None,
+            }))
+            .await;
+        let _ = sender
+            .send(Ok(MarketEvent::Status {
+                generation: None,
+                status: ConnectionStatus::Stopped,
+            }))
+            .await;
+    }
     pub fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
         canonicalize_binance(spec)
             .map_err(|_| ProviderError::Configuration("instrument is not valid for Binance Spot"))
@@ -1056,6 +1577,81 @@ impl BinanceProvider {
     #[must_use]
     pub fn rate_gate(&self) -> RateGateSnapshot {
         self.gate_snapshot.clone()
+    }
+}
+
+enum GenerationOutcome {
+    Cancelled,
+    AcknowledgedReconnect(ProviderError),
+    Reconnect(ProviderError),
+}
+
+async fn send_market(
+    sender: &mpsc::Sender<Result<MarketEvent, ProviderError>>,
+    cancellation: &CancellationToken,
+    event: MarketEvent,
+) -> Result<(), ProviderError> {
+    tokio::select! { biased; () = cancellation.cancelled() => Ok(()), result = sender.send(Ok(event)) => result.map_err(|_| ProviderError::ChannelClosed { context: ErrorContext::operation(ErrorOperation::LiveFeed) }) }
+}
+
+fn checked_next_millis(value: i64) -> Result<i64, ProviderError> {
+    value
+        .checked_add(1)
+        .ok_or(ProviderError::Invariant("gap cursor overflow"))
+}
+
+fn is_terminal_live_error(error: &ProviderError) -> bool {
+    matches!(
+        error,
+        ProviderError::Configuration(_)
+            | ProviderError::WebSocketConfiguration { .. }
+            | ProviderError::Invariant(_)
+            | ProviderError::ClientStatus { .. }
+            | ProviderError::InvalidSymbol { .. }
+    )
+}
+
+impl MarketDataProvider for BinanceProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId::new("binance").expect("static provider id")
+    }
+    fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
+        BinanceProvider::canonicalize(self, spec)
+    }
+    fn history<'a>(
+        &'a self,
+        instrument: &'a Instrument,
+        timeframe: Timeframe,
+        request: HistoryRequest,
+        cancellation: CancellationToken,
+    ) -> ProviderFuture<'a, Vec<Candle>> {
+        Box::pin(BinanceProvider::history(
+            self,
+            instrument,
+            timeframe,
+            request,
+            cancellation,
+        ))
+    }
+    fn open_live<'a>(&'a self, request: LiveRequest) -> ProviderFuture<'a, LiveFeed> {
+        Box::pin(async move {
+            self.live.validate()?;
+            let (sender, receiver) = mpsc::channel(self.live.market_event_capacity);
+            let cancellation = request.cancellation.clone();
+            let producer = self.clone();
+            let events = stream::unfold(receiver, |mut receiver| async move {
+                receiver.recv().await.map(|item| (item, receiver))
+            });
+            Ok(LiveFeed::spawn(
+                Box::pin(events),
+                cancellation,
+                Arc::clone(&self.clock),
+                async move { producer.supervise_live(request, sender).await },
+            ))
+        })
+    }
+    fn rate_gate(&self) -> RateGateSnapshot {
+        BinanceProvider::rate_gate(self)
     }
 }
 
@@ -1359,6 +1955,30 @@ fn validate_loopback_base(value: &str) -> Result<Url, ProviderError> {
     {
         return Err(ProviderError::Configuration(
             "test REST base URL must be plain HTTP on a literal loopback address",
+        ));
+    }
+    Ok(url)
+}
+
+#[cfg(feature = "test-transport")]
+fn validate_loopback_ws_base(value: &str) -> Result<Url, ProviderError> {
+    let url = Url::parse(value)
+        .map_err(|_| ProviderError::Configuration("test WebSocket base URL is invalid"))?;
+    let host = url.host_str().ok_or(ProviderError::Configuration(
+        "test WebSocket base URL requires a host",
+    ))?;
+    let address: std::net::IpAddr = host.parse().map_err(|_| {
+        ProviderError::Configuration("test WebSocket base URL must use a literal loopback address")
+    })?;
+    if !address.is_loopback()
+        || !matches!(url.scheme(), "ws" | "wss")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ProviderError::Configuration(
+            "test WebSocket base URL must use WS on a literal loopback address",
         ));
     }
     Ok(url)

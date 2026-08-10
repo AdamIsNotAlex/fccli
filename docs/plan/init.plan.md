@@ -1106,6 +1106,18 @@ Chunk-9 append-only formatter update (authoritative over the earlier 51-executio
 
 The canonical total is therefore **54 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-54`, accompanied by `artifact://1692`; the artifacts' later check, WebSocket codec test, and API-boundary-test outcomes document chain progression only and do not update unrelated ledger records because their commands and scopes do not exactly match those records.
 
+Chunk-10 append-only formatter update (authoritative over the earlier 54-execution total and `fmt-exec-54` current-basis statement, which remains preserved as historical accounting):
+
+| Record ID | Attempt/date | Requirement | Status after attempt | Environment | Command/scenario | PASS semantics | Observed result | Evidence | Blocker/next action | Supersedes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| DET-FMT | `attempt-2026-08-10-chunk10-1` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, chunk-10 Binance live-feed tree | `cargo fmt --check` within the retained chained command accompanied by `artifact://1733` | exit 0 | PASS; the chain advanced beyond formatting, the subsequent Cargo check passed, all 6 Binance live-feed tests passed, and the final `cargo clippy --locked --all-targets -- -D warnings` stage passed | The retained Main invocation and `artifact://1733` prove the formatter stage exited 0 because execution advanced beyond it; the artifact records the subsequent Cargo check, all 6 `binance_live` tests, and final Clippy stage succeeding. Subagent-run tests are excluded. | — | `attempt-2026-08-10-chunk9-12` |
+
+| Record ID | True occurrence | Canonical execution identity | Exact invocation/result evidence | Historical rows accounted for |
+|---|---:|---|---|---|
+| DET-FMT | 55 | `fmt-exec-55` | The retained Main command accompanied by `artifact://1733` contains `cargo fmt --check`; the artifact records the subsequent Cargo check, all 6 Binance live-feed tests, and the final `cargo clippy --locked --all-targets -- -D warnings` stage passing, so the formatter stage necessarily exited 0 without diagnostics. Subagent-run tests are not counted. | `attempt-2026-08-10-chunk10-1` is the execution row and supplies current `DET-FMT=PASS`. |
+
+The canonical total is therefore **55 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-55`, accompanied by main `artifact://1733`; the artifact's later check, six-test `binance_live`, and Clippy outcomes document chain progression only and do not update unrelated ledger records because their commands and scopes do not exactly match those records. Subagent-run tests are excluded.
+
 The final planned test inventory includes `tests/app_live_contract.rs` and contains no `tests/app_integration.rs`; this is not a precreation requirement. Chunk 2 creates and uses `tests/feature_selection.rs` only for its named feature-selection gates; `tests/app_live_contract.rs` MUST NOT exist before chunk 17, where the real App reducer/sole MarketEvent consumer contract is introduced. The final inventory also contains exactly `tests/terminal_lifecycle.rs` and `tests/api_boundaries.rs` for the other named specialized gates. `terminal_pty` and `transport_api_boundary` are not API/test-target names.
 ### Smoke and delivery references（ledger-only）
 

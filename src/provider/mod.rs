@@ -40,6 +40,32 @@ pub trait MarketDataProvider: Send + Sync {
     fn rate_gate(&self) -> RateGateSnapshot;
 }
 
+#[derive(Clone)]
+pub struct ProviderRegistry {
+    binance: Arc<binance::BinanceProvider>,
+}
+
+impl ProviderRegistry {
+    #[must_use]
+    pub fn new(binance: Arc<binance::BinanceProvider>) -> Self {
+        Self { binance }
+    }
+
+    pub fn get(&self, id: ProviderId) -> Result<Arc<dyn MarketDataProvider>, ProviderError> {
+        match id.as_str() {
+            "binance" => Ok(self.binance.clone()),
+            _ => Err(ProviderError::Configuration(
+                "unsupported market-data provider",
+            )),
+        }
+    }
+
+    #[must_use]
+    pub fn binance(&self) -> Arc<binance::BinanceProvider> {
+        Arc::clone(&self.binance)
+    }
+}
+
 pub struct LiveRequest {
     pub instrument: Instrument,
     pub timeframe: Timeframe,
