@@ -360,6 +360,7 @@ fn decode_ws_payload(
         Err(source) => DecodedFrame::ProviderError(ProviderError::Domain { context, source }),
     }
 }
+const MAX_RETAINED_DECODED_OUTCOMES: usize = 64;
 
 pub struct RawWebSocket {
     stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -370,8 +371,12 @@ pub struct RawWebSocket {
     decoded: VecDeque<Result<DecodedFrame, ProviderError>>,
     outbound: VecDeque<Message>,
     flush_pending: bool,
+    write_stall_deadline: Option<tokio::time::Instant>,
     last_data_message: tokio::time::Instant,
-    prioritize_inbound_after_stall: bool,
+    terminal_io: bool,
+    pending_terminal_error: Option<ProviderError>,
+    stalled_write_error: Option<ProviderError>,
+    peer_close_outcome: Option<DecodedFrame>,
 }
 
 impl RawWebSocket {
@@ -382,115 +387,247 @@ impl RawWebSocket {
 
     pub async fn read(&mut self) -> Result<DecodedFrame, ProviderError> {
         loop {
-            if (self.prioritize_inbound_after_stall || !self.flush_pending)
+            if self.stalled_write_error.is_some() {
+                if let Some(outcome) = self.decoded.pop_front() {
+                    return outcome;
+                }
+            } else if !self.flush_pending
+                && self.outbound.is_empty()
                 && let Some(outcome) = self.decoded.pop_front()
             {
                 return outcome;
+            }
+            if let Some(error) = self.pending_terminal_error.take() {
+                return Err(error);
             }
             self.pump(false).await?;
         }
     }
 
     pub async fn send(&mut self, message: Message) -> Result<(), ProviderError> {
+        self.reject_terminal_write()?;
         self.outbound.push_back(message);
+        self.ensure_write_stall_deadline();
         while !self.outbound.is_empty() || self.flush_pending {
-            if let Err(error) = self.pump(true).await {
-                self.release_retained_outcomes_after_stall(&error);
-                return Err(error);
-            }
+            self.pump(true).await?;
         }
         Ok(())
     }
 
     pub async fn flush(&mut self) -> Result<(), ProviderError> {
+        self.reject_terminal_write()?;
+        if self.flush_pending || !self.outbound.is_empty() {
+            self.ensure_write_stall_deadline();
+        }
         while !self.outbound.is_empty() || self.flush_pending {
-            if let Err(error) = self.pump(true).await {
-                self.release_retained_outcomes_after_stall(&error);
-                return Err(error);
-            }
+            self.pump(true).await?;
         }
         Ok(())
     }
 
-    fn release_retained_outcomes_after_stall(&mut self, error: &ProviderError) {
-        if matches!(
-            error,
-            ProviderError::Timeout {
-                kind: TimeoutKind::StalledWrite,
-                ..
-            }
-        ) {
-            self.flush_pending = false;
-            self.prioritize_inbound_after_stall = true;
+    fn reject_terminal_write(&self) -> Result<(), ProviderError> {
+        if let Some(error) = &self.stalled_write_error {
+            return Err(error.clone());
+        }
+        if !self.terminal_io {
+            return Ok(());
+        }
+        Err(self
+            .pending_terminal_error
+            .clone()
+            .unwrap_or_else(|| ProviderError::Transport {
+                context: self.context.clone(),
+                cause: SanitizedCause::Closed,
+            }))
+    }
+
+    fn enter_stalled_write_drain(&mut self, error: ProviderError) {
+        self.outbound.clear();
+        self.flush_pending = false;
+        self.write_stall_deadline = None;
+        if self.stalled_write_error.is_none() {
+            self.stalled_write_error = Some(error);
         }
     }
 
+    fn ensure_write_stall_deadline(&mut self) {
+        if self.write_stall_deadline.is_none() {
+            self.write_stall_deadline = Some(
+                tokio::time::Instant::now()
+                    .checked_add(self.config.stalled_write_timeout)
+                    .unwrap_or(tokio::time::Instant::now()),
+            );
+        }
+    }
+
+    fn finish_terminal_io(&mut self) {
+        self.terminal_io = true;
+        self.outbound.clear();
+        self.flush_pending = false;
+        self.write_stall_deadline = None;
+    }
+
+    fn finish_or_defer_terminal_error(
+        &mut self,
+        error: ProviderError,
+        report_to_writer: bool,
+    ) -> Result<(), ProviderError> {
+        let error = self.stalled_write_error.clone().unwrap_or(error);
+        if let Some(close) = self.peer_close_outcome.take() {
+            self.decoded.push_back(Ok(close));
+        }
+        self.finish_terminal_io();
+        if !self.decoded.is_empty() {
+            if self.pending_terminal_error.is_none() {
+                self.pending_terminal_error = Some(error.clone());
+            }
+            if report_to_writer {
+                return Err(error);
+            }
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
+    fn fail_write_and_drain(&mut self, error: ProviderError) -> Result<(), ProviderError> {
+        self.enter_stalled_write_drain(error.clone());
+        Err(error)
+    }
+
     async fn pump(&mut self, writing: bool) -> Result<(), ProviderError> {
+        if self.terminal_io {
+            if writing {
+                return self.reject_terminal_write();
+            }
+            if !self.decoded.is_empty() {
+                return Ok(());
+            }
+            if let Some(error) = self.pending_terminal_error.take() {
+                return Err(error);
+            }
+            return Err(ProviderError::Transport {
+                context: self.context.clone(),
+                cause: SanitizedCause::Closed,
+            });
+        }
+        if self.stalled_write_error.is_none()
+            && (writing || self.flush_pending || !self.outbound.is_empty())
+        {
+            self.ensure_write_stall_deadline();
+        }
         let inactivity_deadline = self.last_data_message + self.config.message_inactivity_timeout;
-        let stalled_write_timeout = self.config.stalled_write_timeout;
-        let write_progress_required = writing || self.flush_pending;
+        let write_stall_deadline = self.write_stall_deadline;
+        if write_stall_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            let error = ProviderError::Timeout {
+                context: self.context.clone(),
+                kind: TimeoutKind::StalledWrite,
+            };
+            return self.fail_write_and_drain(error);
+        }
+        let stall_sleep_deadline = write_stall_deadline.unwrap_or(inactivity_deadline);
         let inactivity_context = self.context.clone();
         let stalled_write_context = self.context.clone();
         tokio::select! {
             biased;
-            result = futures_util::future::poll_fn(|cx| self.poll_io(cx)) => result,
-            () = tokio::time::sleep_until(inactivity_deadline) => Err(ProviderError::Timeout {
-                context: inactivity_context,
-                kind: TimeoutKind::WebSocketInactivity,
-            }),
-            () = tokio::time::sleep(stalled_write_timeout), if write_progress_required => {
-                Err(ProviderError::Timeout {
+            result = futures_util::future::poll_fn(|cx| self.poll_io(cx, inactivity_deadline, writing)) => result,
+            () = tokio::time::sleep_until(inactivity_deadline) => {
+                let error = ProviderError::Timeout {
+                    context: inactivity_context,
+                    kind: TimeoutKind::WebSocketInactivity,
+                };
+                self.finish_or_defer_terminal_error(error, writing)
+            },
+            () = tokio::time::sleep_until(stall_sleep_deadline), if write_stall_deadline.is_some() => {
+                let error = ProviderError::Timeout {
                     context: stalled_write_context,
                     kind: TimeoutKind::StalledWrite,
-                })
+                };
+                self.fail_write_and_drain(error)
             },
         }
     }
 
-    fn poll_io(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ProviderError>> {
-        let mut made_progress = false;
-        match Stream::poll_next(Pin::new(&mut self.stream), cx) {
-            Poll::Ready(Some(Ok(message))) => {
-                if matches!(message, Message::Text(_) | Message::Binary(_)) {
-                    self.last_data_message = tokio::time::Instant::now();
-                }
-                self.flush_pending = true;
-                self.decoded.push_back(Ok(decode_ws_frame(
-                    message,
-                    &self.instrument,
-                    self.timeframe,
-                    &self.config,
-                )));
-                made_progress = true;
-            }
-            Poll::Ready(Some(Err(error))) => {
-                self.decoded
-                    .push_back(Err(map_websocket_error(error, &self.context)));
-                made_progress = true;
-            }
-            Poll::Ready(None) => {
-                self.decoded.push_back(Err(ProviderError::Transport {
-                    context: self.context.clone(),
-                    cause: SanitizedCause::Closed,
-                }));
-                made_progress = true;
-            }
-            Poll::Pending => {}
+    fn poll_io(
+        &mut self,
+        cx: &mut Context<'_>,
+        inactivity_deadline: tokio::time::Instant,
+        writing: bool,
+    ) -> Poll<Result<(), ProviderError>> {
+        if self
+            .write_stall_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            let error = ProviderError::Timeout {
+                context: self.context.clone(),
+                kind: TimeoutKind::StalledWrite,
+            };
+            return Poll::Ready(self.fail_write_and_drain(error));
         }
-        if let Some(message) = self.outbound.pop_front() {
+        let mut made_progress = false;
+        if self.decoded.len() < MAX_RETAINED_DECODED_OUTCOMES {
+            match Stream::poll_next(Pin::new(&mut self.stream), cx) {
+                Poll::Ready(Some(Ok(message))) => {
+                    let is_data = matches!(message, Message::Text(_) | Message::Binary(_));
+                    if is_data {
+                        self.last_data_message = tokio::time::Instant::now();
+                    } else if tokio::time::Instant::now() >= inactivity_deadline {
+                        let error = ProviderError::Timeout {
+                            context: self.context.clone(),
+                            kind: TimeoutKind::WebSocketInactivity,
+                        };
+                        return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
+                    }
+                    self.flush_pending = true;
+                    if self.stalled_write_error.is_none() {
+                        self.ensure_write_stall_deadline();
+                    }
+                    let decoded =
+                        decode_ws_frame(message, &self.instrument, self.timeframe, &self.config);
+                    if matches!(&decoded, DecodedFrame::Close(_)) {
+                        self.outbound.clear();
+                        self.peer_close_outcome = Some(decoded);
+                    } else {
+                        self.decoded.push_back(Ok(decoded));
+                    }
+                    made_progress = true;
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    let error = map_websocket_error(error, &self.context);
+                    return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
+                }
+                Poll::Ready(None) => {
+                    let error = ProviderError::Transport {
+                        context: self.context.clone(),
+                        cause: SanitizedCause::Closed,
+                    };
+                    return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
+                }
+                Poll::Pending => {}
+            }
+        }
+        if self.stalled_write_error.is_none()
+            && self.peer_close_outcome.is_none()
+            && let Some(message) = self.outbound.pop_front()
+        {
             let mut stream = Pin::new(&mut self.stream);
             match Sink::<Message>::poll_ready(stream.as_mut(), cx) {
                 Poll::Ready(Ok(())) => match Sink::<Message>::start_send(stream, message) {
                     Ok(()) => {
                         self.flush_pending = true;
+                        if self.stalled_write_error.is_none() {
+                            self.ensure_write_stall_deadline();
+                        }
                         made_progress = true;
                     }
                     Err(error) => {
-                        return Poll::Ready(Err(map_websocket_error(error, &self.context)));
+                        let error = map_websocket_error(error, &self.context);
+                        return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
                     }
                 },
                 Poll::Ready(Err(error)) => {
-                    return Poll::Ready(Err(map_websocket_error(error, &self.context)));
+                    let error = map_websocket_error(error, &self.context);
+                    return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
                 }
                 Poll::Pending => self.outbound.push_front(message),
             }
@@ -499,13 +636,27 @@ impl RawWebSocket {
         match Sink::<Message>::poll_flush(Pin::new(&mut self.stream), cx) {
             Poll::Ready(Ok(())) => {
                 self.flush_pending = false;
+                if let Some(close) = self.peer_close_outcome.take() {
+                    self.decoded.push_back(Ok(close));
+                    let error = ProviderError::Transport {
+                        context: self.context.clone(),
+                        cause: SanitizedCause::Closed,
+                    };
+                    return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
+                }
+                if self.outbound.is_empty() {
+                    self.write_stall_deadline = None;
+                }
                 if made_progress || !self.decoded.is_empty() {
                     Poll::Ready(Ok(()))
                 } else {
                     Poll::Pending
                 }
             }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(map_websocket_error(error, &self.context))),
+            Poll::Ready(Err(error)) => {
+                let error = map_websocket_error(error, &self.context);
+                Poll::Ready(self.finish_or_defer_terminal_error(error, writing))
+            }
             Poll::Pending if made_progress => Poll::Ready(Ok(())),
             Poll::Pending => Poll::Pending,
         }
@@ -559,9 +710,13 @@ async fn connect_websocket_url(
         timeframe,
         decoded: VecDeque::new(),
         outbound: VecDeque::new(),
-        prioritize_inbound_after_stall: false,
         flush_pending: false,
+        write_stall_deadline: None,
         last_data_message: tokio::time::Instant::now(),
+        terminal_io: false,
+        pending_terminal_error: None,
+        stalled_write_error: None,
+        peer_close_outcome: None,
     })
 }
 

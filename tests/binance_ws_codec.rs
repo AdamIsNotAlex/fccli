@@ -489,6 +489,137 @@ async fn local_raw_socket_flushes_exactly_one_automatic_pong_for_one_ping() {
 }
 
 #[tokio::test]
+async fn healthy_ping_read_waits_for_automatic_pong_flush() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let (pong_received_tx, pong_received_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = accept_async(stream).await.expect("server handshake");
+        socket
+            .send(Message::Ping(vec![1, 3, 3, 7].into()))
+            .await
+            .expect("send ping");
+        let reply = timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("automatic pong timeout")
+            .expect("socket open")
+            .expect("valid pong");
+        assert_eq!(reply, Message::Pong(vec![1, 3, 3, 7].into()));
+        pong_received_tx.send(()).expect("report flushed pong");
+    });
+
+    let mut socket = fccli::provider::binance::connect_test_websocket(
+        &format!("ws://{address}"),
+        &instrument(),
+        Timeframe::Minute1,
+        WsConfig::production(),
+    )
+    .await
+    .expect("client handshake");
+
+    assert_eq!(
+        timeout(Duration::from_secs(1), read_raw_websocket(&mut socket))
+            .await
+            .expect("healthy Ping read must complete after control flush")
+            .expect("healthy Ping outcome"),
+        DecodedFrame::Ignored
+    );
+    timeout(Duration::from_secs(1), pong_received_rx)
+        .await
+        .expect("peer must observe the Pong immediately after the read completes")
+        .expect("peer reported Pong");
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn decoded_queue_at_capacity_recovers_after_temporary_write_backpressure() {
+    const DECODED_CAPACITY: usize = 64;
+    const LARGE_WRITE: usize = 8 * 1024 * 1024;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = accept_async(stream).await.expect("server handshake");
+        for _ in 0..DECODED_CAPACITY {
+            socket
+                .send(Message::Text(OPEN.into()))
+                .await
+                .expect("fill decoded queue");
+        }
+        socket
+            .send(Message::Ping(vec![6, 4].into()))
+            .await
+            .expect("Ping behind full decoded queue");
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let mut saw_large_write = false;
+        let mut saw_pong = false;
+        while !saw_large_write || !saw_pong {
+            let message = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("temporary backpressure must recover")
+                .expect("socket open")
+                .expect("valid client frame");
+            match message {
+                Message::Binary(bytes) => {
+                    assert_eq!(bytes.len(), LARGE_WRITE);
+                    saw_large_write = true;
+                }
+                Message::Pong(bytes) => {
+                    assert_eq!(bytes.as_ref(), &[6, 4]);
+                    saw_pong = true;
+                }
+                other => panic!("unexpected client frame during recovery: {other:?}"),
+            }
+        }
+    });
+
+    let mut config = WsConfig::production();
+    config.write_buffer_size = 64 * 1024;
+    config.max_write_buffer_size = LARGE_WRITE + 64 * 1024;
+    config.stalled_write_timeout = Duration::from_secs(2);
+    let mut socket = fccli::provider::binance::connect_test_websocket(
+        &format!("ws://{address}"),
+        &instrument(),
+        Timeframe::Minute1,
+        config,
+    )
+    .await
+    .expect("client handshake");
+
+    timeout(
+        Duration::from_secs(3),
+        fccli::provider::binance::send_raw_websocket(
+            &mut socket,
+            Message::Binary(vec![0; LARGE_WRITE].into()),
+        ),
+    )
+    .await
+    .expect("write must resume after peer starts draining")
+    .expect("temporary backpressure is recoverable");
+
+    for index in 0..DECODED_CAPACITY {
+        assert!(matches!(
+            timeout(Duration::from_secs(1), read_raw_websocket(&mut socket))
+                .await
+                .unwrap_or_else(|_| panic!("retained candle {index} timed out"))
+                .unwrap_or_else(|error| panic!("retained candle {index} failed: {error}")),
+            DecodedFrame::Candle(_)
+        ));
+    }
+    assert_eq!(
+        timeout(Duration::from_secs(1), read_raw_websocket(&mut socket))
+            .await
+            .expect("Ping behind the capacity boundary must resume")
+            .expect("Ping outcome"),
+        DecodedFrame::Ignored
+    );
+    server.await.expect("server task");
+}
+
+#[tokio::test]
 async fn raw_socket_reports_stalled_application_write() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("listener address");
@@ -836,6 +967,378 @@ async fn unfinished_fragment_with_control_activity_hits_nonresetting_inactivity_
         error,
         ProviderError::Timeout {
             kind: TimeoutKind::WebSocketInactivity,
+            ..
+        }
+    ));
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn continuous_inbound_data_cannot_extend_a_stalled_write_deadline_or_lose_frames() {
+    const FRAME_COUNT: usize = 64;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = accept_async(stream).await.expect("server handshake");
+        for _ in 0..FRAME_COUNT {
+            socket
+                .send(Message::Text(OPEN.into()))
+                .await
+                .expect("continuous candle");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
+    let mut config = WsConfig::production();
+    config.write_buffer_size = 64 * 1024;
+    config.max_write_buffer_size = 128 * 1024;
+    config.stalled_write_timeout = Duration::from_millis(15);
+    let mut socket = fccli::provider::binance::connect_test_websocket(
+        &format!("ws://{address}"),
+        &instrument(),
+        Timeframe::Minute1,
+        config,
+    )
+    .await
+    .expect("client handshake");
+
+    let error = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Err(error) = fccli::provider::binance::send_raw_websocket(
+                &mut socket,
+                Message::Binary(vec![0; 64 * 1024].into()),
+            )
+            .await
+            {
+                break error;
+            }
+        }
+    })
+    .await
+    .expect("continuous inbound traffic must not starve stalled-write timeout");
+    assert!(matches!(
+        error,
+        ProviderError::Timeout {
+            kind: TimeoutKind::StalledWrite,
+            ..
+        }
+    ));
+
+    let mut candles = 0;
+    while candles < FRAME_COUNT {
+        match timeout(Duration::from_secs(1), read_raw_websocket(&mut socket))
+            .await
+            .expect("retained candle timeout")
+            .expect("retained candle")
+        {
+            DecodedFrame::Candle(_) => candles += 1,
+            DecodedFrame::Ignored => {}
+            other => panic!("unexpected retained outcome {other:?}"),
+        }
+    }
+    assert_eq!(
+        candles, FRAME_COUNT,
+        "every consumed candle is retained once"
+    );
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn continuously_buffered_pings_cannot_starve_message_inactivity() {
+    const PING_COUNT: usize = 4096;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = accept_async(stream).await.expect("server handshake");
+        socket
+            .send(Message::Frame(Frame::message(
+                Vec::new(),
+                OpCode::Data(Data::Text),
+                false,
+            )))
+            .await
+            .expect("empty initial fragment");
+        for value in 0..PING_COUNT {
+            if socket
+                .send(Message::Ping(vec![(value & 0xff) as u8].into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
+    let mut config = WsConfig::production();
+    config.message_inactivity_timeout = Duration::from_millis(10);
+    let mut socket = fccli::provider::binance::connect_test_websocket(
+        &format!("ws://{address}"),
+        &instrument(),
+        Timeframe::Minute1,
+        config,
+    )
+    .await
+    .expect("client handshake");
+
+    let error = timeout(Duration::from_secs(1), async {
+        loop {
+            match read_raw_websocket(&mut socket).await {
+                Ok(DecodedFrame::Ignored) => {}
+                Ok(other) => panic!("unexpected decoded frame before inactivity: {other:?}"),
+                Err(error) => break error,
+            }
+        }
+    })
+    .await
+    .expect("buffered controls must not starve inactivity deadline");
+    assert!(matches!(
+        error,
+        ProviderError::Timeout {
+            kind: TimeoutKind::WebSocketInactivity,
+            ..
+        }
+    ));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn deferred_terminal_error_rejects_subsequent_send_without_consuming_read_order() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = accept_async(stream).await.expect("server handshake");
+        socket
+            .send(Message::Text(CLOSED.into()))
+            .await
+            .expect("candle");
+        socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Away,
+                reason: "maintenance".into(),
+            })))
+            .await
+            .expect("close");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
+    let mut socket = fccli::provider::binance::connect_test_websocket(
+        &format!("ws://{address}"),
+        &instrument(),
+        Timeframe::Minute1,
+        WsConfig::production(),
+    )
+    .await
+    .expect("client handshake");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = fccli::provider::binance::send_raw_websocket(
+        &mut socket,
+        Message::Text("application-write".into()),
+    )
+    .await;
+    let subsequent_send = timeout(
+        Duration::from_secs(1),
+        fccli::provider::binance::send_raw_websocket(
+            &mut socket,
+            Message::Text("subsequent-application-write".into()),
+        ),
+    )
+    .await
+    .expect("subsequent send must not spin")
+    .expect_err("terminal socket rejects subsequent send");
+    assert!(matches!(
+        subsequent_send,
+        ProviderError::Transport { .. } | ProviderError::Protocol { .. }
+    ));
+
+    assert!(matches!(
+        read_raw_websocket(&mut socket)
+            .await
+            .expect("retained candle"),
+        DecodedFrame::Candle(_)
+    ));
+    assert_eq!(
+        read_raw_websocket(&mut socket)
+            .await
+            .expect("retained close"),
+        DecodedFrame::Close(Some(CloseCode::Away))
+    );
+    let terminal = read_raw_websocket(&mut socket)
+        .await
+        .expect_err("terminal sink error follows retained outcomes");
+    assert!(matches!(
+        terminal,
+        ProviderError::Transport { .. } | ProviderError::Protocol { .. }
+    ));
+    // The failed subsequent send must not consume or reorder the terminal read error:
+    // both retained outcomes still precede that error, and the error is delivered once.
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn peer_close_racing_ordinary_outbound_replies_before_termination_and_is_delivered_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let (close_sent_tx, close_sent_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = accept_async(stream).await.expect("server handshake");
+        socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Away,
+                reason: "maintenance".into(),
+            })))
+            .await
+            .expect("send peer close");
+        close_sent_tx.send(()).expect("signal peer close sent");
+
+        let reply = timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("automatic close reply must arrive promptly")
+            .expect("close reply frame")
+            .expect("valid close reply");
+        assert!(
+            matches!(reply, Message::Close(_)),
+            "ordinary outbound won the close race: {reply:?}"
+        );
+    });
+
+    let mut socket = fccli::provider::binance::connect_test_websocket(
+        &format!("ws://{address}"),
+        &instrument(),
+        Timeframe::Minute1,
+        WsConfig::production(),
+    )
+    .await
+    .expect("client handshake");
+    close_sent_rx.await.expect("peer close sent");
+
+    timeout(
+        Duration::from_secs(1),
+        fccli::provider::binance::send_raw_websocket(
+            &mut socket,
+            Message::Text("ordinary-outbound".into()),
+        ),
+    )
+    .await
+    .expect("outbound racing peer Close must terminate promptly")
+    .expect_err("peer Close prevents ordinary outbound completion");
+
+    assert_eq!(
+        read_raw_websocket(&mut socket)
+            .await
+            .expect("retained peer Close"),
+        DecodedFrame::Close(Some(CloseCode::Away))
+    );
+    let terminal = timeout(Duration::from_secs(1), read_raw_websocket(&mut socket))
+        .await
+        .expect("terminal read after Close must return promptly")
+        .expect_err("peer Close outcome is delivered only once");
+    assert!(matches!(
+        terminal,
+        ProviderError::Transport { .. } | ProviderError::Protocol { .. }
+    ));
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn stalled_drain_flushes_automatic_close_reply_before_close_outcome_and_error() {
+    const LARGE_WRITE: usize = 8 * 1024 * 1024;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let (start_close_tx, start_close_rx) = tokio::sync::oneshot::channel();
+    let (close_reply_tx, close_reply_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = accept_async(stream).await.expect("server handshake");
+        start_close_rx.await.expect("client entered stalled drain");
+        socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Away,
+                reason: "maintenance".into(),
+            })))
+            .await
+            .expect("send peer Close");
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        loop {
+            let message = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("automatic Close reply must flush after drain resumes")
+                .expect("socket open until Close reply")
+                .expect("valid client frame");
+            if matches!(message, Message::Close(_)) {
+                close_reply_tx.send(()).expect("report Close reply");
+                break;
+            }
+        }
+    });
+
+    let mut config = WsConfig::production();
+    config.write_buffer_size = 64 * 1024;
+    config.max_write_buffer_size = LARGE_WRITE + 64 * 1024;
+    config.stalled_write_timeout = Duration::from_millis(20);
+    let mut socket = fccli::provider::binance::connect_test_websocket(
+        &format!("ws://{address}"),
+        &instrument(),
+        Timeframe::Minute1,
+        config,
+    )
+    .await
+    .expect("client handshake");
+
+    let stalled = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Err(error) = fccli::provider::binance::send_raw_websocket(
+                &mut socket,
+                Message::Binary(vec![0; LARGE_WRITE].into()),
+            )
+            .await
+            {
+                break error;
+            }
+        }
+    })
+    .await
+    .expect("non-draining peer must trigger stalled-write mode");
+    assert!(matches!(
+        stalled,
+        ProviderError::Timeout {
+            kind: TimeoutKind::StalledWrite,
+            ..
+        }
+    ));
+    start_close_tx.send(()).expect("request peer Close");
+
+    assert_eq!(
+        timeout(Duration::from_secs(2), read_raw_websocket(&mut socket))
+            .await
+            .expect("Close read must recover when peer resumes draining")
+            .expect("Close outcome precedes terminal error"),
+        DecodedFrame::Close(Some(CloseCode::Away))
+    );
+    timeout(Duration::from_secs(1), close_reply_rx)
+        .await
+        .expect("peer must observe automatic Close reply")
+        .expect("peer reported Close reply");
+
+    let terminal = timeout(Duration::from_secs(1), read_raw_websocket(&mut socket))
+        .await
+        .expect("terminal error after Close must return promptly")
+        .expect_err("stalled-write error follows the retained Close outcome");
+    assert!(matches!(
+        terminal,
+        ProviderError::Timeout {
+            kind: TimeoutKind::StalledWrite,
             ..
         }
     ));
