@@ -248,19 +248,59 @@ fn rejected_arguments_are_bounded_and_never_echo_terminal_control_payloads() {
 #[test]
 fn provider_symbol_length_accepts_exact_limit_and_rejects_one_over() {
     const PROVIDER_SYMBOL_LIMIT: usize = 256;
-    const DEFAULT_QUOTE_LEN: usize = 4;
+    const DEFAULT_QUOTE: &str = "USDT";
 
-    let exact = "a".repeat(PROVIDER_SYMBOL_LIMIT - DEFAULT_QUOTE_LEN);
+    let exact = format!(
+        "{}{}",
+        "a".repeat(PROVIDER_SYMBOL_LIMIT - DEFAULT_QUOTE.len()),
+        DEFAULT_QUOTE
+    );
+    assert_eq!(exact.len(), PROVIDER_SYMBOL_LIMIT);
+    let expected_provider_symbol = exact.to_ascii_uppercase();
     let cli = Cli::try_parse_from(["fccli", exact.as_str(), "1m"])
-        .expect("exact-limit instrument specification");
-    let instrument = canonicalize_binance(cli.instrument()).expect("exact-limit canonicalization");
+        .expect("exact-limit separator-free USDT-suffixed instrument specification");
+    assert_eq!(cli.instrument().base(), expected_provider_symbol);
+    assert_eq!(cli.instrument().quote(), None);
+    let instrument = canonicalize_binance(cli.instrument())
+        .expect("exact-limit separator-free USDT-suffixed canonicalization");
+    assert_eq!(
+        instrument.base().len(),
+        PROVIDER_SYMBOL_LIMIT - DEFAULT_QUOTE.len()
+    );
+    assert_eq!(instrument.quote(), DEFAULT_QUOTE);
     assert_eq!(instrument.provider_symbol().len(), PROVIDER_SYMBOL_LIMIT);
+    assert_eq!(instrument.provider_symbol(), expected_provider_symbol);
 
-    let one_over = "a".repeat(PROVIDER_SYMBOL_LIMIT - DEFAULT_QUOTE_LEN + 1);
+    let one_over = format!(
+        "{}{}",
+        "a".repeat(PROVIDER_SYMBOL_LIMIT - DEFAULT_QUOTE.len() + 1),
+        DEFAULT_QUOTE
+    );
+    assert_eq!(one_over.len(), PROVIDER_SYMBOL_LIMIT + 1);
     let error = Cli::try_parse_from(["fccli", one_over.as_str(), "1m"])
-        .expect_err("one-over-limit instrument specification");
+        .expect_err("one-over-limit separator-free USDT-suffixed instrument specification");
     assert_eq!(error.kind(), ErrorKind::ValueValidation);
     assert!(!error.to_string().contains(&one_over));
+
+    let provider = ProviderId::new("binance").expect("valid provider");
+    let exact_specification = InstrumentSpec::new(provider.clone(), exact, None::<String>)
+        .expect("exact-limit direct instrument specification");
+    let instrument = canonicalize_binance(&exact_specification)
+        .expect("exact-limit direct separator-free USDT-suffixed canonicalization");
+    assert_eq!(
+        instrument.base().len(),
+        PROVIDER_SYMBOL_LIMIT - DEFAULT_QUOTE.len()
+    );
+    assert_eq!(instrument.quote(), DEFAULT_QUOTE);
+    assert_eq!(instrument.provider_symbol().len(), PROVIDER_SYMBOL_LIMIT);
+    assert_eq!(instrument.provider_symbol(), expected_provider_symbol);
+
+    let one_over_specification = InstrumentSpec::new(provider, one_over, None::<String>)
+        .expect("one-over-limit direct instrument specification");
+    assert_eq!(
+        canonicalize_binance(&one_over_specification),
+        Err(CanonicalizationError::InvalidInstrument)
+    );
 }
 
 #[test]

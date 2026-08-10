@@ -240,11 +240,22 @@ fn split_pair(value: &str) -> Result<(&str, Option<&str>), String> {
 }
 
 fn validate_symbol_lengths(base: &str, quote: Option<&str>) -> Result<(), ()> {
+    let projected_quote_len = match quote {
+        Some(quote) => quote.len(),
+        None if base
+            .get(base.len().saturating_sub(DEFAULT_QUOTE.len())..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(DEFAULT_QUOTE)) =>
+        {
+            0
+        }
+        None => DEFAULT_QUOTE.len(),
+    };
+
     if base.len() > MAX_PROVIDER_SYMBOL_LEN
         || quote.is_some_and(|quote| quote.len() > MAX_PROVIDER_SYMBOL_LEN)
         || base
             .len()
-            .checked_add(quote.map_or(DEFAULT_QUOTE.len(), str::len))
+            .checked_add(projected_quote_len)
             .is_none_or(|length| length > MAX_PROVIDER_SYMBOL_LEN)
     {
         return Err(());
