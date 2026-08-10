@@ -5,7 +5,7 @@ use std::{
     net::{Shutdown, TcpListener},
     process::Command,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -13,7 +13,7 @@ use std::{
 };
 
 use fccli::{
-    clock::ManualClock,
+    clock::{Clock, ClockFuture, ManualClock},
     error::{ModelError, PayloadError, ProviderError, SanitizedMessage, TimeoutKind},
     model::{
         FinalityAuthority, HistoryRequest, Instrument, Market, MonoInstant, ProcessBlocker,
@@ -30,6 +30,180 @@ use wiremock::{
 const VALID: &str = include_str!("fixtures/binance_klines.json");
 const EMPTY: &str = "[]";
 
+struct ConcurrentHttpServer {
+    uri: String,
+    limit_2_observed: Option<tokio::sync::oneshot::Receiver<()>>,
+    release_limit_2: tokio::sync::watch::Sender<bool>,
+    limit_3_observed: tokio::sync::mpsc::UnboundedReceiver<()>,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl ConcurrentHttpServer {
+    async fn start(limit_2_status: u16, limit_2_retry_after: Option<&str>) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind concurrent HTTP server");
+        let uri = format!(
+            "http://{}",
+            listener.local_addr().expect("concurrent server address")
+        );
+        let (limit_2_tx, limit_2_observed) = tokio::sync::oneshot::channel();
+        let limit_2_tx = Arc::new(Mutex::new(Some(limit_2_tx)));
+        let (release_limit_2, release_rx) = tokio::sync::watch::channel(false);
+        let (limit_3_tx, limit_3_observed) = tokio::sync::mpsc::unbounded_channel();
+        let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let retry_after = limit_2_retry_after.map(str::to_owned);
+        let join = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.expect("accept concurrent HTTP connection");
+                        let limit_2_tx = Arc::clone(&limit_2_tx);
+                        let mut release_rx = release_rx.clone();
+                        let limit_3_tx = limit_3_tx.clone();
+                        let retry_after = retry_after.clone();
+                        connections.spawn(async move {
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                            let mut request = Vec::new();
+                            let mut chunk = [0_u8; 1024];
+                            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                let read = stream.read(&mut chunk).await.expect("read HTTP request");
+                                assert_ne!(read, 0, "connection closed before HTTP headers");
+                                request.extend_from_slice(&chunk[..read]);
+                            }
+                            let request = String::from_utf8(request).expect("ASCII HTTP request");
+                            let target = request
+                                .lines()
+                                .next()
+                                .and_then(|line| line.split_whitespace().nth(1))
+                                .expect("HTTP request target");
+                            let limit = target
+                                .split_once('?')
+                                .map(|(_, query)| query)
+                                .expect("request query")
+                                .split('&')
+                                .find_map(|field| field.strip_prefix("limit="))
+                                .expect("request limit");
+                            let (status, reason, extra_header, body) = match limit {
+                                "1" => (
+                                    429,
+                                    "Too Many Requests",
+                                    "Retry-After: 60\r\n".to_owned(),
+                                    "",
+                                ),
+                                "2" => {
+                                    limit_2_tx
+                                        .lock()
+                                        .expect("limit-2 signal mutex poisoned")
+                                        .take()
+                                        .expect("limit-2 requested more than once")
+                                        .send(())
+                                        .expect("test stopped before observing limit-2");
+                                    while !*release_rx.borrow() {
+                                        release_rx.changed().await.expect("limit-2 release sender");
+                                    }
+                                    let header = retry_after
+                                        .as_deref()
+                                        .map(|value| format!("Retry-After: {value}\r\n"))
+                                        .unwrap_or_default();
+                                    let reason = if limit_2_status == 418 { "I'm a teapot" } else { "Too Many Requests" };
+                                    (limit_2_status, reason, header, "")
+                                }
+                                "3" => {
+                                    limit_3_tx.send(()).expect("limit-3 observer");
+                                    (200, "OK", "Content-Type: application/json\r\n".to_owned(), EMPTY)
+                                }
+                                other => panic!("unexpected request limit {other}"),
+                            };
+                            let response = format!(
+                                "HTTP/1.1 {status} {reason}\r\n{extra_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            stream.write_all(response.as_bytes()).await.expect("write HTTP response");
+                            stream.shutdown().await.expect("shutdown HTTP response");
+                        });
+                    }
+                    _ = &mut shutdown_rx => break,
+                }
+            }
+            while let Some(result) = connections.join_next().await {
+                result.expect("concurrent HTTP connection task");
+            }
+        });
+        Self {
+            uri,
+            limit_2_observed: Some(limit_2_observed),
+            release_limit_2,
+            limit_3_observed,
+            shutdown,
+            join,
+        }
+    }
+
+    async fn wait_for_limit_2(&mut self) {
+        self.limit_2_observed
+            .take()
+            .expect("limit-2 observation awaited more than once")
+            .await
+            .expect("server stopped before limit-2 request");
+    }
+
+    fn release_limit_2(&self) {
+        let _ = self.release_limit_2.send_replace(true);
+    }
+
+    fn limit_3_was_not_observed(&mut self) -> bool {
+        matches!(
+            self.limit_3_observed.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        )
+    }
+
+    async fn wait_for_limit_3(&mut self) {
+        self.limit_3_observed
+            .recv()
+            .await
+            .expect("server stopped before limit-3 request");
+    }
+
+    async fn shutdown(self) {
+        let _ = self.shutdown.send(());
+        self.join.await.expect("concurrent HTTP server task");
+    }
+}
+
+struct SleepObservedClock {
+    inner: Arc<ManualClock>,
+    observed: tokio::sync::mpsc::UnboundedSender<MonoInstant>,
+}
+
+impl Clock for SleepObservedClock {
+    fn now(&self) -> MonoInstant {
+        self.inner.now()
+    }
+
+    fn sleep_until<'a>(&'a self, deadline: MonoInstant) -> ClockFuture<'a> {
+        let _ = self.observed.send(deadline);
+        self.inner.sleep_until(deadline)
+    }
+}
+
+fn sleep_observed_clock() -> (
+    Arc<ManualClock>,
+    Arc<SleepObservedClock>,
+    tokio::sync::mpsc::UnboundedReceiver<MonoInstant>,
+) {
+    let inner = clock();
+    let (observed, observed_rx) = tokio::sync::mpsc::unbounded_channel();
+    (
+        Arc::clone(&inner),
+        Arc::new(SleepObservedClock { inner, observed }),
+        observed_rx,
+    )
+}
 fn single_kline_fixture() -> serde_json::Value {
     let mut payload =
         serde_json::from_str::<serde_json::Value>(VALID).expect("valid kline fixture JSON");
@@ -984,97 +1158,135 @@ fn hostile_proxy_environment_does_not_capture_loopback_request() {
     assert!(!proxy_observed.load(Ordering::SeqCst));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timed_gate_waiter_wakes_when_concurrent_418_blocks_process() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(query_param("limit", "1"))
-        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "60"))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(query_param("limit", "2"))
-        .respond_with(ResponseTemplate::new(418).set_delay(Duration::from_millis(30)))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let provider = provider(&server, clock());
+    let mut server = ConcurrentHttpServer::start(418, None).await;
+    let (clock, observed_clock, mut sleep_observed) = sleep_observed_clock();
+    let provider = BinanceProvider::new_test(server.uri.clone(), observed_clock)
+        .expect("loopback provider with observed clock");
     let concurrent = {
         let provider = provider.clone();
         tokio::spawn(
             async move { history(&provider, HistoryRequest::latest(2).expect("latest")).await },
         )
     };
-    tokio::task::yield_now().await;
-    let _ = history(&provider, HistoryRequest::latest(1).expect("latest")).await;
-    let waiter = history(&provider, HistoryRequest::latest(3).expect("latest"));
-    assert!(matches!(waiter.await, Err(ProviderError::InvalidBanExpiry)));
+    server.wait_for_limit_2().await;
     assert!(matches!(
-        concurrent.await.expect("concurrent request"),
-        Err(ProviderError::InvalidBanExpiry)
+        history(&provider, HistoryRequest::latest(1).expect("latest")).await,
+        Err(ProviderError::RateLimited { .. })
     ));
-}
-
-#[tokio::test]
-async fn timed_gate_waiter_observes_deadline_extension_before_release() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(query_param("limit", "1"))
-        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "60"))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(query_param("limit", "2"))
-        .respond_with(
-            ResponseTemplate::new(429)
-                .insert_header("retry-after", "90")
-                .set_delay(Duration::from_millis(30)),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(query_param("limit", "3"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(EMPTY, "application/json"))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let clock = clock();
-    let provider = provider(&server, Arc::clone(&clock));
-    let extension = {
-        let provider = provider.clone();
-        tokio::spawn(
-            async move { history(&provider, HistoryRequest::latest(2).expect("latest")).await },
-        )
-    };
-    tokio::task::yield_now().await;
-    let _ = history(&provider, HistoryRequest::latest(1).expect("latest")).await;
+    assert_eq!(
+        provider.rate_gate().current(),
+        Ok(RateGateState::TimedUntil(
+            MonoInstant::from_millis(60_000).expect("deadline")
+        ))
+    );
     let waiter = {
         let provider = provider.clone();
         tokio::spawn(
             async move { history(&provider, HistoryRequest::latest(3).expect("latest")).await },
         )
     };
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        sleep_observed
+            .recv()
+            .await
+            .expect("waiter did not enter gate sleep"),
+        MonoInstant::from_millis(60_000).expect("deadline")
+    );
+    server.release_limit_2();
+    assert!(matches!(
+        concurrent.await.expect("concurrent request"),
+        Err(ProviderError::InvalidBanExpiry)
+    ));
+    assert_eq!(
+        provider.rate_gate().current(),
+        Ok(RateGateState::ProcessBlocked(
+            ProcessBlocker::InvalidBanExpiry
+        ))
+    );
+    assert!(matches!(
+        waiter.await.expect("waiter task"),
+        Err(ProviderError::InvalidBanExpiry)
+    ));
+    assert_eq!(clock.now(), MonoInstant::ZERO);
+    assert!(server.limit_3_was_not_observed());
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_gate_waiter_observes_deadline_extension_before_release() {
+    let mut server = ConcurrentHttpServer::start(429, Some("90")).await;
+    let (clock, observed_clock, mut sleep_observed) = sleep_observed_clock();
+    let provider = BinanceProvider::new_test(server.uri.clone(), observed_clock)
+        .expect("loopback provider with observed clock");
+    let extension = {
+        let provider = provider.clone();
+        tokio::spawn(
+            async move { history(&provider, HistoryRequest::latest(2).expect("latest")).await },
+        )
+    };
+    server.wait_for_limit_2().await;
+    assert!(matches!(
+        history(&provider, HistoryRequest::latest(1).expect("latest")).await,
+        Err(ProviderError::RateLimited { .. })
+    ));
+    assert_eq!(
+        provider.rate_gate().current(),
+        Ok(RateGateState::TimedUntil(
+            MonoInstant::from_millis(60_000).expect("deadline")
+        ))
+    );
+    let waiter = {
+        let provider = provider.clone();
+        tokio::spawn(
+            async move { history(&provider, HistoryRequest::latest(3).expect("latest")).await },
+        )
+    };
+    let deadline_60 = MonoInstant::from_millis(60_000).expect("deadline");
+    assert_eq!(
+        sleep_observed
+            .recv()
+            .await
+            .expect("waiter did not enter gate sleep"),
+        deadline_60
+    );
+    server.release_limit_2();
+    assert!(matches!(
+        extension.await.expect("extension task"),
+        Err(ProviderError::RateLimited { .. })
+    ));
+    let deadline_90 = MonoInstant::from_millis(90_000).expect("deadline");
+    assert_eq!(
+        provider.rate_gate().current(),
+        Ok(RateGateState::TimedUntil(deadline_90))
+    );
+    loop {
+        let observed = sleep_observed
+            .recv()
+            .await
+            .expect("waiter did not observe extended sleep");
+        assert!(
+            observed == deadline_60 || observed == deadline_90,
+            "unexpected gate sleep deadline: {observed:?}"
+        );
+        if observed == deadline_90 {
+            break;
+        }
+    }
     clock
-        .advance_to(MonoInstant::from_millis(60_000).expect("deadline"))
+        .advance_to(deadline_60)
         .expect("advance to old deadline");
     tokio::task::yield_now().await;
-    assert!(
-        !waiter.is_finished(),
-        "extended waiter released at stale deadline"
-    );
+    assert!(server.limit_3_was_not_observed());
+    assert!(!waiter.is_finished());
     clock
-        .advance_to(MonoInstant::from_millis(90_000).expect("deadline"))
+        .advance_to(deadline_90)
         .expect("advance to extended deadline");
     waiter
         .await
         .expect("waiter task")
         .expect("history after gate");
-    assert!(matches!(
-        extension.await.expect("extension task"),
-        Err(ProviderError::RateLimited { .. })
-    ));
+    server.wait_for_limit_3().await;
+    server.shutdown().await;
 }

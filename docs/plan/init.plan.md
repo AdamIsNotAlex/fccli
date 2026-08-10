@@ -1028,6 +1028,19 @@ Chunk-8 append-only formatter update (authoritative over the earlier 40-executio
 
 The canonical total is therefore **41 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-41`, accompanied by `artifact://1438`; the artifact's later check, REST-test, API-boundary-test, and Clippy executions do not update unrelated ledger records because their commands and scopes do not exactly match those records.
 
+
+Chunk-8 append-only formatter update (authoritative over the earlier 41-execution total and `fmt-exec-41` current-basis statement, which remains preserved as historical accounting):
+
+| Record ID | Attempt/date | Requirement | Status after attempt | Environment | Command/scenario | PASS semantics | Observed result | Evidence | Blocker/next action | Supersedes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| DET-FMT | `attempt-2026-08-10-chunk8-10` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, latest corrected chunk-8 Binance REST tree | `cargo fmt --check` within the retained chained command accompanied by `artifact://1491` | exit 0 | PASS; the chain advanced beyond formatting, the subsequent Cargo check passed, all 22 Binance REST tests passed, the test-transport API-boundary target passed its 1 test, the production API-boundary target passed its 1 test, and the final `cargo clippy --locked --all-targets -- -D warnings` stage passed | The retained chained invocation and `artifact://1491` prove the formatter stage exited 0 because execution advanced beyond it; the artifact records the subsequent check, all 22 REST tests, both single-test feature-specific API-boundary targets, and final Clippy stage passing. | — | `attempt-2026-08-10-chunk8-9` |
+
+| Record ID | True occurrence | Canonical execution identity | Exact invocation/result evidence | Historical rows accounted for |
+|---|---:|---|---|---|
+| DET-FMT | 42 | `fmt-exec-42` | The retained command accompanied by `artifact://1491` contains `cargo fmt --check`; the artifact records the subsequent Cargo check passing, all 22 Binance REST tests passing, the test-transport and production API-boundary targets each passing 1 test, and the final `cargo clippy --locked --all-targets -- -D warnings` passing, so the formatter stage necessarily exited 0 without diagnostics. | `attempt-2026-08-10-chunk8-10` is the execution row and supplies current `DET-FMT=PASS`. |
+
+The canonical total is therefore **42 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-42`, accompanied by `artifact://1491`; the artifact's later check, REST-test, API-boundary-test, and Clippy executions do not update unrelated ledger records because their commands and scopes do not exactly match those records.
+
 The final planned test inventory includes `tests/app_live_contract.rs` and contains no `tests/app_integration.rs`; this is not a precreation requirement. Chunk 2 creates and uses `tests/feature_selection.rs` only for its named feature-selection gates; `tests/app_live_contract.rs` MUST NOT exist before chunk 17, where the real App reducer/sole MarketEvent consumer contract is introduced. The final inventory also contains exactly `tests/terminal_lifecycle.rs` and `tests/api_boundaries.rs` for the other named specialized gates. `terminal_pty` and `transport_api_boundary` are not API/test-target names.
 ### Smoke and delivery references（ledger-only）
 
