@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use fccli::{
     clock::{Clock, ManualClock, SleepOutcome, checked_deadline, sleep_until_or_cancelled},
@@ -98,10 +104,15 @@ impl MarketDataProvider for FakeProvider {
             ]));
             let cancellation = request.cancellation;
             let supervisor_cancellation = cancellation.clone();
-            Ok(LiveFeed::spawn(events, cancellation, async move {
-                supervisor_cancellation.cancelled().await;
-                Ok(())
-            }))
+            Ok(LiveFeed::spawn(
+                events,
+                cancellation,
+                Arc::new(ManualClock::new(MonoInstant::from_nanos(0))),
+                async move {
+                    supervisor_cancellation.cancelled().await;
+                    Ok(())
+                },
+            ))
         })
     }
 
@@ -397,29 +408,33 @@ async fn reconcile_ack_registration_and_proof_rules_are_exact() {
 
 #[tokio::test]
 async fn producer_completion_is_observed_without_consuming_join_ownership() {
+    fn assert_eq_bound<T: Eq>() {}
+    assert_eq_bound::<ProducerCompletion>();
+
     let cancellation = CancellationToken::new();
     let supervisor_cancellation = cancellation.clone();
+    let clock = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
     let events: MarketEventStream = Box::pin(stream::empty());
-    let feed = LiveFeed::spawn(events, cancellation, async move {
+    let feed = LiveFeed::spawn(events, cancellation, clock, async move {
         supervisor_cancellation.cancelled().await;
         Err(ProviderError::Configuration("fake completion"))
     });
     let mut completion = feed.producer_completion.clone();
+    let mut independent_cursor = completion.clone();
     assert_eq!(completion.current(), Ok(ProducerCompletion::Running));
 
     feed.request_shutdown();
-    assert_eq!(
-        completion.changed().await,
-        Ok(ProducerCompletion::Finished(Err(
-            ProviderError::Configuration("fake completion")
-        )))
-    );
-    assert_eq!(
-        completion.current(),
-        Ok(ProducerCompletion::Finished(Err(
-            ProviderError::Configuration("fake completion")
-        )))
-    );
+    let finished =
+        ProducerCompletion::Finished(Err(ProviderError::Configuration("fake completion")));
+    assert_eq!(completion.changed().await, Ok(finished.clone()));
+    assert_eq!(completion.current(), Ok(finished.clone()));
+    assert!(completion.changed().await.is_err());
+
+    assert_eq!(independent_cursor.changed().await, Ok(finished.clone()));
+    let mut clone_after_delivery = independent_cursor.clone();
+    assert!(independent_cursor.changed().await.is_err());
+    assert!(clone_after_delivery.changed().await.is_err());
+
     assert_eq!(
         feed.join(MonoInstant::from_nanos(u64::MAX)).await,
         Err(fccli::provider::LiveFeedJoinError::Producer(
@@ -478,4 +493,180 @@ async fn manual_clock_drives_deadlines_timeouts_and_cancellation_deterministical
         .advance_to(MonoInstant::from_nanos(200))
         .expect("advance");
     assert_eq!(wait.await.expect("deadline wait"), SleepOutcome::Deadline);
+}
+
+struct DropProbe {
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+async fn wait_until_true(flag: &AtomicBool) {
+    for _ in 0..100 {
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(flag.load(Ordering::SeqCst), "task cleanup did not complete");
+}
+
+#[tokio::test]
+async fn manual_clock_bounds_pending_supervisor_join_and_abort_cleanup() {
+    let clock = Arc::new(ManualClock::new(MonoInstant::from_nanos(1_000)));
+    let cancellation = CancellationToken::new();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let probe = DropProbe {
+        dropped: dropped.clone(),
+    };
+    let feed = LiveFeed::spawn(
+        Box::pin(stream::empty()),
+        cancellation,
+        clock.clone(),
+        async move {
+            let _probe = probe;
+            std::future::pending::<Result<(), ProviderError>>().await
+        },
+    );
+    let deadline = checked_deadline(clock.now(), Duration::from_nanos(50)).expect("deadline");
+    let join = tokio::spawn(feed.join(deadline));
+    tokio::task::yield_now().await;
+    assert!(!join.is_finished());
+
+    clock
+        .advance_to(MonoInstant::from_nanos(1_049))
+        .expect("before deadline");
+    tokio::task::yield_now().await;
+    assert!(!join.is_finished());
+    clock.advance_to(deadline).expect("exact deadline");
+    assert_eq!(
+        join.await.expect("join task"),
+        Err(fccli::provider::LiveFeedJoinError::DeadlineElapsed)
+    );
+    wait_until_true(&dropped).await;
+}
+
+#[tokio::test]
+async fn dropped_feed_and_cancelled_join_future_abort_supervisor_tasks() {
+    let dropped_feed = Arc::new(AtomicBool::new(false));
+    let feed_probe = DropProbe {
+        dropped: dropped_feed.clone(),
+    };
+    let feed = LiveFeed::spawn(
+        Box::pin(stream::empty()),
+        CancellationToken::new(),
+        Arc::new(ManualClock::new(MonoInstant::from_nanos(0))),
+        async move {
+            let _probe = feed_probe;
+            std::future::pending::<Result<(), ProviderError>>().await
+        },
+    );
+    tokio::task::yield_now().await;
+    drop(feed);
+    wait_until_true(&dropped_feed).await;
+
+    let dropped_join = Arc::new(AtomicBool::new(false));
+    let join_probe = DropProbe {
+        dropped: dropped_join.clone(),
+    };
+    let feed = LiveFeed::spawn(
+        Box::pin(stream::empty()),
+        CancellationToken::new(),
+        Arc::new(ManualClock::new(MonoInstant::from_nanos(0))),
+        async move {
+            let _probe = join_probe;
+            std::future::pending::<Result<(), ProviderError>>().await
+        },
+    );
+    let join = tokio::spawn(feed.join(MonoInstant::from_nanos(100)));
+    tokio::task::yield_now().await;
+    join.abort();
+    assert!(join.await.expect_err("join future aborted").is_cancelled());
+    wait_until_true(&dropped_join).await;
+}
+
+#[test]
+fn manual_clock_concurrent_advances_are_monotonic_and_lossless() {
+    const WORKERS: usize = 8;
+    const INCREMENTS: usize = 1_000;
+    let clock = ManualClock::new(MonoInstant::from_nanos(0));
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let mut workers = Vec::with_capacity(WORKERS);
+    for _ in 0..WORKERS {
+        let clock = clock.clone();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..INCREMENTS {
+                clock
+                    .advance_by(Duration::from_nanos(1))
+                    .expect("increment");
+            }
+        }));
+    }
+    for worker in workers {
+        worker.join().expect("clock worker");
+    }
+    assert_eq!(
+        clock.now(),
+        MonoInstant::from_nanos((WORKERS * INCREMENTS) as u64)
+    );
+
+    let later = MonoInstant::from_nanos(clock.now().as_nanos() + 2);
+    clock.advance_to(later).expect("advance later");
+    assert!(
+        clock
+            .advance_to(MonoInstant::from_nanos(later.as_nanos() - 1))
+            .is_err()
+    );
+    assert_eq!(clock.now(), later);
+}
+
+#[tokio::test]
+async fn rate_gate_deadlines_never_shorten_and_process_block_is_absorbing() {
+    let (sender, snapshot) = fccli::provider::rate_gate_channel(RateGateState::Open);
+    let barrier = Arc::new(Barrier::new(3));
+    let later_sender = sender.clone();
+    let later_barrier = barrier.clone();
+    let later = std::thread::spawn(move || {
+        later_barrier.wait();
+        later_sender
+            .publish(RateGateState::TimedUntil(MonoInstant::from_nanos(300)))
+            .expect("publish later deadline");
+    });
+    let earlier_sender = sender.clone();
+    let earlier_barrier = barrier.clone();
+    let earlier = std::thread::spawn(move || {
+        earlier_barrier.wait();
+        earlier_sender
+            .publish(RateGateState::TimedUntil(MonoInstant::from_nanos(200)))
+            .expect("publish earlier deadline");
+    });
+    barrier.wait();
+    later.join().expect("later publisher");
+    earlier.join().expect("earlier publisher");
+    assert_eq!(
+        snapshot.current(),
+        Ok(RateGateState::TimedUntil(MonoInstant::from_nanos(300)))
+    );
+
+    sender
+        .publish(RateGateState::ProcessBlocked(
+            ProcessBlocker::InvalidBanExpiry,
+        ))
+        .expect("block process");
+    sender.publish(RateGateState::Open).expect("ignored open");
+    sender
+        .publish(RateGateState::TimedUntil(MonoInstant::from_nanos(u64::MAX)))
+        .expect("ignored deadline");
+    assert_eq!(
+        snapshot.current(),
+        Ok(RateGateState::ProcessBlocked(
+            ProcessBlocker::InvalidBanExpiry
+        ))
+    );
 }

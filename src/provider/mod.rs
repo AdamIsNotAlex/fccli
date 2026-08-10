@@ -9,7 +9,7 @@ use std::{
 use tokio::sync::{Notify, watch};
 
 use crate::{
-    clock::sleep_until,
+    clock::Clock,
     error::ProviderError,
     model::{
         Candle, GapGeneration, HistoryRequest, Instrument, InstrumentSpec, MarketEvent,
@@ -344,26 +344,50 @@ pub enum ProducerCompletion {
     Finished(Result<(), ProviderError>),
 }
 
-#[derive(Clone)]
-pub struct ProducerCompletionReceiver(watch::Receiver<ProducerCompletion>);
+impl Eq for ProducerCompletion {}
+
+pub struct ProducerCompletionReceiver {
+    receiver: watch::Receiver<ProducerCompletion>,
+    delivered_finished: bool,
+}
+
+impl Clone for ProducerCompletionReceiver {
+    fn clone(&self) -> Self {
+        Self {
+            receiver: self.receiver.clone(),
+            delivered_finished: self.delivered_finished,
+        }
+    }
+}
 
 impl ProducerCompletionReceiver {
     pub fn current(&self) -> Result<ProducerCompletion, ProducerCompletionClosed> {
-        match self.0.has_changed() {
-            Ok(_) => Ok(self.0.borrow().clone()),
+        match self.receiver.has_changed() {
+            Ok(_) => Ok(self.receiver.borrow().clone()),
             Err(_) => self.final_value_or_closed(),
         }
     }
 
     pub async fn changed(&mut self) -> Result<ProducerCompletion, ProducerCompletionClosed> {
-        match self.0.changed().await {
-            Ok(()) => Ok(self.0.borrow_and_update().clone()),
-            Err(_) => self.final_value_or_closed(),
+        match self.receiver.changed().await {
+            Ok(()) => {
+                let value = self.receiver.borrow_and_update().clone();
+                if matches!(value, ProducerCompletion::Finished(_)) {
+                    self.delivered_finished = true;
+                }
+                Ok(value)
+            }
+            Err(_) if !self.delivered_finished => {
+                let value = self.final_value_or_closed()?;
+                self.delivered_finished = true;
+                Ok(value)
+            }
+            Err(_) => Err(ProducerCompletionClosed),
         }
     }
 
     fn final_value_or_closed(&self) -> Result<ProducerCompletion, ProducerCompletionClosed> {
-        let value = self.0.borrow().clone();
+        let value = self.receiver.borrow().clone();
         match value {
             ProducerCompletion::Finished(_) => Ok(value),
             ProducerCompletion::Running => Err(ProducerCompletionClosed),
@@ -378,13 +402,15 @@ pub struct LiveFeed {
     pub events: MarketEventStream,
     pub producer_completion: ProducerCompletionReceiver,
     cancellation: CancellationToken,
-    supervisor: tokio::task::JoinHandle<Result<(), ProviderError>>,
+    clock: Arc<dyn Clock>,
+    supervisor: Option<tokio::task::JoinHandle<Result<(), ProviderError>>>,
 }
 
 impl LiveFeed {
     pub fn spawn<F>(
         events: MarketEventStream,
         cancellation: CancellationToken,
+        clock: Arc<dyn Clock>,
         supervisor: F,
     ) -> Self
     where
@@ -398,9 +424,13 @@ impl LiveFeed {
         });
         Self {
             events,
-            producer_completion: ProducerCompletionReceiver(completion_rx),
+            producer_completion: ProducerCompletionReceiver {
+                receiver: completion_rx,
+                delivered_finished: false,
+            },
             cancellation,
-            supervisor: task,
+            clock,
+            supervisor: Some(task),
         }
     }
 
@@ -409,14 +439,42 @@ impl LiveFeed {
     }
 
     pub async fn join(mut self, deadline: MonoInstant) -> Result<(), LiveFeedJoinError> {
-        tokio::select! {
-            biased;
-            result = &mut self.supervisor => map_join_result(result),
-            () = sleep_until(deadline) => {
-                self.supervisor.abort();
-                let _ = self.supervisor.await;
+        let clock = Arc::clone(&self.clock);
+        let outcome = {
+            let supervisor = self
+                .supervisor
+                .as_mut()
+                .expect("live-feed supervisor must be owned until join completes");
+            tokio::select! {
+                biased;
+                result = supervisor => Some(result),
+                () = clock.sleep_until(deadline) => None,
+            }
+        };
+
+        match outcome {
+            Some(result) => {
+                self.supervisor = None;
+                map_join_result(result)
+            }
+            None => {
+                let supervisor = self
+                    .supervisor
+                    .take()
+                    .expect("live-feed supervisor must be owned until timeout cleanup");
+                supervisor.abort();
+                let _ = supervisor.await;
                 Err(LiveFeedJoinError::DeadlineElapsed)
             }
+        }
+    }
+}
+
+impl Drop for LiveFeed {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(supervisor) = self.supervisor.take() {
+            supervisor.abort();
         }
     }
 }
@@ -465,15 +523,39 @@ impl RateGateSnapshot {
 pub struct RateGateClosed;
 
 #[derive(Clone)]
-pub struct RateGateSender(watch::Sender<RateGateState>);
+pub struct RateGateSender(Arc<Mutex<watch::Sender<RateGateState>>>);
 
 pub fn rate_gate_channel(initial: RateGateState) -> (RateGateSender, RateGateSnapshot) {
     let (sender, receiver) = watch::channel(initial);
-    (RateGateSender(sender), RateGateSnapshot(receiver))
+    (
+        RateGateSender(Arc::new(Mutex::new(sender))),
+        RateGateSnapshot(receiver),
+    )
 }
 
 impl RateGateSender {
-    pub fn publish(&self, state: RateGateState) -> Result<(), RateGateClosed> {
-        self.0.send(state).map_err(|_| RateGateClosed)
+    pub fn publish(&self, requested: RateGateState) -> Result<(), RateGateClosed> {
+        let sender = self.0.lock().expect("rate gate mutex poisoned");
+        if sender.is_closed() {
+            return Err(RateGateClosed);
+        }
+
+        let current = *sender.borrow();
+        let effective = match (current, requested) {
+            (RateGateState::ProcessBlocked(blocker), _) => RateGateState::ProcessBlocked(blocker),
+            (_, RateGateState::ProcessBlocked(blocker)) => RateGateState::ProcessBlocked(blocker),
+            (RateGateState::TimedUntil(current), RateGateState::TimedUntil(requested)) => {
+                RateGateState::TimedUntil(current.max(requested))
+            }
+            (RateGateState::TimedUntil(deadline), RateGateState::Open) => {
+                RateGateState::TimedUntil(deadline)
+            }
+            (RateGateState::Open, next) => next,
+        };
+
+        if effective != current {
+            sender.send_replace(effective);
+        }
+        Ok(())
     }
 }

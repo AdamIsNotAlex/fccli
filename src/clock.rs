@@ -34,7 +34,7 @@ impl Clock for SystemClock {
 
 #[derive(Clone, Debug)]
 pub struct ManualClock {
-    state: Arc<watch::Sender<MonoInstant>>,
+    state: Arc<std::sync::Mutex<watch::Sender<MonoInstant>>>,
 }
 
 impl ManualClock {
@@ -42,32 +42,42 @@ impl ManualClock {
     pub fn new(initial: MonoInstant) -> Self {
         let (sender, _) = watch::channel(initial);
         Self {
-            state: Arc::new(sender),
+            state: Arc::new(std::sync::Mutex::new(sender)),
         }
     }
 
     pub fn advance_to(&self, deadline: MonoInstant) -> Result<(), ModelError> {
-        if deadline < self.now() {
+        let state = self.state.lock().expect("manual clock mutex poisoned");
+        if deadline < *state.borrow() {
             return Err(ModelError::InvalidMonoInstant);
         }
-        self.state.send_replace(deadline);
+        state.send_replace(deadline);
         Ok(())
     }
 
     pub fn advance_by(&self, duration: Duration) -> Result<MonoInstant, ModelError> {
-        let deadline = checked_deadline(self.now(), duration)?;
-        self.state.send_replace(deadline);
+        let state = self.state.lock().expect("manual clock mutex poisoned");
+        let deadline = checked_deadline(*state.borrow(), duration)?;
+        state.send_replace(deadline);
         Ok(deadline)
     }
 }
 
 impl Clock for ManualClock {
     fn now(&self) -> MonoInstant {
-        *self.state.borrow()
+        *self
+            .state
+            .lock()
+            .expect("manual clock mutex poisoned")
+            .borrow()
     }
 
     fn sleep_until<'a>(&'a self, deadline: MonoInstant) -> ClockFuture<'a> {
-        let mut receiver = self.state.subscribe();
+        let mut receiver = self
+            .state
+            .lock()
+            .expect("manual clock mutex poisoned")
+            .subscribe();
         Box::pin(async move {
             while *receiver.borrow_and_update() < deadline {
                 if receiver.changed().await.is_err() {

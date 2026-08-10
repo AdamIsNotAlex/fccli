@@ -958,6 +958,18 @@ Chunk-7 append-only formatter update (authoritative over the earlier 29-executio
 
 The canonical total is therefore **31 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-31`, accompanied by `artifact://1255`; the artifacts' later check and provider-contract test executions do not update unrelated ledger records because their commands and scopes do not exactly match those records.
 
+Chunk-7 append-only formatter update (authoritative over the earlier 31-execution total and `fmt-exec-31` current-basis statement, which remains preserved as historical accounting):
+
+| Record ID | Attempt/date | Requirement | Status after attempt | Environment | Command/scenario | PASS semantics | Observed result | Evidence | Blocker/next action | Supersedes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| DET-FMT | `attempt-2026-08-10-chunk7-3` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, latest corrected chunk-7 provider-contract tree | `cargo fmt --check` within the retained chained command accompanied by `artifact://1278` | exit 0 | PASS; the chain advanced beyond formatting, the subsequent Cargo check passed, all 10 provider-contract tests passed, and the final `cargo clippy --locked --all-targets -- -D warnings` stage passed | The retained chained invocation and `artifact://1278` prove the formatter stage exited 0 because execution advanced beyond it; the artifact records the subsequent check, all 10 provider-contract tests, and final Clippy stage passing. | — | `attempt-2026-08-10-chunk7-2` |
+
+| Record ID | True occurrence | Canonical execution identity | Exact invocation/result evidence | Historical rows accounted for |
+|---|---:|---|---|---|
+| DET-FMT | 32 | `fmt-exec-32` | The retained command accompanied by `artifact://1278` contains `cargo fmt --check`; the artifact records the subsequent Cargo check passing, all 10 provider-contract tests passing, and the final `cargo clippy --locked --all-targets -- -D warnings` passing, so the formatter stage necessarily exited 0 without diagnostics. | `attempt-2026-08-10-chunk7-3` is the execution row and supplies current `DET-FMT=PASS`. |
+
+The canonical total is therefore **32 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-32`, accompanied by `artifact://1278`; the artifact's later check, provider-contract test, and Clippy executions do not update unrelated ledger records because their commands and scopes do not exactly match those records.
+
 The final planned test inventory includes `tests/app_live_contract.rs` and contains no `tests/app_integration.rs`; this is not a precreation requirement. Chunk 2 creates and uses `tests/feature_selection.rs` only for its named feature-selection gates; `tests/app_live_contract.rs` MUST NOT exist before chunk 17, where the real App reducer/sole MarketEvent consumer contract is introduced. The final inventory also contains exactly `tests/terminal_lifecycle.rs` and `tests/api_boundaries.rs` for the other named specialized gates. `terminal_pty` and `transport_api_boundary` are not API/test-target names.
 ### Smoke and delivery references（ledger-only）
 
