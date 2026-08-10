@@ -125,6 +125,62 @@ fn x_pan_zoom_use_exact_factors_rounding_and_bounds() {
 }
 
 #[test]
+fn x_zoom_floors_cover_each_limiter_for_keyboard_and_generic_factors() {
+    for (series_len, plot_width, expected_floor) in [(7, 20, 7), (100, 6, 6), (100, 20, 10)] {
+        let series = candles(series_len);
+
+        let mut keyboard = ChartViewState::snapshot(&series, plot_width);
+        while data(&keyboard).visible_count() > expected_floor {
+            keyboard.zoom_x_in(&series, plot_width);
+        }
+        assert_eq!(
+            data(&keyboard).visible_count(),
+            expected_floor,
+            "keyboard floor for series_len={series_len}, plot_width={plot_width}"
+        );
+        let keyboard_floor = keyboard.clone();
+        keyboard.zoom_x_in(&series, plot_width);
+        assert_eq!(
+            keyboard, keyboard_floor,
+            "keyboard next zoom is blocked for series_len={series_len}, plot_width={plot_width}"
+        );
+
+        let mut generic = ChartViewState::snapshot(&series, plot_width);
+        generic.zoom_x_by_factor(&series, plot_width, 0.01);
+        assert_eq!(
+            data(&generic).visible_count(),
+            expected_floor,
+            "generic floor for series_len={series_len}, plot_width={plot_width}"
+        );
+        let generic_floor = generic.clone();
+        generic.zoom_x_by_factor(&series, plot_width, 0.5);
+        assert_eq!(
+            generic, generic_floor,
+            "generic next zoom is blocked for series_len={series_len}, plot_width={plot_width}"
+        );
+    }
+}
+
+#[test]
+fn paused_zoom_out_reaching_latest_restores_live_append_following() {
+    let mut series = candles(100);
+    let mut state = ChartViewState::interactive(&series, 40);
+    state.pan_x_older(&series);
+    assert!(!data(&state).follows_live());
+    assert_eq!(data(&state).right_index(), 98);
+
+    state.zoom_x_out(&series, 40);
+    assert_eq!(data(&state).right_index(), 99);
+    assert!(data(&state).follows_live());
+
+    let summary = series.append(candle(100, 101.0, 102.0));
+    state.apply_mutation(&series, &summary, 40);
+    assert_eq!(data(&state).right_index(), 100);
+    assert_eq!(data(&state).right_open_time(), at(&series, 100).open_time());
+    assert!(data(&state).follows_live());
+}
+
+#[test]
 fn zoom_while_following_stays_latest_and_advances_on_live_append() {
     let mut series = candles(100);
     let mut state = ChartViewState::interactive(&series, 40);
@@ -181,6 +237,8 @@ fn maximum_step_bounded_factor_is_positive_and_reaches_zoom_minima() {
     assert_eq!(bounded_zoom_factor(f64::INFINITY, 2, 100.0), 1.0);
     assert_eq!(bounded_zoom_factor(0.0, 2, 100.0), 1.0);
     assert_eq!(bounded_zoom_factor(1.0, usize::MAX, 100.0), 1.0);
+    assert_eq!(bounded_zoom_factor(0.5, 4, 10.0), 0.125);
+    assert_eq!(bounded_zoom_factor(0.5, usize::MAX, 10.0), 0.125);
 
     let minimum_factor = bounded_zoom_factor(0.8, usize::MAX, f64::MAX);
     assert!(minimum_factor.is_finite());
@@ -354,6 +412,21 @@ fn real_series_summaries_cover_canonical_mapping_shapes_without_center_drift() {
         center_open_time(&merged_state, &merged_series),
         merged_anchor
     );
+}
+
+#[test]
+fn mutation_reclamps_visible_count_to_smaller_plot_width() {
+    let mut series = candles(100);
+    let mut state = ChartViewState::snapshot(&series, 30);
+    state.pan_x_older(&series);
+    let anchor = center_open_time(&state, &series);
+
+    let summary = series.append(candle(100, 101.0, 102.0));
+    state.apply_mutation(&series, &summary, 7);
+
+    assert_eq!(data(&state).visible_count(), 7);
+    assert_eq!(center_open_time(&state, &series), anchor);
+    assert!(!data(&state).follows_live());
 }
 
 #[test]

@@ -274,7 +274,7 @@ impl ChartViewState {
             view.follow_live = true;
         } else {
             view.right_index = right_index_for_center(anchor_index, next, candles.len());
-            view.follow_live = false;
+            view.follow_live = view.right_index + 1 == candles.len();
         }
         refresh_open_time_and_auto_y(view, candles);
     }
@@ -560,10 +560,22 @@ pub fn bounded_zoom_factor(base: f64, steps: usize, limit: f64) -> f64 {
         return 1.0;
     }
     if base < 1.0 {
-        // A shrinking multiplier is bounded by the reciprocal limit just as a growing
-        // multiplier is bounded by `limit`. Clamping the result also prevents an
-        // enormous step count from underflowing to zero and turning zoom into a no-op.
-        return base.powf(steps as f64).max(limit.recip());
+        let lower_bound = limit.recip();
+        let maximum_steps = (lower_bound.ln() / base.ln()).floor().max(0.0) as usize;
+        let mut applied_steps = steps.min(maximum_steps);
+        let mut factor = base.powf(applied_steps as f64);
+
+        // Correct logarithm/power rounding at the boundary without walking the
+        // requested steps or evaluating the first crossing (possibly underflowing) power.
+        while factor < lower_bound {
+            factor /= base;
+            applied_steps = applied_steps.saturating_sub(1);
+        }
+        while applied_steps < steps && factor >= lower_bound / base {
+            factor *= base;
+            applied_steps += 1;
+        }
+        return factor;
     }
 
     let requested = steps as f64;

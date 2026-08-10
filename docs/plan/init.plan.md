@@ -835,6 +835,28 @@ Chunk-5 append-only execution update (authoritative over the earlier 19-executio
 
 The canonical total is therefore **22 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-22`, accompanied by `artifact://1038`; the later failure does not invalidate the successfully completed formatter stage and does not update any unrelated ledger record.
 
+Chunk-5 append-only outcome correction (authoritative over the inaccurate outcome narratives in `attempt-2026-08-10-chunk5-6` through `attempt-2026-08-10-chunk5-8` and `fmt-exec-20` through `fmt-exec-22`, which remain preserved as historical accounting):
+
+| Record ID | Corrected canonical execution | Authoritative observed outcome | Accounting effect | Supersedes narrative |
+|---|---|---|---|---|
+| DET-FMT | `fmt-exec-20` / `attempt-2026-08-10-chunk5-6` | `artifact://1012` records that the retained `&&` chain advanced beyond `cargo fmt --check`, then Cargo compilation failed with `E0599` before the chart-state tests ran. | Formatter execution 20 remains a successful formatter execution because the chain advanced beyond formatting; no test or later-stage success is claimed. | The earlier statements that `artifact://1012` reached a chart-state test failure. |
+| DET-FMT | `fmt-exec-21` / `attempt-2026-08-10-chunk5-7` | `artifact://1025` records that the retained chain advanced beyond `cargo fmt --check`; the chart-state target ran 19 tests with 18 passing and one manual-Y test failing, so no later chained stage ran. | Formatter execution 21 remains a successful formatter execution; no successful chart-state target or subsequent-stage result is claimed. | The earlier statements that `artifact://1025` records successful chart-state tests and Cargo-check stages. |
+| DET-FMT | `fmt-exec-22` / `attempt-2026-08-10-chunk5-8` | `artifact://1038` records that the retained final chain advanced beyond `cargo fmt --check`, all 19 chart-state tests passed, and every subsequent stage in that retained chain completed successfully. | Formatter execution 22 remains the current `DET-FMT=PASS` basis and is accompanied by successful later-stage evidence; this correction does not update any unrelated ledger record. | The earlier statements that `artifact://1038` ended in a later Cargo compilation failure. |
+
+The canonical total remains **22 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-22`, accompanied by `artifact://1038`; this append-only correction changes only the recorded post-formatter outcomes, not the formatter execution identities, count, or PASS status.
+
+Chunk-5 append-only formatter update (authoritative over the earlier 22-execution total and `fmt-exec-22` current-basis statement, which remain preserved as historical accounting):
+
+| Record ID | Attempt/date | Requirement | Status after attempt | Environment | Command/scenario | PASS semantics | Observed result | Evidence | Blocker/next action | Supersedes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| DET-FMT | `attempt-2026-08-10-chunk5-9` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, latest corrected chunk-5 chart-state tree | `cargo fmt --check` within the retained chained command accompanied by `artifact://1060` | exit 0 | PASS; the chain advanced beyond formatting and its later Cargo check, 22-test chart-state target, and final Cargo check completed successfully | The retained chained invocation and `artifact://1060` prove the formatter stage exited 0 because execution advanced beyond it; rustfmt emitted no diagnostics. | — | `attempt-2026-08-10-chunk5-8` |
+
+| Record ID | True occurrence | Canonical execution identity | Exact invocation/result evidence | Historical rows accounted for |
+|---|---:|---|---|---|
+| DET-FMT | 23 | `fmt-exec-23` | The retained command accompanied by `artifact://1060` contains `cargo fmt --check`; the artifact records subsequent Cargo check, all 22 chart-state tests, and the final Cargo check succeeding, so the formatter stage necessarily exited 0 without diagnostics. | `attempt-2026-08-10-chunk5-9` is the execution row and supplies current `DET-FMT=PASS`. |
+
+The canonical total is therefore **23 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-23`, accompanied by `artifact://1060`; the artifact's later checks and chart-state test execution do not update unrelated ledger records because their commands and scopes do not exactly match those records.
+
 The final planned test inventory includes `tests/app_live_contract.rs` and contains no `tests/app_integration.rs`; this is not a precreation requirement. Chunk 2 creates and uses `tests/feature_selection.rs` only for its named feature-selection gates; `tests/app_live_contract.rs` MUST NOT exist before chunk 17, where the real App reducer/sole MarketEvent consumer contract is introduced. The final inventory also contains exactly `tests/terminal_lifecycle.rs` and `tests/api_boundaries.rs` for the other named specialized gates. `terminal_pty` and `transport_api_boundary` are not API/test-target names.
 ### Smoke and delivery references（ledger-only）
 
