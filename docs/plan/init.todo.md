@@ -87,10 +87,10 @@ Each chunk is independently reviewable and committable after its definition of d
 
 ### 6. Implement CLI parsing and pure Binance canonicalization
 
-- [ ] Define positional `instrument`, `timeframe`, and `-i`/`--interactive`; parse generic provider prefix and pair grammar into `InstrumentSpec`, with explicit error precedence. Chunk 6 parses `ProviderId` only; concrete registry lookup/selection occurs only after full Binance REST/live implementations in chunk 10.
-- [ ] Reject malformed symbols/providers/timeframes before terminal, runtime, or network work; preserve case-sensitive `1m`/`1M` and exact intervals. Reject quote-only suffix tokens after canonical splitting; require nonempty canonical base and quote.
-- [ ] Implement Binance-local pure uppercase/canonical resolution and display/provider symbol fields without network access, including the shortest valid suffixed pair.
-- [ ] Use only `Cli::try_parse_from`/command rendering library tests. No Assert Cmd or binary path in chunk 6; binary help/version/argument errors begin only in chunk 17.
+- [x] Define positional `instrument`, `timeframe`, and `-i`/`--interactive`; parse generic provider prefix and pair grammar into `InstrumentSpec`, with explicit error precedence. Chunk 6 parses `ProviderId` only; concrete registry lookup/selection occurs only after full Binance REST/live implementations in chunk 10.
+- [x] Reject malformed symbols/providers/timeframes before terminal, runtime, or network work; preserve case-sensitive `1m`/`1M` and exact intervals. Reject quote-only suffix tokens after canonical splitting; require nonempty canonical base and quote.
+- [x] Implement Binance-local pure uppercase/canonical resolution and display/provider symbol fields without network access, including the shortest valid suffixed pair.
+- [x] Use only `Cli::try_parse_from`/command rendering library tests. No Assert Cmd or binary path in chunk 6; binary help/version/argument errors begin only in chunk 17.
 - Definition of done: parser/canonicalization library behavior only; valid modes are later direct `run_with_dependencies` tests, never child-process injection.
 
 ### 7. Define provider interface and task ownership

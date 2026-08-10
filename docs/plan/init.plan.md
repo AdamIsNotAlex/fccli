@@ -877,6 +877,20 @@ Chunk-5 append-only formatter update (authoritative over the earlier 23-executio
 
 The canonical total is therefore **24 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-24`, accompanied by `artifact://1119`; the artifact's later check, chart-state test, and Clippy executions do not update unrelated ledger records because their commands and scopes do not exactly match those records.
 
+Chunk-6 append-only formatter update (authoritative over the earlier 24-execution total and `fmt-exec-24` current-basis statement, which remain preserved as historical accounting):
+
+| Record ID | Attempt/date | Requirement | Status after attempt | Environment | Command/scenario | PASS semantics | Observed result | Evidence | Blocker/next action | Supersedes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| DET-FMT | `attempt-2026-08-10-chunk6-1` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, first chunk-6 CLI tree | `cargo fmt --check` within the retained chained command accompanied by `artifact://1142` | exit 0 | PASS; the chain advanced beyond formatting, the subsequent Cargo check passed, and the CLI test target ran 8 tests with 7 passing and 1 failing | The retained chained invocation and `artifact://1142` prove the formatter stage exited 0 because execution advanced beyond it; the artifact records the subsequent check succeeding and `tests/cli.rs` failing only `whitespace_non_ascii_empty_and_malformed_components_are_rejected` after 7 tests passed. | — | `attempt-2026-08-10-chunk5-10` |
+| DET-FMT | `attempt-2026-08-10-chunk6-2` / 2026-08-10 | REQUIRED | `PASS` | Linux workspace, corrected chunk-6 CLI tree | `cargo fmt --check` within the final retained chained command accompanied by `artifact://1152` | exit 0 | PASS; the chain advanced beyond formatting, the subsequent Cargo check passed, all 8 CLI tests passed, and the remaining chained command completed successfully | The retained final chained invocation and `artifact://1152` prove the formatter stage exited 0 because execution advanced beyond it; the artifact records the subsequent check, all 8 CLI tests, and the final chained Cargo stage succeeding. | — | `attempt-2026-08-10-chunk6-1` |
+
+| Record ID | True occurrence | Canonical execution identity | Exact invocation/result evidence | Historical rows accounted for |
+|---|---:|---|---|---|
+| DET-FMT | 25 | `fmt-exec-25` | The retained command accompanied by `artifact://1142` contains `cargo fmt --check`; because the chain advanced through a successful Cargo check to the later CLI test failure (7 passed, 1 failed), the formatter stage necessarily exited 0 without diagnostics. | `attempt-2026-08-10-chunk6-1` is the execution row. |
+| DET-FMT | 26 | `fmt-exec-26` | The final retained command accompanied by `artifact://1152` contains `cargo fmt --check`; the artifact records the subsequent Cargo check passing, all 8 CLI tests passing, and the remaining chained Cargo stage succeeding, so the formatter stage necessarily exited 0 without diagnostics. | `attempt-2026-08-10-chunk6-2` is the execution row and supplies current `DET-FMT=PASS`. |
+
+The canonical total is therefore **26 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-26`, accompanied by `artifact://1152`; the artifacts' later check and CLI-test executions do not update unrelated ledger records because their commands and scopes do not exactly match those records.
+
 The final planned test inventory includes `tests/app_live_contract.rs` and contains no `tests/app_integration.rs`; this is not a precreation requirement. Chunk 2 creates and uses `tests/feature_selection.rs` only for its named feature-selection gates; `tests/app_live_contract.rs` MUST NOT exist before chunk 17, where the real App reducer/sole MarketEvent consumer contract is introduced. The final inventory also contains exactly `tests/terminal_lifecycle.rs` and `tests/api_boundaries.rs` for the other named specialized gates. `terminal_pty` and `transport_api_boundary` are not API/test-target names.
 ### Smoke and delivery references（ledger-only）
 
