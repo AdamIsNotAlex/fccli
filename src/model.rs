@@ -1,4 +1,6 @@
-use std::{fmt, str::FromStr};
+use std::{collections::VecDeque, fmt, ops::Range, str::FromStr};
+
+use time::{Date, Month, OffsetDateTime};
 
 use crate::error::{ModelError, ProviderError};
 
@@ -474,6 +476,349 @@ impl Candle {
     pub const fn is_closed(&self) -> bool {
         self.authority.is_closed()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationKind {
+    Inserted,
+    Replaced,
+    Unchanged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedMutation {
+    pub open_time: i64,
+    pub final_index: usize,
+    pub kind: MutationKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationSummary {
+    pub inserted: usize,
+    pub replaced: usize,
+    pub unchanged: usize,
+    pub old_to_new: Vec<usize>,
+    pub resolved: Vec<ResolvedMutation>,
+    pub empty_input: bool,
+    pub duplicate_only: bool,
+    pub no_progress: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CandleSeries {
+    timeframe: Timeframe,
+    candles: VecDeque<Candle>,
+}
+
+impl CandleSeries {
+    #[must_use]
+    pub const fn new(timeframe: Timeframe) -> Self {
+        Self {
+            timeframe,
+            candles: VecDeque::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn timeframe(&self) -> Timeframe {
+        self.timeframe
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.candles.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.candles.is_empty()
+    }
+
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&Candle> {
+        self.candles.get(index)
+    }
+
+    #[must_use]
+    pub fn range(&self, range: Range<usize>) -> Option<impl Iterator<Item = &Candle>> {
+        (range.start <= range.end && range.end <= self.len()).then(|| {
+            self.candles
+                .iter()
+                .skip(range.start)
+                .take(range.end - range.start)
+        })
+    }
+
+    #[must_use]
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Candle> + ExactSizeIterator {
+        self.candles.iter()
+    }
+
+    #[must_use]
+    pub fn oldest_open_time(&self) -> Option<i64> {
+        self.candles.front().map(Candle::open_time)
+    }
+
+    #[must_use]
+    pub fn newest_open_time(&self) -> Option<i64> {
+        self.candles.back().map(Candle::open_time)
+    }
+
+    #[must_use]
+    pub fn index_of_open_time(&self, open_time: i64) -> Option<usize> {
+        self.candles
+            .binary_search_by_key(&open_time, Candle::open_time)
+            .ok()
+    }
+
+    #[must_use]
+    pub fn candle_at_open_time(&self, open_time: i64) -> Option<&Candle> {
+        self.index_of_open_time(open_time)
+            .and_then(|index| self.candles.get(index))
+    }
+
+    #[must_use]
+    pub fn is_contiguous(&self) -> bool {
+        self.is_range_contiguous(0..self.len())
+    }
+
+    #[must_use]
+    pub fn is_range_contiguous(&self, range: Range<usize>) -> bool {
+        let Some(candles) = self.range(range) else {
+            return false;
+        };
+        let mut candles = candles.peekable();
+        let Some(mut previous) = candles.next() else {
+            return true;
+        };
+        candles.all(|next| {
+            let contiguous =
+                timeframe_successor(self.timeframe, previous.open_time()) == Some(next.open_time());
+            previous = next;
+            contiguous
+        })
+    }
+
+    #[must_use]
+    pub fn is_contiguous_through(&self, start_open_time: i64, end_open_time: i64) -> bool {
+        let (Some(start), Some(end)) = (
+            self.index_of_open_time(start_open_time),
+            self.index_of_open_time(end_open_time),
+        ) else {
+            return false;
+        };
+        start <= end && self.is_range_contiguous(start..end.saturating_add(1))
+    }
+
+    #[must_use]
+    pub fn replace(&mut self, candles: Vec<Candle>) -> MutationSummary {
+        self.mutate(candles, true)
+    }
+
+    #[must_use]
+    pub fn merge(&mut self, candles: Vec<Candle>) -> MutationSummary {
+        self.mutate(candles, false)
+    }
+
+    #[must_use]
+    pub fn prepend(&mut self, candles: Vec<Candle>) -> MutationSummary {
+        self.merge(candles)
+    }
+
+    #[must_use]
+    pub fn upsert(&mut self, candle: Candle) -> MutationSummary {
+        self.merge(vec![candle])
+    }
+
+    #[must_use]
+    pub fn append(&mut self, candle: Candle) -> MutationSummary {
+        self.merge(vec![candle])
+    }
+
+    fn mutate(&mut self, mut input: Vec<Candle>, replace: bool) -> MutationSummary {
+        let empty_input = input.is_empty();
+        let old: Vec<Candle> = self.candles.iter().cloned().collect();
+        if empty_input {
+            return MutationSummary {
+                inserted: 0,
+                replaced: 0,
+                unchanged: 0,
+                old_to_new: (0..old.len()).collect(),
+                resolved: Vec::new(),
+                empty_input: true,
+                duplicate_only: false,
+                no_progress: true,
+            };
+        }
+
+        input.sort_by_key(Candle::open_time);
+        let mut accepted: Vec<Candle> = Vec::with_capacity(input.len());
+        for candle in input {
+            if let Some(previous) = accepted.last_mut()
+                && previous.open_time() == candle.open_time()
+            {
+                *previous = merge_equal(previous, candle);
+            } else {
+                accepted.push(candle);
+            }
+        }
+        let accepted_times: Vec<i64> = accepted.iter().map(Candle::open_time).collect();
+
+        let mut merged = if replace {
+            accepted
+        } else {
+            merge_sorted(&old, accepted)
+        };
+        recompute_rest_adjacency(self.timeframe, &mut merged);
+        self.candles = merged.into();
+
+        let old_to_new = old
+            .iter()
+            .map(|candle| {
+                self.index_of_open_time(candle.open_time())
+                    .unwrap_or(usize::MAX)
+            })
+            .collect();
+        let mut inserted = 0;
+        let mut replaced = 0;
+        let mut unchanged = 0;
+        let resolved = accepted_times
+            .into_iter()
+            .map(|open_time| {
+                let final_index = self
+                    .index_of_open_time(open_time)
+                    .expect("accepted candle must exist after normalization");
+                let final_candle = &self.candles[final_index];
+                let kind = match old.binary_search_by_key(&open_time, Candle::open_time) {
+                    Err(_) => {
+                        inserted += 1;
+                        MutationKind::Inserted
+                    }
+                    Ok(old_index) if old[old_index] == *final_candle => {
+                        unchanged += 1;
+                        MutationKind::Unchanged
+                    }
+                    Ok(_) => {
+                        replaced += 1;
+                        MutationKind::Replaced
+                    }
+                };
+                ResolvedMutation {
+                    open_time,
+                    final_index,
+                    kind,
+                }
+            })
+            .collect();
+        MutationSummary {
+            inserted,
+            replaced,
+            unchanged,
+            old_to_new,
+            resolved,
+            empty_input: false,
+            duplicate_only: inserted == 0 && replaced == 0,
+            no_progress: inserted == 0,
+        }
+    }
+}
+
+fn merge_sorted(old: &[Candle], incoming: Vec<Candle>) -> Vec<Candle> {
+    let mut merged = Vec::with_capacity(old.len() + incoming.len());
+    let mut old_index = 0;
+    let mut incoming = incoming.into_iter().peekable();
+    while old_index < old.len() || incoming.peek().is_some() {
+        match incoming.peek() {
+            None => {
+                merged.extend_from_slice(&old[old_index..]);
+                break;
+            }
+            Some(next)
+                if old_index == old.len() || next.open_time() < old[old_index].open_time() =>
+            {
+                merged.push(incoming.next().expect("peeked candle must exist"));
+            }
+            Some(next) if next.open_time() == old[old_index].open_time() => {
+                let candidate = incoming.next().expect("peeked candle must exist");
+                merged.push(merge_equal(&old[old_index], candidate));
+                old_index += 1;
+            }
+            Some(_) => {
+                merged.push(old[old_index].clone());
+                old_index += 1;
+            }
+        }
+    }
+    merged
+}
+
+fn merge_equal(current: &Candle, candidate: Candle) -> Candle {
+    use FinalityAuthority::{
+        RestProvisionalClosed, RestProvisionalOpen, WsAuthoritativeClosed, WsAuthoritativeOpen,
+    };
+    match (current.authority(), candidate.authority()) {
+        (_, WsAuthoritativeClosed) => candidate,
+        (WsAuthoritativeClosed, _) => current.clone(),
+        (WsAuthoritativeOpen, RestProvisionalOpen | RestProvisionalClosed) => current.clone(),
+        (RestProvisionalOpen | RestProvisionalClosed, WsAuthoritativeOpen) => candidate,
+        (WsAuthoritativeOpen, WsAuthoritativeOpen)
+        | (
+            RestProvisionalOpen | RestProvisionalClosed,
+            RestProvisionalOpen | RestProvisionalClosed,
+        ) => candidate,
+    }
+}
+
+fn recompute_rest_adjacency(timeframe: Timeframe, candles: &mut [Candle]) {
+    for index in 0..candles.len() {
+        if candles[index].authority().is_authoritative() {
+            continue;
+        }
+        let has_successor = candles.get(index + 1).is_some_and(|next| {
+            timeframe_successor(timeframe, candles[index].open_time()) == Some(next.open_time())
+        });
+        candles[index].authority = if has_successor {
+            FinalityAuthority::RestProvisionalClosed
+        } else {
+            FinalityAuthority::RestProvisionalOpen
+        };
+    }
+}
+
+fn timeframe_successor(timeframe: Timeframe, open_time: i64) -> Option<i64> {
+    let fixed_milliseconds = match timeframe {
+        Timeframe::Second1 => Some(1_000),
+        Timeframe::Minute1 => Some(60_000),
+        Timeframe::Minute3 => Some(180_000),
+        Timeframe::Minute5 => Some(300_000),
+        Timeframe::Minute15 => Some(900_000),
+        Timeframe::Minute30 => Some(1_800_000),
+        Timeframe::Hour1 => Some(3_600_000),
+        Timeframe::Hour2 => Some(7_200_000),
+        Timeframe::Hour4 => Some(14_400_000),
+        Timeframe::Hour6 => Some(21_600_000),
+        Timeframe::Hour8 => Some(28_800_000),
+        Timeframe::Hour12 => Some(43_200_000),
+        Timeframe::Day1 => Some(86_400_000),
+        Timeframe::Day3 => Some(259_200_000),
+        Timeframe::Week1 => Some(604_800_000),
+        Timeframe::Month1 => None,
+    };
+    if let Some(milliseconds) = fixed_milliseconds {
+        return checked_timestamp_add(open_time, milliseconds).ok();
+    }
+
+    let timestamp =
+        OffsetDateTime::from_unix_timestamp_nanos(i128::from(open_time) * 1_000_000).ok()?;
+    let (year, month) = match timestamp.month() {
+        Month::December => (timestamp.year().checked_add(1)?, Month::January),
+        month => (timestamp.year(), month.next()),
+    };
+    let date = Date::from_calendar_date(year, month, timestamp.day()).ok()?;
+    let successor = timestamp.replace_date(date).unix_timestamp_nanos() / 1_000_000;
+    i64::try_from(successor)
+        .ok()
+        .filter(|value| validate_timestamp(*value).is_ok())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
