@@ -129,6 +129,61 @@ fn assert_function_is_compiled_out(
         "fixture failed for a reason other than the missing {forbidden_function} function in fccli::provider::binance:\n{stderr}"
     );
 }
+fn assert_combined_provider_boundaries_are_compiled_out(
+    fixture_name: &str,
+    dependency_feature: &str,
+    forbidden_constructor: &str,
+    forbidden_function: &str,
+    source: &str,
+) {
+    let fixture = CompileFixture::new(fixture_name, dependency_feature, source);
+    let output = fixture.check();
+    assert!(
+        !output.status.success(),
+        "the forbidden provider boundaries compiled under {dependency_feature}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let named_constructor = format!("`{forbidden_constructor}`");
+    let constructor_missing = stderr.match_indices("error[E0599]").any(|(start, _)| {
+        let diagnostic_tail = &stderr[start..];
+        let end = [
+            diagnostic_tail.find("\n\n"),
+            diagnostic_tail.find("\nnote:"),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(diagnostic_tail.len());
+        let diagnostic = &diagnostic_tail[..end];
+
+        (diagnostic.contains("no function or associated item named")
+            || diagnostic.contains("no associated function or constant named"))
+            && diagnostic.contains(&named_constructor)
+            && diagnostic.contains("for struct `BinanceProvider`")
+    });
+    let named_function = format!("`{forbidden_function}`");
+    let websocket_missing = stderr.match_indices("error[E0425]").any(|(start, _)| {
+        let diagnostic_tail = &stderr[start..];
+        let end = [
+            diagnostic_tail.find("\n\n"),
+            diagnostic_tail.find("\nnote:"),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(diagnostic_tail.len());
+        let diagnostic = &diagnostic_tail[..end];
+
+        diagnostic.contains("cannot find function")
+            && diagnostic.contains(&named_function)
+            && diagnostic.contains("in module `fccli::provider::binance`")
+    });
+    assert!(
+        constructor_missing && websocket_missing,
+        "combined fixture did not independently prove the missing {forbidden_constructor} constructor and {forbidden_function} WebSocket function:\n{stderr}"
+    );
+}
 
 #[cfg(feature = "test-transport")]
 #[test]
@@ -193,6 +248,58 @@ fn production_transport_cannot_connect_the_loopback_test_websocket() {
         r#"
 fn main() {
     let _ = fccli::provider::binance::connect_test_websocket();
+}
+"#,
+    );
+}
+
+#[test]
+fn combined_production_constructors_are_unnameable() {
+    #[cfg(feature = "test-transport")]
+    assert_combined_provider_boundaries_are_compiled_out(
+        "test-registry-cannot-use-production-provider",
+        "test-transport",
+        "new",
+        "connect_websocket",
+        r#"
+use std::sync::Arc;
+
+use fccli::{
+    clock::SystemClock,
+    provider::{ProviderRegistry, binance::BinanceProvider},
+};
+
+fn main() {
+    let provider = Arc::new(
+        BinanceProvider::new(Arc::new(SystemClock)).expect("production provider"),
+    );
+    let _registry = ProviderRegistry::new(provider);
+    let _socket = fccli::provider::binance::connect_websocket();
+}
+"#,
+    );
+
+    #[cfg(feature = "production-transport")]
+    assert_combined_provider_boundaries_are_compiled_out(
+        "production-registry-cannot-use-test-provider",
+        "production-transport",
+        "new_test_live",
+        "connect_test_websocket",
+        r#"
+use std::sync::Arc;
+
+use fccli::{
+    clock::SystemClock,
+    provider::{ProviderRegistry, binance::BinanceProvider},
+};
+
+fn main() {
+    let provider = Arc::new(
+        BinanceProvider::new_test_live(todo!(), Arc::new(SystemClock))
+            .expect("test provider"),
+    );
+    let _registry = ProviderRegistry::new(provider);
+    let _socket = fccli::provider::binance::connect_test_websocket();
 }
 "#,
     );

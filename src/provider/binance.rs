@@ -3,19 +3,25 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
 
-use futures_util::{Sink, Stream, stream};
+use futures_util::{FutureExt, Sink, Stream, stream};
 use reqwest::{Client, StatusCode, Url, header::RETRY_AFTER};
 use serde::{
     Deserialize,
     de::{IgnoredAny, SeqAccess, Visitor},
 };
 use serde_json::Value;
-use tokio::{net::TcpStream, sync::mpsc};
+use tokio::{
+    net::TcpStream,
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc},
+};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
     tungstenite::{
@@ -34,13 +40,14 @@ use crate::{
         SanitizedMessage, TimeoutKind,
     },
     model::{
-        Candle, ConnectionStatus, GapGeneration, HistoryRequest, Instrument, InstrumentSpec,
-        MarketEvent, MonoInstant, ProcessBlocker, ProviderId, RateGateState, ReplayRevision,
-        Timeframe,
+        Candle, ConnectionStatus, FinalityAuthority, GapGeneration, HistoryRequest, Instrument,
+        InstrumentSpec, MarketEvent, MonoInstant, ProcessBlocker, ProviderId, RateGateState,
+        ReplayRevision, Timeframe,
     },
     provider::{
         LiveFeed, LiveRequest, MarketDataProvider, ProviderFuture, RateGateSender,
-        RateGateSnapshot, ReconcileAck, ReconcileExpectation, rate_gate_channel,
+        RateGateSnapshot, ReconcileAck, ReconcileExpectation, ReconcileExpectationError,
+        rate_gate_channel,
     },
 };
 
@@ -82,6 +89,8 @@ pub struct LiveSupervisorConfig {
     pub reconcile_ack_timeout: Duration,
     pub max_connection_age: Duration,
     pub ws_config: WsConfig,
+    #[cfg(feature = "test-transport")]
+    pub stalled_write_probe_frames: usize,
 }
 
 impl Default for LiveSupervisorConfig {
@@ -94,6 +103,8 @@ impl Default for LiveSupervisorConfig {
             reconcile_ack_timeout: RECONCILE_ACK_TIMEOUT,
             max_connection_age: MAX_CONNECTION_AGE,
             ws_config: WsConfig::default(),
+            #[cfg(feature = "test-transport")]
+            stalled_write_probe_frames: 0,
         }
     }
 }
@@ -110,6 +121,12 @@ impl LiveSupervisorConfig {
                     "live supervisor capacity is outside 1..=65536",
                 ));
             }
+        }
+        #[cfg(feature = "test-transport")]
+        if self.stalled_write_probe_frames > MAX_SUPERVISOR_CAPACITY {
+            return Err(ProviderError::Configuration(
+                "live supervisor stalled-write probe is outside 0..=65536",
+            ));
         }
         for timeout in [self.first_kline_timeout, self.reconcile_ack_timeout] {
             if !(Duration::from_millis(1)..=Duration::from_secs(60)).contains(&timeout) {
@@ -373,6 +390,17 @@ fn decode_ws_payload(
     };
     if envelope.event.as_deref() == Some("serverShutdown") {
         return DecodedFrame::ServerShutdown;
+    }
+    if envelope.code == Some(-1121) {
+        return DecodedFrame::ProviderError(ProviderError::InvalidSymbol {
+            context,
+            code: -1121,
+            message: envelope
+                .msg
+                .as_deref()
+                .map(SanitizedMessage::new)
+                .unwrap_or(SanitizedMessage::InvalidSymbol),
+        });
     }
     if envelope.code.is_some() || envelope.msg.is_some() {
         return DecodedFrame::ProviderError(ProviderError::Protocol {
@@ -1189,18 +1217,13 @@ impl BinanceProvider {
     async fn supervise_live(
         self,
         mut request: LiveRequest,
-        sender: mpsc::Sender<Result<MarketEvent, ProviderError>>,
+        sender: EventEmitter,
     ) -> Result<(), ProviderError> {
         let mut generation_number = 0_u64;
         let mut backoff_index = 0_usize;
         loop {
             if request.cancellation.is_cancelled() {
-                let _ = sender
-                    .send(Ok(MarketEvent::Status {
-                        generation: None,
-                        status: ConnectionStatus::Stopped,
-                    }))
-                    .await;
+                sender.shutdown().await;
                 return Ok(());
             }
             if matches!(
@@ -1223,12 +1246,45 @@ impl BinanceProvider {
                 },
             )
             .await?;
-            let mut socket = match self
-                .connect_live_socket(&request.instrument, request.timeframe)
-                .await
-            {
+            let connect_result = {
+                let connect_instrument = request.instrument.clone();
+                let connect_timeframe = request.timeframe;
+                let connect = self.connect_live_socket(&connect_instrument, connect_timeframe);
+                tokio::pin!(connect);
+                let mut gate = self.gate_snapshot.clone();
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = request.cancellation.cancelled() => {
+                            sender.shutdown().await;
+                            return Ok(());
+                        }
+                        changed = request.accepted_watermark_rx.changed() => {
+                            if changed.is_err() {
+                                break Err(control_channel_closed(&request.instrument, request.timeframe));
+                            }
+                        }
+                        ack = request.reconcile_ack_rx.changed() => {
+                            if ack.is_err() {
+                                break Err(control_channel_closed(&request.instrument, request.timeframe));
+                            }
+                        }
+                        changed = gate.changed() => match changed {
+                            Err(_) => break Err(ProviderError::Invariant("rate gate closed")),
+                            Ok(RateGateState::ProcessBlocked(_)) => {
+                                self.send_invalid_ban_and_stop(&sender).await;
+                                return Err(ProviderError::InvalidBanExpiry);
+                            }
+                            Ok(RateGateState::Open | RateGateState::TimedUntil(_)) => {}
+                        },
+                        result = &mut connect => break result,
+                    }
+                }
+            };
+            let mut socket = match connect_result {
                 Ok(socket) => socket,
                 Err(error) if is_terminal_live_error(&error) => {
+                    sender.invalidate_generation(generation);
                     send_market(
                         &sender,
                         &request.cancellation,
@@ -1238,9 +1294,10 @@ impl BinanceProvider {
                     return Err(error);
                 }
                 Err(error) => {
+                    sender.invalidate_generation(generation);
                     self.recover_and_backoff(
                         &sender,
-                        &request.cancellation,
+                        &mut request,
                         Some(generation),
                         error,
                         &mut backoff_index,
@@ -1254,21 +1311,22 @@ impl BinanceProvider {
             let outcome = self
                 .run_generation(&mut request, &sender, &mut socket, generation, age_deadline)
                 .await;
+            drop(socket);
+            if !matches!(&outcome, Ok(GenerationOutcome::Cancelled)) {
+                sender.invalidate_generation(generation);
+            }
             match outcome {
                 Ok(GenerationOutcome::Cancelled) => {
-                    let _ = sender
-                        .send(Ok(MarketEvent::Status {
-                            generation: Some(generation),
-                            status: ConnectionStatus::Stopped,
-                        }))
-                        .await;
+                    sender.shutdown().await;
                     return Ok(());
                 }
                 Ok(GenerationOutcome::AcknowledgedReconnect(error)) => {
-                    backoff_index = 0;
+                    if sender.connected_delivered(generation) {
+                        backoff_index = 0;
+                    }
                     self.recover_and_backoff(
                         &sender,
-                        &request.cancellation,
+                        &mut request,
                         Some(generation),
                         error,
                         &mut backoff_index,
@@ -1278,7 +1336,7 @@ impl BinanceProvider {
                 Ok(GenerationOutcome::Reconnect(error)) => {
                     self.recover_and_backoff(
                         &sender,
-                        &request.cancellation,
+                        &mut request,
                         Some(generation),
                         error,
                         &mut backoff_index,
@@ -1301,7 +1359,7 @@ impl BinanceProvider {
                 Err(error) => {
                     self.recover_and_backoff(
                         &sender,
-                        &request.cancellation,
+                        &mut request,
                         Some(generation),
                         error,
                         &mut backoff_index,
@@ -1315,7 +1373,7 @@ impl BinanceProvider {
     async fn run_generation(
         &self,
         request: &mut LiveRequest,
-        sender: &mpsc::Sender<Result<MarketEvent, ProviderError>>,
+        sender: &EventEmitter,
         socket: &mut RawWebSocket,
         generation: GapGeneration,
         age_deadline: MonoInstant,
@@ -1329,19 +1387,50 @@ impl BinanceProvider {
             },
         )
         .await?;
+        #[cfg(feature = "test-transport")]
+        if self.live.stalled_write_probe_frames != 0 {
+            let payload_size = self
+                .live
+                .ws_config
+                .write_buffer_size
+                .min(self.live.ws_config.max_frame_size)
+                .min(self.live.ws_config.max_message_size)
+                .max(1);
+            let payload = Message::Binary(vec![0; payload_size].into());
+            for _ in 0..self.live.stalled_write_probe_frames {
+                tokio::select! {
+                    biased;
+                    () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
+                    result = socket.send(payload.clone()) => result?,
+                }
+            }
+        }
+        let mut gate = self.gate_snapshot.clone();
         let first_deadline = checked_deadline(self.clock.now(), self.live.first_kline_timeout)
             .map_err(|_| ProviderError::Invariant("first-kline deadline overflow"))?;
         let first = loop {
             tokio::select! {
                 biased;
                 () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
+                changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
+                ack = request.reconcile_ack_rx.changed() => { ack.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
+                changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::InvalidBanExpiry); },
                 frame = socket.read() => match frame? {
                     DecodedFrame::Candle(candle) => break candle,
-                    DecodedFrame::Ignored => {}
+                    DecodedFrame::Ignored => {
+                        let now = self.clock.now();
+                        if now >= first_deadline {
+                            return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), kind: TimeoutKind::FirstKline }));
+                        }
+                        if now >= age_deadline {
+                            return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached")));
+                        }
+                    }
                     DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => return Ok(GenerationOutcome::Reconnect(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" })),
                     DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
                     DecodedFrame::ProviderError(error) => return Ok(GenerationOutcome::Reconnect(error)),
                 },
+                () = self.clock.sleep_until(age_deadline) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached"))),
                 () = self.clock.sleep_until(first_deadline) => {
                     return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), kind: TimeoutKind::FirstKline }));
                 }
@@ -1354,85 +1443,261 @@ impl BinanceProvider {
                 context: ErrorContext::operation(ErrorOperation::Reconciliation)
                     .with_market(&request.instrument, request.timeframe),
             })?
-            .or(request.startup_watermark);
+            .max(request.startup_watermark);
         let start = confirmed.unwrap_or_else(|| first.open_time());
-        let mut target = first.open_time().max(start);
+        let mut target_open_time = first.open_time().max(start);
         let mut revision = ReplayRevision(1);
         let mut buffered = BTreeMap::new();
-        buffered.insert(first.open_time(), first);
+        if first.open_time() >= start {
+            coalesce_candle(&mut buffered, first);
+        }
         let mut deferred_reconnect: Option<ProviderError> = None;
+        let mut rest_synced_through = None;
 
         loop {
-            let mut cursor = start;
-            let mut page_candles = Vec::new();
-            while cursor <= target {
-                let history_request = HistoryRequest::gap(cursor, target, GAP_PAGE_LIMIT)
-                    .map_err(|_| ProviderError::Invariant("invalid gap history request"))?;
-                let history_cancel = request.cancellation.child_token();
-                let history = self.history(
-                    &request.instrument,
-                    request.timeframe,
-                    history_request,
-                    history_cancel,
-                );
-                tokio::pin!(history);
-                let page = loop {
-                    tokio::select! {
-                        biased;
-                        () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
-                        page = &mut history => break page,
-                        frame = socket.read(), if deferred_reconnect.is_none() => match frame? {
-                            DecodedFrame::Candle(candle) => {
-                                revision.0 = revision.0.checked_add(1).ok_or(ProviderError::Invariant("replay revision overflow"))?;
-                                target = target.max(candle.open_time());
-                                buffered.insert(candle.open_time(), candle);
-                            }
-                            DecodedFrame::Ignored => {}
-                            DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => deferred_reconnect = Some(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" }),
-                            DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
-                            DecodedFrame::ProviderError(error) => deferred_reconnect = Some(error),
-                        },
+            let mut cursor = match rest_synced_through {
+                Some(last) => next_gap_cursor(request.timeframe, last)?,
+                None => start,
+            };
+            while cursor <= target_open_time {
+                let request_target = target_open_time;
+                let history_request =
+                    HistoryRequest::gap(cursor, request_target, GAP_PAGE_LIMIT)
+                        .map_err(|_| ProviderError::Invariant("invalid gap history request"))?;
+                let page = {
+                    let history_instrument = request.instrument.clone();
+                    let history_timeframe = request.timeframe;
+                    let history_cancel = request.cancellation.child_token();
+                    let history = self.history(
+                        &history_instrument,
+                        history_timeframe,
+                        history_request,
+                        history_cancel,
+                    );
+                    tokio::pin!(history);
+                    enum ReconcileWake {
+                        Cancelled,
+                        AcceptedWatermark(Result<Option<i64>, ProviderError>),
+                        Ack(Result<(), ProviderError>),
+                        ConnectionAged,
+                        Gate(Result<RateGateState, ProviderError>),
+                        Socket(Result<DecodedFrame, ProviderError>),
+                        Page(Result<Vec<Candle>, ProviderError>),
                     }
-                }?;
+
+                    loop {
+                        if request.cancellation.is_cancelled() {
+                            return Ok(GenerationOutcome::Cancelled);
+                        }
+                        let wake = tokio::select! {
+                            () = request.cancellation.cancelled() => ReconcileWake::Cancelled,
+                            changed = request.accepted_watermark_rx.changed() => ReconcileWake::AcceptedWatermark(changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))),
+                            ack = request.reconcile_ack_rx.changed() => ReconcileWake::Ack(ack.map(|_| ()).map_err(|_| control_channel_closed(&request.instrument, request.timeframe))),
+                            () = self.clock.sleep_until(age_deadline) => ReconcileWake::ConnectionAged,
+                            changed = gate.changed() => ReconcileWake::Gate(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))),
+                            frame = socket.read() => ReconcileWake::Socket(frame),
+                            page = &mut history => ReconcileWake::Page(page),
+                        };
+                        if request.cancellation.is_cancelled() {
+                            return Ok(GenerationOutcome::Cancelled);
+                        }
+                        match wake {
+                            ReconcileWake::Cancelled => return Ok(GenerationOutcome::Cancelled),
+                            ReconcileWake::AcceptedWatermark(changed) => {
+                                if let Some(watermark) = changed? {
+                                    target_open_time = target_open_time.max(watermark);
+                                }
+                            }
+                            ReconcileWake::Ack(changed) => changed?,
+                            ReconcileWake::ConnectionAged => {
+                                return Ok(GenerationOutcome::Reconnect(live_protocol_error(
+                                    request,
+                                    "24-hour WebSocket connection age reached",
+                                )));
+                            }
+                            ReconcileWake::Gate(changed) => {
+                                if matches!(changed?, RateGateState::ProcessBlocked(_)) {
+                                    return Err(ProviderError::InvalidBanExpiry);
+                                }
+                            }
+                            ReconcileWake::Socket(frame) => match frame {
+                                Ok(DecodedFrame::Candle(candle)) => {
+                                    apply_reconciliation_candle(
+                                        &mut buffered,
+                                        candle,
+                                        &mut revision,
+                                        &mut target_open_time,
+                                    )?;
+                                }
+                                Ok(DecodedFrame::Ignored) => {}
+                                Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => {
+                                    return Ok(GenerationOutcome::Reconnect(live_protocol_error(
+                                        request,
+                                        "WebSocket peer requested reconnect",
+                                    )));
+                                }
+                                Ok(DecodedFrame::ProviderError(error))
+                                    if is_terminal_live_error(&error) =>
+                                {
+                                    return Err(error);
+                                }
+                                Err(error) if is_terminal_live_error(&error) => return Err(error),
+                                Ok(DecodedFrame::ProviderError(error)) | Err(error) => {
+                                    return Ok(GenerationOutcome::Reconnect(error));
+                                }
+                            },
+                            ReconcileWake::Page(page) => {
+                                if request.cancellation.is_cancelled() {
+                                    return Ok(GenerationOutcome::Cancelled);
+                                }
+                                let terminal = async {
+                                tokio::select! {
+                                    biased;
+                                    () = request.cancellation.cancelled() => Ok((Some(GenerationOutcome::Cancelled), false)),
+                                    changed = request.accepted_watermark_rx.changed() => changed
+                                        .map(|watermark| {
+                                            if let Some(watermark) = watermark {
+                                                target_open_time = target_open_time.max(watermark);
+                                            }
+                                            (None, true)
+                                        })
+                                        .map_err(|_| control_channel_closed(&request.instrument, request.timeframe)),
+                                    ack = request.reconcile_ack_rx.changed() => ack
+                                        .map(|_| (None, false))
+                                        .map_err(|_| control_channel_closed(&request.instrument, request.timeframe)),
+                                    () = self.clock.sleep_until(age_deadline) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached"))), false)),
+                                    changed = gate.changed() => match changed {
+                                        Ok(RateGateState::ProcessBlocked(_)) => Err(ProviderError::InvalidBanExpiry),
+                                        Ok(_) => Ok((None, false)),
+                                        Err(_) => Err(ProviderError::Invariant("rate gate closed")),
+                                    },
+                                    frame = socket.read() => match frame {
+                                        Ok(DecodedFrame::Candle(candle)) => {
+                                            apply_reconciliation_candle(&mut buffered, candle, &mut revision, &mut target_open_time)?;
+                                            Ok((None, false))
+                                        }
+                                        Ok(DecodedFrame::Ignored) => Ok((None, false)),
+                                        Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))), false)),
+                                        Ok(DecodedFrame::ProviderError(error)) | Err(error) if is_terminal_live_error(&error) => Err(error),
+                                        Ok(DecodedFrame::ProviderError(error)) | Err(error) => Ok((Some(GenerationOutcome::Reconnect(error)), false)),
+                                    },
+                                }
+                            }
+                            .now_or_never()
+                            .transpose()?;
+                                if request.cancellation.is_cancelled() {
+                                    return Ok(GenerationOutcome::Cancelled);
+                                }
+                                let watermark_consumed = match terminal {
+                                    Some((Some(outcome), _)) => return Ok(outcome),
+                                    Some((None, true)) => true,
+                                    _ => false,
+                                };
+                                if watermark_consumed {
+                                    let follow_up = async {
+                                    tokio::select! {
+                                        biased;
+                                        () = request.cancellation.cancelled() => Ok(Some(GenerationOutcome::Cancelled)),
+                                        frame = socket.read() => match frame {
+                                            Ok(DecodedFrame::Candle(candle)) => {
+                                                apply_reconciliation_candle(&mut buffered, candle, &mut revision, &mut target_open_time)?;
+                                                Ok(None)
+                                            }
+                                            Ok(DecodedFrame::Ignored) => Ok(None),
+                                            Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect")))),
+                                            Ok(DecodedFrame::ProviderError(error)) | Err(error) if is_terminal_live_error(&error) => Err(error),
+                                            Ok(DecodedFrame::ProviderError(error)) | Err(error) => Ok(Some(GenerationOutcome::Reconnect(error))),
+                                        },
+                                        () = self.clock.sleep_until(age_deadline) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached")))),
+                                        changed = gate.changed() => match changed {
+                                            Ok(RateGateState::ProcessBlocked(_)) => Err(ProviderError::InvalidBanExpiry),
+                                            Ok(_) => Ok(None),
+                                            Err(_) => Err(ProviderError::Invariant("rate gate closed")),
+                                        },
+                                        ack = request.reconcile_ack_rx.changed() => ack
+                                            .map(|_| None)
+                                            .map_err(|_| control_channel_closed(&request.instrument, request.timeframe)),
+                                    }
+                                }
+                                .now_or_never()
+                                .transpose()?;
+                                    if request.cancellation.is_cancelled() {
+                                        return Ok(GenerationOutcome::Cancelled);
+                                    }
+                                    if let Some(Some(outcome)) = follow_up {
+                                        return Ok(outcome);
+                                    }
+                                }
+                                break page;
+                            }
+                        }
+                    }
+                };
+                let page = page?;
                 let last = page.last().map(Candle::open_time);
-                if page.is_empty() || last.is_some_and(|value| value < cursor) {
+                if page.is_empty() {
+                    if confirmed.is_none() && cursor == start {
+                        break;
+                    }
                     return Ok(GenerationOutcome::Reconnect(
                         ProviderError::GapSyncNoProgress {
-                            target_open_time: target,
+                            target_open_time: request_target,
+                            last_open_time: None,
+                        },
+                    ));
+                }
+                if last.is_some_and(|value| value < cursor) {
+                    return Ok(GenerationOutcome::Reconnect(
+                        ProviderError::GapSyncNoProgress {
+                            target_open_time: request_target,
                             last_open_time: last,
                         },
                     ));
                 }
                 let page_len = page.len();
-                page_candles.extend(page);
+                let mut accepted_any = false;
+                for candle in page {
+                    accepted_any |= coalesce_candle(&mut buffered, candle);
+                }
                 let Some(last) = last else { unreachable!() };
-                if last >= target {
+                rest_synced_through = Some(last);
+                if last >= target_open_time {
                     break;
                 }
-                if page_len < usize::from(GAP_PAGE_LIMIT) {
+                if last < request_target && page_len < usize::from(GAP_PAGE_LIMIT) {
                     return Ok(GenerationOutcome::Reconnect(
                         ProviderError::GapSyncNoProgress {
-                            target_open_time: target,
+                            target_open_time: request_target,
                             last_open_time: Some(last),
                         },
                     ));
                 }
-                cursor = checked_next_millis(last)?;
+                if !accepted_any && last < request_target {
+                    return Ok(GenerationOutcome::Reconnect(
+                        ProviderError::GapSyncNoProgress {
+                            target_open_time: request_target,
+                            last_open_time: Some(last),
+                        },
+                    ));
+                }
+                cursor = next_gap_cursor(request.timeframe, last)?;
             }
-            page_candles.extend(buffered.values().cloned());
-            page_candles.sort_by_key(Candle::open_time);
-            page_candles.dedup_by_key(|candle| candle.open_time());
+            let page_candles = buffered.values().cloned().collect();
             let expected = ReconcileExpectation {
                 generation,
                 revision,
-                target_open_time: target,
+                target_open_time,
             };
             request
                 .reconcile_ack_rx
                 .register_expectation(expected)
-                .map_err(|_| ProviderError::ChannelClosed {
-                    context: ErrorContext::operation(ErrorOperation::Reconciliation)
-                        .with_market(&request.instrument, request.timeframe),
+                .map_err(|error| match error {
+                    ReconcileExpectationError::Closed => {
+                        control_channel_closed(&request.instrument, request.timeframe)
+                    }
+                    ReconcileExpectationError::Regression | ReconcileExpectationError::Conflict => {
+                        ProviderError::Invariant("reconciliation expectation invariant violated")
+                    }
                 })?;
             send_market(
                 sender,
@@ -1440,7 +1705,7 @@ impl BinanceProvider {
                 MarketEvent::ReconcileBatch {
                     generation,
                     revision,
-                    target_open_time: target,
+                    target_open_time,
                     candles: page_candles,
                 },
             )
@@ -1451,28 +1716,62 @@ impl BinanceProvider {
                 tokio::select! {
                     biased;
                     () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
+                    changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
+                    () = self.clock.sleep_until(age_deadline) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached"))),
+                    changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::InvalidBanExpiry); },
                     frame = socket.read(), if deferred_reconnect.is_none() => match frame? {
-                        DecodedFrame::Candle(candle) => { revision.0 = revision.0.checked_add(1).ok_or(ProviderError::Invariant("replay revision overflow"))?; target = target.max(candle.open_time()); buffered.insert(candle.open_time(), candle); break; }
-                        DecodedFrame::Ignored => {}
-                        DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => deferred_reconnect = Some(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" }),
+                        DecodedFrame::Candle(candle) => {
+                            apply_reconciliation_candle(&mut buffered, candle, &mut revision, &mut target_open_time)?;
+                            break;
+                        }
+                        DecodedFrame::Ignored => {
+                            if let Some(ack) = request
+                                .reconcile_ack_rx
+                                .current()
+                                .map_err(|_| {
+                                    control_channel_closed(&request.instrument, request.timeframe)
+                                })?
+                                && ack.generation == generation
+                                && ack.revision == revision
+                                && ack.through >= target_open_time
+                            {
+                                return if let Some(error) = deferred_reconnect.take() {
+                                    Ok(GenerationOutcome::Reconnect(error))
+                                } else {
+                                    self.connected_loop(request, sender, socket, generation, age_deadline).await
+                                };
+                            }
+                            if self.clock.now() >= ack_deadline {
+                                return Ok(GenerationOutcome::Reconnect(ProviderError::ReconcileAckTimeout { generation, revision, target_open_time }));
+                            }
+                        }
+                        DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))),
                         DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
                         DecodedFrame::ProviderError(error) => deferred_reconnect = Some(error),
                     },
                     ack = request.reconcile_ack_rx.changed() => {
                         let ReconcileAck { generation: ack_generation, revision: ack_revision, through } = ack.map_err(|_| ProviderError::ChannelClosed { context: ErrorContext::operation(ErrorOperation::Reconciliation).with_market(&request.instrument, request.timeframe) })?;
-                        if ack_generation == generation && ack_revision == revision && through >= target {
-                            send_market(sender, &request.cancellation, MarketEvent::Status { generation: Some(generation), status: ConnectionStatus::Connected }).await?;
-                            if let Some(error) = deferred_reconnect.take() { return Ok(GenerationOutcome::AcknowledgedReconnect(error)); }
-                            return self.connected_loop(request, sender, socket, generation, age_deadline).await;
+                        if ack_generation == generation && ack_revision == revision && through >= target_open_time {
+                            return if let Some(error) = deferred_reconnect.take() {
+                                Ok(GenerationOutcome::Reconnect(error))
+                            } else {
+                                self.connected_loop(request, sender, socket, generation, age_deadline).await
+                            };
                         }
                     },
                     () = self.clock.sleep_until(ack_deadline) => {
-                        if let Ok(Some(ack)) = request.reconcile_ack_rx.current() && ack.generation == generation && ack.revision == revision && ack.through >= target {
-                            send_market(sender, &request.cancellation, MarketEvent::Status { generation: Some(generation), status: ConnectionStatus::Connected }).await?;
-                            if let Some(error) = deferred_reconnect.take() { return Ok(GenerationOutcome::AcknowledgedReconnect(error)); }
-                            return self.connected_loop(request, sender, socket, generation, age_deadline).await;
+                        if let Ok(Some(ack)) = request.reconcile_ack_rx.current()
+                            && ack.generation == generation
+                            && ack.revision == revision
+                            && ack.through >= target_open_time
+                        {
+                            return if let Some(error) = deferred_reconnect.take() {
+                                Ok(GenerationOutcome::Reconnect(error))
+                            } else {
+                                self.connected_loop(request, sender, socket, generation, age_deadline).await
+                            };
                         }
-                        return Ok(GenerationOutcome::Reconnect(ProviderError::ReconcileAckTimeout { generation, revision, target_open_time: target }));
+                        return Ok(GenerationOutcome::Reconnect(ProviderError::ReconcileAckTimeout { generation, revision, target_open_time }));
                     }
                 }
             }
@@ -1482,64 +1781,102 @@ impl BinanceProvider {
     async fn connected_loop(
         &self,
         request: &mut LiveRequest,
-        sender: &mpsc::Sender<Result<MarketEvent, ProviderError>>,
+        sender: &EventEmitter,
         socket: &mut RawWebSocket,
         generation: GapGeneration,
         age_deadline: MonoInstant,
     ) -> Result<GenerationOutcome, ProviderError> {
+        let mut connected_queued = false;
+        let mut pending = BTreeMap::<i64, Candle>::new();
+        let mut gate = self.gate_snapshot.clone();
         loop {
+            if matches!(gate.current(), Ok(RateGateState::ProcessBlocked(_))) {
+                return Err(ProviderError::InvalidBanExpiry);
+            }
             tokio::select! {
                 biased;
                 () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
-                () = self.clock.sleep_until(age_deadline) => return Ok(GenerationOutcome::AcknowledgedReconnect(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::LiveFeed).with_market(&request.instrument, request.timeframe), detail: "24-hour WebSocket connection age reached" })),
-                changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| ProviderError::ChannelClosed { context: ErrorContext::operation(ErrorOperation::Reconciliation).with_market(&request.instrument, request.timeframe) })?; }
-                frame = socket.read() => match frame? {
-                    DecodedFrame::Candle(candle) => send_market(sender, &request.cancellation, MarketEvent::Candle { generation, candle }).await?,
-                    DecodedFrame::Ignored => {}
-                    DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => return Ok(GenerationOutcome::AcknowledgedReconnect(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" })),
-                    DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
-                    DecodedFrame::ProviderError(error) => return Ok(GenerationOutcome::AcknowledgedReconnect(error)),
-                }
+                changed = gate.changed() => match changed.map_err(|_| ProviderError::Invariant("rate gate closed"))? {
+                    RateGateState::ProcessBlocked(_) => return Err(ProviderError::InvalidBanExpiry),
+                    RateGateState::Open | RateGateState::TimedUntil(_) => {}
+                },
+                changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
+                ack = request.reconcile_ack_rx.changed() => { ack.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
+                result = send_market(sender, &request.cancellation, MarketEvent::Status { generation: Some(generation), status: ConnectionStatus::Connected }), if !connected_queued => {
+                    result?;
+                    connected_queued = true;
+                },
+                permit = sender.reserve_regular(), if connected_queued && !pending.is_empty() => {
+                    let permit = permit?;
+                    let key = *pending.first_key_value().expect("pending is nonempty").0;
+                    let candle = pending.remove(&key).expect("key came from pending");
+                    sender.send_reserved(permit, MarketEvent::Candle { generation, candle })?;
+                },
+                frame = socket.read() => {
+                    if self.clock.now() >= age_deadline {
+                        let error = live_protocol_error(request, "24-hour WebSocket connection age reached");
+                        return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
+                    }
+                    match frame {
+                        Ok(DecodedFrame::Candle(candle)) => {
+                            let is_new_key = !pending.contains_key(&candle.open_time());
+                            if is_new_key && pending.len() == self.live.keyed_candle_capacity {
+                                let outcome = ProviderError::QueueSaturated;
+                                return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(outcome) } else { GenerationOutcome::Reconnect(outcome) });
+                            }
+                            coalesce_candle(&mut pending, candle);
+                        }
+                        Ok(DecodedFrame::Ignored) => {}
+                        Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => {
+                            let error = live_protocol_error(request, "WebSocket peer requested reconnect");
+                            return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
+                        }
+                        Ok(DecodedFrame::ProviderError(error)) if is_terminal_live_error(&error) => return Err(error),
+                        Err(error) if is_terminal_live_error(&error) => return Err(error),
+                        Ok(DecodedFrame::ProviderError(error)) | Err(error) => {
+                            return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
+                        }
+                    }
+                },
+                () = self.clock.sleep_until(age_deadline) => {
+                    let error = live_protocol_error(request, "24-hour WebSocket connection age reached");
+                    return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
+                },
             }
         }
     }
 
     async fn recover_and_backoff(
         &self,
-        sender: &mpsc::Sender<Result<MarketEvent, ProviderError>>,
-        cancellation: &CancellationToken,
+        sender: &EventEmitter,
+        request: &mut LiveRequest,
         generation: Option<GapGeneration>,
         error: ProviderError,
         backoff_index: &mut usize,
     ) -> Result<(), ProviderError> {
-        let gate_deadline = match self
-            .gate_snapshot
-            .current()
-            .map_err(|_| ProviderError::Invariant("rate gate closed"))?
-        {
-            RateGateState::ProcessBlocked(_) => return Err(ProviderError::InvalidBanExpiry),
-            RateGateState::TimedUntil(deadline) => Some(deadline),
-            RateGateState::Open => None,
+        let cancellation = request.cancellation.clone();
+        let mut gate = self.gate_snapshot.clone();
+        let initial_gate = match gate.current() {
+            Ok(state) => state,
+            Err(_) => {
+                let error = ProviderError::Invariant("rate gate closed");
+                send_market(
+                    sender,
+                    &cancellation,
+                    MarketEvent::TerminalError(error.clone()),
+                )
+                .await?;
+                return Err(error);
+            }
         };
-        send_market(
-            sender,
-            cancellation,
-            MarketEvent::RecoverableError {
-                generation,
-                error,
-                rate_gate_deadline: gate_deadline,
-            },
-        )
-        .await?;
-        send_market(
-            sender,
-            cancellation,
-            MarketEvent::Status {
-                generation,
-                status: ConnectionStatus::Backoff,
-            },
-        )
-        .await?;
+        if matches!(initial_gate, RateGateState::ProcessBlocked(_)) {
+            self.send_invalid_ban_and_stop(sender).await;
+            return Err(ProviderError::InvalidBanExpiry);
+        }
+        let gate_deadline = match initial_gate {
+            RateGateState::TimedUntil(deadline) => Some(deadline),
+            RateGateState::Open | RateGateState::ProcessBlocked(_) => None,
+        };
         let seconds = [1_u64, 2, 4, 8, 16, 30]
             .get(*backoff_index)
             .copied()
@@ -1547,28 +1884,109 @@ impl BinanceProvider {
         *backoff_index = backoff_index.saturating_add(1);
         let backoff = checked_deadline(self.clock.now(), Duration::from_secs(seconds))
             .map_err(|_| ProviderError::Invariant("backoff deadline overflow"))?;
-        let deadline = gate_deadline.map_or(backoff, |gate| gate.max(backoff));
-        tokio::select! { biased; () = cancellation.cancelled() => Ok(()), () = self.clock.sleep_until(deadline) => Ok(()) }
+        let mut deadline = gate_deadline.map_or(backoff, |value| value.max(backoff));
+        let queue_saturated = matches!(&error, ProviderError::QueueSaturated);
+        let control_generation = if queue_saturated { None } else { generation };
+        let recoverable = MarketEvent::RecoverableError {
+            generation: control_generation,
+            error,
+            rate_gate_deadline: gate_deadline,
+        };
+        let backoff_status = MarketEvent::Status {
+            generation: control_generation,
+            status: ConnectionStatus::Backoff,
+        };
+        let emergency_barrier = if queue_saturated {
+            if let Some(generation) = generation {
+                sender.invalidate_generation(generation);
+            }
+            Some(sender.queue_emergency_pair(recoverable, backoff_status)?)
+        } else {
+            send_market(sender, &cancellation, recoverable).await?;
+            send_market(sender, &cancellation, backoff_status).await?;
+            None
+        };
+        let mut deadline_elapsed = false;
+        loop {
+            let barrier_elapsed = emergency_barrier
+                .as_ref()
+                .is_none_or(|barrier| barrier.is_dequeued());
+            if deadline_elapsed && barrier_elapsed {
+                return Ok(());
+            }
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    sender.shutdown().await;
+                    return Ok(());
+                },
+                changed = request.accepted_watermark_rx.changed() => {
+                    if changed.is_err() {
+                        let error = control_channel_closed(&request.instrument, request.timeframe);
+                        send_market(sender, &cancellation, MarketEvent::TerminalError(error.clone())).await?;
+                        return Err(error);
+                    }
+                },
+                ack = request.reconcile_ack_rx.changed() => {
+                    if ack.is_err() {
+                        let error = control_channel_closed(&request.instrument, request.timeframe);
+                        send_market(sender, &cancellation, MarketEvent::TerminalError(error.clone())).await?;
+                        return Err(error);
+                    }
+                },
+                () = sender.wait_closed() => return Err(live_channel_closed()),
+                changed = gate.changed() => match changed {
+                    Err(_) => {
+                        let error = ProviderError::Invariant("rate gate closed");
+                        send_market(sender, &cancellation, MarketEvent::TerminalError(error.clone())).await?;
+                        return Err(error);
+                    }
+                    Ok(RateGateState::ProcessBlocked(_)) => {
+                        self.send_invalid_ban_and_stop(sender).await;
+                        return Err(ProviderError::InvalidBanExpiry);
+                    }
+                    Ok(RateGateState::TimedUntil(value)) => {
+                        deadline = deadline.max(value);
+                        deadline_elapsed = self.clock.now() >= deadline;
+                    }
+                    Ok(RateGateState::Open) => {}
+                },
+                () = self.clock.sleep_until(deadline), if !deadline_elapsed => {
+                    match gate.current() {
+                        Err(_) => {
+                            let error = ProviderError::Invariant("rate gate closed");
+                            send_market(sender, &cancellation, MarketEvent::TerminalError(error.clone())).await?;
+                            return Err(error);
+                        }
+                        Ok(RateGateState::ProcessBlocked(_)) => {
+                            self.send_invalid_ban_and_stop(sender).await;
+                            return Err(ProviderError::InvalidBanExpiry);
+                        }
+                        Ok(RateGateState::TimedUntil(value)) if value > deadline => deadline = value,
+                        Ok(RateGateState::Open | RateGateState::TimedUntil(_)) => deadline_elapsed = true,
+                    }
+                },
+                () = async { if let Some(barrier) = &emergency_barrier { barrier.wait_dequeued().await } }, if !barrier_elapsed => {}
+            }
+        }
     }
 
-    async fn send_invalid_ban_and_stop(
-        &self,
-        sender: &mpsc::Sender<Result<MarketEvent, ProviderError>>,
-    ) {
+    async fn send_invalid_ban_and_stop(&self, sender: &EventEmitter) {
         let _ = sender
-            .send(Ok(MarketEvent::RecoverableError {
-                generation: None,
-                error: ProviderError::InvalidBanExpiry,
-                rate_gate_deadline: None,
-            }))
-            .await;
-        let _ = sender
-            .send(Ok(MarketEvent::Status {
-                generation: None,
-                status: ConnectionStatus::Stopped,
-            }))
+            .queue_terminal_pair(
+                MarketEvent::RecoverableError {
+                    generation: None,
+                    error: ProviderError::InvalidBanExpiry,
+                    rate_gate_deadline: None,
+                },
+                MarketEvent::Status {
+                    generation: None,
+                    status: ConnectionStatus::Stopped,
+                },
+            )
             .await;
     }
+
     pub fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
         canonicalize_binance(spec)
             .map_err(|_| ProviderError::Configuration("instrument is not valid for Binance Spot"))
@@ -1586,18 +2004,528 @@ enum GenerationOutcome {
     Reconnect(ProviderError),
 }
 
+type StatusKey = (Option<GapGeneration>, ConnectionStatus);
+
+struct EventEnvelope {
+    item: Option<Result<MarketEvent, ProviderError>>,
+    generation: Option<GapGeneration>,
+    purge_on_invalidate: bool,
+    connected_delivered: Arc<AtomicU64>,
+    control_key: Option<StatusKey>,
+    pending_controls: Arc<Mutex<Vec<StatusKey>>>,
+    _regular_permit: Option<OwnedSemaphorePermit>,
+    _control_permit: Option<OwnedSemaphorePermit>,
+    emergency_slot: Option<u8>,
+    emergency_barrier: Option<Arc<EmergencyBarrier>>,
+}
+
+impl EventEnvelope {
+    fn into_item(mut self) -> Result<MarketEvent, ProviderError> {
+        let item = self.item.take().expect("event envelope contains an item");
+        if let Ok(MarketEvent::Status {
+            generation: Some(generation),
+            status: ConnectionStatus::Connected,
+        }) = &item
+        {
+            self.connected_delivered
+                .fetch_max(generation.0, Ordering::AcqRel);
+        }
+        item
+    }
+
+    fn is_stopped(&self) -> bool {
+        matches!(
+            self.item.as_ref(),
+            Some(Ok(MarketEvent::Status {
+                generation: None,
+                status: ConnectionStatus::Stopped,
+            }))
+        )
+    }
+}
+
+impl Drop for EventEnvelope {
+    fn drop(&mut self) {
+        if let Some(key) = self.control_key {
+            let mut pending = self
+                .pending_controls
+                .lock()
+                .expect("control mutex poisoned");
+            if let Some(index) = pending.iter().position(|pending_key| *pending_key == key) {
+                pending.swap_remove(index);
+            }
+        }
+        if let (Some(slot), Some(barrier)) = (self.emergency_slot, &self.emergency_barrier) {
+            barrier.dequeued(slot);
+        }
+    }
+}
+
+struct EmergencyBarrier {
+    pending: AtomicU8,
+    suppressed: AtomicU8,
+    notify: Notify,
+}
+
+impl EmergencyBarrier {
+    const fn new() -> Self {
+        Self {
+            pending: AtomicU8::new(0),
+            suppressed: AtomicU8::new(0),
+            notify: Notify::const_new(),
+        }
+    }
+
+    fn begin_pair(&self) -> Result<(), ProviderError> {
+        self.suppressed.store(0, Ordering::Release);
+        self.pending
+            .compare_exchange(0, 0b11, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| ProviderError::Invariant("emergency barrier already active"))
+    }
+
+    fn dequeued(&self, slot: u8) {
+        self.pending.fetch_and(!(1 << slot), Ordering::AcqRel);
+        self.notify.notify_one();
+    }
+
+    fn suppress_pending(&self) {
+        self.suppressed
+            .fetch_or(self.pending.load(Ordering::Acquire), Ordering::AcqRel);
+    }
+
+    fn begin_shutdown(&self) {
+        self.suppressed.store(0, Ordering::Release);
+        self.pending.store(0b01, Ordering::Release);
+    }
+
+    fn is_suppressed(&self, slot: u8) -> bool {
+        self.suppressed.load(Ordering::Acquire) & (1 << slot) != 0
+    }
+
+    fn is_dequeued(&self) -> bool {
+        self.pending.load(Ordering::Acquire) == 0
+    }
+
+    async fn wait_dequeued(&self) {
+        while !self.is_dequeued() {
+            let notified = self.notify.notified();
+            if self.is_dequeued() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct EventEmitter {
+    sender: mpsc::Sender<EventEnvelope>,
+    regular_permits: Arc<Semaphore>,
+    control_permits: Arc<Semaphore>,
+    invalidated_through: Arc<AtomicU64>,
+    connected_delivered: Arc<AtomicU64>,
+    pending_controls: Arc<Mutex<Vec<StatusKey>>>,
+    emergency_barrier: Arc<EmergencyBarrier>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl EventEmitter {
+    fn new(
+        sender: mpsc::Sender<EventEnvelope>,
+        regular_capacity: usize,
+        control_capacity: usize,
+    ) -> Self {
+        Self {
+            sender,
+            regular_permits: Arc::new(Semaphore::new(regular_capacity)),
+            control_permits: Arc::new(Semaphore::new(control_capacity)),
+            invalidated_through: Arc::new(AtomicU64::new(0)),
+            connected_delivered: Arc::new(AtomicU64::new(0)),
+            pending_controls: Arc::new(Mutex::new(Vec::new())),
+            emergency_barrier: Arc::new(EmergencyBarrier::new()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    async fn reserve_regular(&self) -> Result<OwnedSemaphorePermit, ProviderError> {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(live_channel_closed());
+        }
+        Arc::clone(&self.regular_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| live_channel_closed())
+    }
+
+    fn send_reserved(
+        &self,
+        permit: OwnedSemaphorePermit,
+        event: MarketEvent,
+    ) -> Result<(), ProviderError> {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(live_channel_closed());
+        }
+        let generation = event_generation(&event);
+        let purge_on_invalidate = event_purges_with_generation(&event);
+        self.sender
+            .try_send(EventEnvelope {
+                item: Some(Ok(event)),
+                generation,
+                purge_on_invalidate,
+                connected_delivered: Arc::clone(&self.connected_delivered),
+                control_key: None,
+                pending_controls: Arc::clone(&self.pending_controls),
+                _regular_permit: Some(permit),
+                _control_permit: None,
+                emergency_slot: None,
+                emergency_barrier: None,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Closed(_) => live_channel_closed(),
+                mpsc::error::TrySendError::Full(_) => {
+                    ProviderError::Invariant("reserved market event channel capacity exhausted")
+                }
+            })
+    }
+
+    async fn wait_closed(&self) {
+        self.sender.closed().await;
+    }
+
+    async fn send_regular(&self, event: MarketEvent) -> Result<(), ProviderError> {
+        let control_key = status_key(&event);
+        if control_key.is_some_and(|key| {
+            self.pending_controls
+                .lock()
+                .expect("control mutex poisoned")
+                .contains(&key)
+        }) {
+            return Ok(());
+        }
+        let control_permit = if is_control_event(&event) {
+            Some(
+                Arc::clone(&self.control_permits)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| live_channel_closed())?,
+            )
+        } else {
+            None
+        };
+        let permit = self.reserve_regular().await?;
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(live_channel_closed());
+        }
+        if let Some(key) = control_key {
+            self.pending_controls
+                .lock()
+                .expect("control mutex poisoned")
+                .push(key);
+        }
+        let generation = event_generation(&event);
+        let purge_on_invalidate = event_purges_with_generation(&event);
+        self.sender
+            .try_send(EventEnvelope {
+                item: Some(Ok(event)),
+                generation,
+                purge_on_invalidate,
+                connected_delivered: Arc::clone(&self.connected_delivered),
+                control_key,
+                pending_controls: Arc::clone(&self.pending_controls),
+                _regular_permit: Some(permit),
+                _control_permit: control_permit,
+                emergency_slot: None,
+                emergency_barrier: None,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Closed(_) => live_channel_closed(),
+                mpsc::error::TrySendError::Full(_) => {
+                    ProviderError::Invariant("reserved market event channel capacity exhausted")
+                }
+            })
+    }
+
+    fn connected_delivered(&self, generation: GapGeneration) -> bool {
+        self.connected_delivered.load(Ordering::Acquire) >= generation.0
+    }
+
+    fn invalidate_generation(&self, generation: GapGeneration) {
+        self.invalidated_through
+            .fetch_max(generation.0, Ordering::AcqRel);
+    }
+
+    fn queue_emergency_pair(
+        &self,
+        first: MarketEvent,
+        second: MarketEvent,
+    ) -> Result<Arc<EmergencyBarrier>, ProviderError> {
+        self.emergency_barrier.begin_pair()?;
+        for (slot, event) in [first, second].into_iter().enumerate() {
+            self.sender
+                .try_send(EventEnvelope {
+                    item: Some(Ok(event)),
+                    generation: None,
+                    purge_on_invalidate: false,
+                    connected_delivered: Arc::clone(&self.connected_delivered),
+                    control_key: None,
+                    pending_controls: Arc::clone(&self.pending_controls),
+                    _regular_permit: None,
+                    _control_permit: None,
+                    emergency_slot: Some(slot as u8),
+                    emergency_barrier: Some(Arc::clone(&self.emergency_barrier)),
+                })
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Closed(_) => live_channel_closed(),
+                    mpsc::error::TrySendError::Full(_) => {
+                        ProviderError::Invariant("emergency market event reservation exhausted")
+                    }
+                })?;
+        }
+        Ok(Arc::clone(&self.emergency_barrier))
+    }
+
+    async fn queue_terminal_pair(
+        &self,
+        first: MarketEvent,
+        second: MarketEvent,
+    ) -> Result<(), ProviderError> {
+        self.emergency_barrier.suppress_pending();
+        self.emergency_barrier.wait_dequeued().await;
+        let _ = self.queue_emergency_pair(first, second)?;
+        Ok(())
+    }
+
+    async fn shutdown(&self) {
+        if self.shutdown.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.invalidated_through.store(u64::MAX, Ordering::Release);
+        self.emergency_barrier.suppress_pending();
+        // Cancellation makes the stream discard every non-Stopped envelope. Wait until any
+        // reserved saturation pair has actually left the bounded channel before reusing its
+        // reservation for the sole terminal event. Receiver drop also drops the queued
+        // envelopes and releases this barrier, so shutdown cannot deadlock on a closed stream.
+        self.emergency_barrier.wait_dequeued().await;
+        self.emergency_barrier.begin_shutdown();
+        let envelope = EventEnvelope {
+            item: Some(Ok(MarketEvent::Status {
+                generation: None,
+                status: ConnectionStatus::Stopped,
+            })),
+            generation: None,
+            purge_on_invalidate: false,
+            connected_delivered: Arc::clone(&self.connected_delivered),
+            control_key: None,
+            pending_controls: Arc::clone(&self.pending_controls),
+            _regular_permit: None,
+            _control_permit: None,
+            emergency_slot: Some(0),
+            emergency_barrier: Some(Arc::clone(&self.emergency_barrier)),
+        };
+        let _ = self.sender.try_send(envelope);
+    }
+}
+
+fn event_generation(event: &MarketEvent) -> Option<GapGeneration> {
+    match event {
+        MarketEvent::Status { generation, .. }
+        | MarketEvent::RecoverableError { generation, .. } => *generation,
+        MarketEvent::ReconcileBatch { generation, .. } | MarketEvent::Candle { generation, .. } => {
+            Some(*generation)
+        }
+        MarketEvent::TerminalError(_) => None,
+    }
+}
+fn is_control_event(event: &MarketEvent) -> bool {
+    !matches!(
+        event,
+        MarketEvent::Candle { .. } | MarketEvent::ReconcileBatch { .. }
+    )
+}
+
+fn event_purges_with_generation(event: &MarketEvent) -> bool {
+    matches!(
+        event,
+        MarketEvent::Candle { .. }
+            | MarketEvent::ReconcileBatch { .. }
+            | MarketEvent::Status {
+                generation: Some(_),
+                status: ConnectionStatus::Connecting
+                    | ConnectionStatus::GapSync
+                    | ConnectionStatus::Connected,
+            }
+    )
+}
+fn status_key(event: &MarketEvent) -> Option<(Option<GapGeneration>, ConnectionStatus)> {
+    match event {
+        MarketEvent::Status { generation, status } => Some((*generation, *status)),
+        _ => None,
+    }
+}
+
+fn live_channel_closed() -> ProviderError {
+    ProviderError::ChannelClosed {
+        context: ErrorContext::operation(ErrorOperation::LiveFeed),
+    }
+}
+
 async fn send_market(
-    sender: &mpsc::Sender<Result<MarketEvent, ProviderError>>,
+    sender: &EventEmitter,
     cancellation: &CancellationToken,
     event: MarketEvent,
 ) -> Result<(), ProviderError> {
-    tokio::select! { biased; () = cancellation.cancelled() => Ok(()), result = sender.send(Ok(event)) => result.map_err(|_| ProviderError::ChannelClosed { context: ErrorContext::operation(ErrorOperation::LiveFeed) }) }
+    tokio::select! { biased; () = cancellation.cancelled() => Ok(()), result = sender.send_regular(event) => result }
+}
+fn apply_reconciliation_candle(
+    pending: &mut BTreeMap<i64, Candle>,
+    candidate: Candle,
+    revision: &mut ReplayRevision,
+    target_open_time: &mut i64,
+) -> Result<(), ProviderError> {
+    let open_time = candidate.open_time();
+    let _ = coalesce_candle(pending, candidate);
+    revision.0 = revision
+        .0
+        .checked_add(1)
+        .ok_or(ProviderError::Invariant("replay revision overflow"))?;
+    *target_open_time = (*target_open_time).max(open_time);
+    Ok(())
 }
 
-fn checked_next_millis(value: i64) -> Result<i64, ProviderError> {
+fn coalesce_candle(pending: &mut BTreeMap<i64, Candle>, candidate: Candle) -> bool {
+    use FinalityAuthority::{
+        RestProvisionalClosed, RestProvisionalOpen, WsAuthoritativeClosed, WsAuthoritativeOpen,
+    };
+    let key = candidate.open_time();
+    match pending.get(&key) {
+        None => {
+            pending.insert(key, candidate);
+            true
+        }
+        Some(current) => {
+            let replace = match (current.authority(), candidate.authority()) {
+                (_, WsAuthoritativeClosed) => true,
+                (WsAuthoritativeClosed, _) => false,
+                (WsAuthoritativeOpen, RestProvisionalOpen | RestProvisionalClosed) => false,
+                (RestProvisionalOpen | RestProvisionalClosed, WsAuthoritativeOpen) => true,
+                (WsAuthoritativeOpen, WsAuthoritativeOpen) => true,
+                (RestProvisionalClosed, RestProvisionalOpen) => false,
+                (RestProvisionalOpen, RestProvisionalClosed)
+                | (RestProvisionalOpen, RestProvisionalOpen)
+                | (RestProvisionalClosed, RestProvisionalClosed) => true,
+            };
+            if replace {
+                pending.insert(key, candidate);
+            }
+            replace
+        }
+    }
+}
+
+fn control_channel_closed(instrument: &Instrument, timeframe: Timeframe) -> ProviderError {
+    ProviderError::ChannelClosed {
+        context: ErrorContext::operation(ErrorOperation::Reconciliation)
+            .with_market(instrument, timeframe),
+    }
+}
+
+fn live_protocol_error(request: &LiveRequest, detail: &'static str) -> ProviderError {
+    ProviderError::Protocol {
+        context: ErrorContext::operation(ErrorOperation::WebSocket)
+            .with_market(&request.instrument, request.timeframe),
+        detail,
+    }
+}
+
+fn next_gap_cursor(_timeframe: Timeframe, value: i64) -> Result<i64, ProviderError> {
     value
         .checked_add(1)
         .ok_or(ProviderError::Invariant("gap cursor overflow"))
+}
+
+#[cfg(feature = "test-transport")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveErrorDisposition {
+    Recoverable,
+    Terminal,
+}
+
+#[cfg(feature = "test-transport")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveInBandEventDisposition {
+    RecoverableInBand,
+    TerminalInBand,
+}
+
+#[cfg(feature = "test-transport")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveCompletionDisposition {
+    Running,
+    FinishedErr,
+}
+
+#[cfg(feature = "test-transport")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveErrorClassification {
+    pub disposition: LiveErrorDisposition,
+    pub event: LiveInBandEventDisposition,
+    pub completion: LiveCompletionDisposition,
+    pub retries: bool,
+}
+
+#[cfg(feature = "test-transport")]
+#[must_use]
+pub fn classify_live_error_for_test(error: &ProviderError) -> LiveErrorClassification {
+    if is_terminal_live_error(error) {
+        LiveErrorClassification {
+            disposition: LiveErrorDisposition::Terminal,
+            event: LiveInBandEventDisposition::TerminalInBand,
+            completion: LiveCompletionDisposition::FinishedErr,
+            retries: false,
+        }
+    } else {
+        LiveErrorClassification {
+            disposition: LiveErrorDisposition::Recoverable,
+            event: LiveInBandEventDisposition::RecoverableInBand,
+            completion: LiveCompletionDisposition::Running,
+            retries: true,
+        }
+    }
+}
+
+#[cfg(feature = "test-transport")]
+#[derive(Clone, Debug, PartialEq)]
+pub enum LiveInputClassification {
+    Continue,
+    Error {
+        error: ProviderError,
+        policy: LiveErrorClassification,
+    },
+}
+
+#[cfg(feature = "test-transport")]
+#[must_use]
+pub fn classify_live_input_for_test(
+    input: Result<DecodedFrame, ProviderError>,
+    instrument: &Instrument,
+    timeframe: Timeframe,
+) -> LiveInputClassification {
+    let error = match input {
+        Ok(DecodedFrame::Candle(_) | DecodedFrame::Ignored) => {
+            return LiveInputClassification::Continue;
+        }
+        Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => ProviderError::Protocol {
+            context: ErrorContext::operation(ErrorOperation::WebSocket)
+                .with_market(instrument, timeframe),
+            detail: "WebSocket peer requested reconnect",
+        },
+        Ok(DecodedFrame::ProviderError(error)) | Err(error) => error,
+    };
+    LiveInputClassification::Error {
+        policy: classify_live_error_for_test(&error),
+        error,
+    }
 }
 
 fn is_terminal_live_error(error: &ProviderError) -> bool {
@@ -1608,6 +2536,7 @@ fn is_terminal_live_error(error: &ProviderError) -> bool {
             | ProviderError::Invariant(_)
             | ProviderError::ClientStatus { .. }
             | ProviderError::InvalidSymbol { .. }
+            | ProviderError::ChannelClosed { .. }
     )
 }
 
@@ -1636,11 +2565,56 @@ impl MarketDataProvider for BinanceProvider {
     fn open_live<'a>(&'a self, request: LiveRequest) -> ProviderFuture<'a, LiveFeed> {
         Box::pin(async move {
             self.live.validate()?;
-            let (sender, receiver) = mpsc::channel(self.live.market_event_capacity);
+            let physical_capacity = self
+                .live
+                .market_event_capacity
+                .checked_add(2)
+                .ok_or(ProviderError::Invariant("market event capacity overflow"))?;
+            let (sender, receiver) = mpsc::channel(physical_capacity);
+            let sender = EventEmitter::new(
+                sender,
+                self.live.market_event_capacity,
+                self.live.control_capacity,
+            );
+            let invalidated_through = Arc::clone(&sender.invalidated_through);
+            let emergency_barrier = Arc::clone(&sender.emergency_barrier);
             let cancellation = request.cancellation.clone();
+            let stream_cancellation = cancellation.clone();
             let producer = self.clone();
-            let events = stream::unfold(receiver, |mut receiver| async move {
-                receiver.recv().await.map(|item| (item, receiver))
+            let events = stream::unfold(receiver, move |mut receiver| {
+                let invalidated_through = Arc::clone(&invalidated_through);
+                let emergency_barrier = Arc::clone(&emergency_barrier);
+                let cancellation = stream_cancellation.clone();
+                async move {
+                    loop {
+                        let cancelled = cancellation.is_cancelled();
+                        let envelope = if cancelled {
+                            receiver.recv().await?
+                        } else {
+                            tokio::select! {
+                                biased;
+                                () = cancellation.cancelled() => continue,
+                                envelope = receiver.recv() => envelope?,
+                            }
+                        };
+                        if cancellation.is_cancelled() && !envelope.is_stopped() {
+                            drop(envelope);
+                            continue;
+                        }
+                        let invalidated = envelope.purge_on_invalidate
+                            && envelope.generation.is_some_and(|generation| {
+                                generation.0 <= invalidated_through.load(Ordering::Acquire)
+                            });
+                        let suppressed = envelope
+                            .emergency_slot
+                            .is_some_and(|slot| emergency_barrier.is_suppressed(slot));
+                        if invalidated || suppressed {
+                            drop(envelope);
+                            continue;
+                        }
+                        return Some((envelope.into_item(), receiver));
+                    }
+                }
             });
             Ok(LiveFeed::spawn(
                 Box::pin(events),

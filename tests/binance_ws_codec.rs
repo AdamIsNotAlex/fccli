@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use fccli::{
-    error::{PayloadError, ProviderError, SanitizedCause, TimeoutKind},
+    error::{PayloadError, ProviderError, SanitizedCause, SanitizedMessage, TimeoutKind},
     model::{FinalityAuthority, Instrument, Market, ProviderId, Timeframe},
     provider::binance::{
         DecodedFrame, WS_FRAME_SIZE, WS_MAX_WRITE_BUFFER_SIZE, WS_MESSAGE_INACTIVITY_TIMEOUT,
@@ -332,14 +332,45 @@ fn malformed_oversized_mismatched_and_provider_frames_are_typed() {
             "accepted {label}"
         );
     }
+    let invalid_symbol = decode_ws_frame(
+        Message::Text(r#"{"code":-1121,"msg":"Invalid symbol; api_key_SECRET"}"#.into()),
+        &instrument(),
+        Timeframe::Minute1,
+        &config,
+    );
+    let DecodedFrame::ProviderError(error) = invalid_symbol else {
+        panic!("expected typed provider error, got {invalid_symbol:?}");
+    };
+    assert!(matches!(
+        &error,
+        ProviderError::InvalidSymbol {
+            code: -1121,
+            message: SanitizedMessage::InvalidSymbol,
+            ..
+        }
+    ));
+    assert_eq!(
+        error.to_string(),
+        "invalid symbol (operation websocket, provider binance, instrument BTC/USDT, timeframe 1m); provider code -1121: invalid symbol"
+    );
+    assert_eq!(
+        format!("{error:?}"),
+        "InvalidSymbol { context: ErrorContext { provider: Some(ProviderId(\"binance\")), instrument: Some(\"BTC/USDT\"), timeframe: Some(Minute1), operation: WebSocket }, code: -1121, message: InvalidSymbol }"
+    );
+    assert!(!error.to_string().contains("api_key_SECRET"));
+    assert!(!format!("{error:?}").contains("api_key_SECRET"));
+
     assert!(matches!(
         decode_ws_frame(
-            Message::Text(r#"{"code":-1121,"msg":"Invalid symbol; api_key_SECRET"}"#.into()),
+            Message::Text(r#"{"code":-1000,"msg":"generic provider failure"}"#.into()),
             &instrument(),
             Timeframe::Minute1,
             &config
         ),
-        DecodedFrame::ProviderError(ProviderError::Protocol { .. })
+        DecodedFrame::ProviderError(ProviderError::Protocol {
+            detail: "provider reported a WebSocket error",
+            ..
+        })
     ));
     assert_eq!(
         decode_ws_frame(
