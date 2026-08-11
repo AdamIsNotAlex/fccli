@@ -243,6 +243,24 @@ impl ChartViewState {
         view.follow_live = view.right_index + 1 == candles.len();
         refresh_open_time_and_auto_y(view, candles);
     }
+    /// Pans by an exact candle count; positive values move toward newer data.
+    pub(super) fn pan_x_by_candles(&mut self, candles: &CandleSeries, delta: isize) {
+        let Some(view) = self.viewport_mut_internal() else {
+            return;
+        };
+        let minimum_right = view.visible_count - 1;
+        view.right_index = if delta >= 0 {
+            view.right_index
+                .saturating_add(delta.unsigned_abs())
+                .min(candles.len() - 1)
+        } else {
+            view.right_index
+                .saturating_sub(delta.unsigned_abs())
+                .max(minimum_right)
+        };
+        view.follow_live = view.right_index + 1 == candles.len();
+        refresh_open_time_and_auto_y(view, candles);
+    }
 
     pub fn zoom_x_in(&mut self, candles: &CandleSeries, plot_width: usize) {
         self.zoom_x_by_factor(candles, plot_width, X_ZOOM_IN);
@@ -278,6 +296,68 @@ impl ChartViewState {
         }
         refresh_open_time_and_auto_y(view, candles);
     }
+    /// Zooms X around a fixed candle rather than the viewport center.
+    pub(super) fn zoom_x_at(
+        &mut self,
+        candles: &CandleSeries,
+        plot_width: usize,
+        factor: f64,
+        anchor_open_time: i64,
+    ) {
+        assert!(plot_width > 0, "plot_width must be positive");
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        let Some(anchor_index) = candles.index_of_open_time(anchor_open_time) else {
+            return;
+        };
+        let Some(view) = self.viewport_mut_internal() else {
+            return;
+        };
+        let old_left = view.right_index + 1 - view.visible_count;
+        let anchor_offset = anchor_index
+            .saturating_sub(old_left)
+            .min(view.visible_count - 1);
+        let minimum = Self::min_visible_count(candles.len(), plot_width);
+        let maximum = candles.len().min(plot_width);
+        let next = round_ties_away(view.visible_count as f64 * factor).clamp(minimum, maximum);
+        if next == view.visible_count {
+            return;
+        }
+        let scaled_offset =
+            round_ties_away(anchor_offset as f64 * next as f64 / view.visible_count as f64)
+                .min(next - 1);
+        let left = anchor_index.saturating_sub(scaled_offset);
+        view.visible_count = next;
+        view.right_index = left
+            .saturating_add(next - 1)
+            .min(candles.len() - 1)
+            .max(next - 1);
+        view.follow_live = view.right_index + 1 == candles.len();
+        refresh_open_time_and_auto_y(view, candles);
+    }
+    /// Places a fixed candle in the requested visible slot after interaction
+    /// geometry has changed. The slot is clamped only when a series boundary
+    /// makes the exact placement impossible.
+    pub(super) fn align_x_anchor(
+        &mut self,
+        candles: &CandleSeries,
+        anchor_open_time: i64,
+        visible_slot: usize,
+    ) {
+        let Some(anchor_index) = candles.index_of_open_time(anchor_open_time) else {
+            return;
+        };
+        let Some(view) = self.viewport_mut_internal() else {
+            return;
+        };
+        let visible_slot = visible_slot.min(view.visible_count - 1);
+        let maximum_left = candles.len() - view.visible_count;
+        let left = anchor_index.saturating_sub(visible_slot).min(maximum_left);
+        view.right_index = left + view.visible_count - 1;
+        view.follow_live = view.right_index + 1 == candles.len();
+        refresh_open_time_and_auto_y(view, candles);
+    }
 
     pub fn pan_y_up(&mut self) {
         self.pan_y(1.0);
@@ -302,6 +382,22 @@ impl ChartViewState {
             view.auto_y = false;
         }
     }
+    /// Pans the manual price range by a fraction of its current span.
+    pub(super) fn pan_y_by_fraction(&mut self, fraction: f64) {
+        if !fraction.is_finite() {
+            return;
+        }
+        let Some(view) = self.viewport_mut_internal() else {
+            return;
+        };
+        let delta = view.y_range.span() * fraction;
+        if let Some(candidate) =
+            normalized_manual_range(view.y_range.low + delta, view.y_range.high + delta)
+        {
+            view.y_range = candidate;
+            view.auto_y = false;
+        }
+    }
 
     pub fn zoom_y_in(&mut self) {
         self.zoom_y_by_factor(Y_ZOOM_IN);
@@ -319,6 +415,29 @@ impl ChartViewState {
         };
         let previous = view.y_range;
         if let Some(candidate) = zoomed_manual_range(previous, factor) {
+            view.y_range = candidate;
+            view.auto_y = false;
+        }
+    }
+    /// Zooms the manual price range around a fixed price.
+    pub(super) fn zoom_y_at(&mut self, factor: f64, anchor_price: f64) {
+        if !factor.is_finite() || factor <= 0.0 || !anchor_price.is_finite() {
+            return;
+        }
+        let Some(view) = self.viewport_mut_internal() else {
+            return;
+        };
+        let span = view.y_range.span();
+        if !span.is_finite() || span <= 0.0 {
+            return;
+        }
+        let ratio = ((anchor_price - view.y_range.low) / span).clamp(0.0, 1.0);
+        let Some(zoomed) = zoomed_manual_range(view.y_range, factor) else {
+            return;
+        };
+        let next_span = zoomed.span();
+        let low = anchor_price - next_span * ratio;
+        if let Some(candidate) = normalized_manual_range(low, low + next_span) {
             view.y_range = candidate;
             view.auto_y = false;
         }
