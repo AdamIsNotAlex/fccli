@@ -3,6 +3,7 @@
 #[cfg(all(feature = "test-transport", feature = "production-transport"))]
 compile_error!("features `test-transport` and `production-transport` are mutually exclusive");
 
+pub mod app;
 pub mod chart;
 pub mod cli;
 pub mod clock;

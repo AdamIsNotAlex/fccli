@@ -9,8 +9,8 @@ use crate::{
     clock::Clock,
     error::ProviderError,
     model::{
-        Candle, CandleSeries, HistoryRequest, Instrument, MonoInstant, ProcessBlocker,
-        RateGateState, Timeframe,
+        Candle, CandleSeries, HistoryRequest, Instrument, MonoInstant, MutationSummary,
+        ProcessBlocker, RateGateState, Timeframe,
     },
     provider::{CancellationToken, MarketDataProvider, RateGateSnapshot},
 };
@@ -23,7 +23,7 @@ pub enum HistoryBoundary {
     Inside,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum HistoryProgress {
     Idle,
     RequestStarted,
@@ -33,6 +33,35 @@ pub enum HistoryProgress {
     RetryDeferred(MonoInstant),
     Cancelled,
     PermanentlyDisabled,
+    TerminalFailure(ProviderError),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryApplyResult {
+    pub progress: HistoryProgress,
+    pub mutation: Option<MutationSummary>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoryJoinError {
+    DeadlineElapsed,
+    Aborted,
+    JoinFailure,
+}
+
+impl HistoryApplyResult {
+    #[must_use]
+    pub fn changed(&self) -> bool {
+        self.mutation
+            .as_ref()
+            .is_some_and(|summary| summary.inserted != 0 || summary.replaced != 0)
+    }
+}
+
+impl PartialEq<HistoryProgress> for HistoryApplyResult {
+    fn eq(&self, other: &HistoryProgress) -> bool {
+        &self.progress == other
+    }
 }
 
 enum InFlightWake {
@@ -109,6 +138,18 @@ impl HistoryCoordinator {
         self.in_flight.is_some() || self.completed_page.is_some()
     }
     #[must_use]
+    pub const fn has_completed_page(&self) -> bool {
+        self.completed_page.is_some()
+    }
+    /// Returns whether the coordinator still owns an actual spawned history task.
+    ///
+    /// This is intentionally narrower than [`Self::in_flight`], which also includes a
+    /// completed page retained until the App can apply it.
+    #[must_use]
+    pub const fn has_owned_task(&self) -> bool {
+        self.in_flight.is_some()
+    }
+    #[must_use]
     pub const fn retry_deadline(&self) -> Option<MonoInstant> {
         self.retry_deadline
     }
@@ -131,6 +172,53 @@ impl HistoryCoordinator {
     #[must_use]
     pub fn last_error(&self) -> Option<&ProviderError> {
         self.last_error.as_ref()
+    }
+
+    /// Requests shutdown without relinquishing ownership of an in-flight task.
+    pub fn request_shutdown(&self) {
+        self.cancellation.cancel();
+    }
+
+    /// Waits for the owned request task until an absolute injected-clock deadline.
+    ///
+    /// The handle remains in `self` until termination is observed, so cancelling this join
+    /// future cannot detach the task. A deadline abort is also awaited before returning.
+    pub async fn join(&mut self, deadline: MonoInstant) -> Result<(), HistoryJoinError> {
+        self.request_shutdown();
+        self.retry_deadline = None;
+        self.completed_page = None;
+        let clock = Arc::clone(&self.clock);
+        let outcome = {
+            let Some(task) = self.in_flight.as_mut() else {
+                return Ok(());
+            };
+            tokio::select! {
+                biased;
+                result = task => Some(result),
+                () = clock.sleep_until(deadline) => None,
+            }
+        };
+
+        match outcome {
+            Some(result) => {
+                self.in_flight = None;
+                match result {
+                    Ok(_) => Ok(()),
+                    Err(error) if error.is_cancelled() => Err(HistoryJoinError::Aborted),
+                    Err(_) => Err(HistoryJoinError::JoinFailure),
+                }
+            }
+            None => {
+                let task = self
+                    .in_flight
+                    .as_mut()
+                    .expect("history task remains owned through deadline cleanup");
+                task.abort();
+                let _ = task.await;
+                self.in_flight = None;
+                Err(HistoryJoinError::DeadlineElapsed)
+            }
+        }
     }
 
     /// Updates the visible-left boundary and starts at most one request.
@@ -174,6 +262,9 @@ impl HistoryCoordinator {
                 self.abort_in_flight_and_wait().await;
                 return HistoryProgress::Cancelled;
             }
+            if self.completed_page.is_some() {
+                return HistoryProgress::PageReady;
+            }
 
             if self.in_flight.is_some() {
                 let cancellation = self.cancellation.clone();
@@ -197,7 +288,7 @@ impl HistoryCoordinator {
                     }
                     InFlightWake::Gate(Err(_)) => {
                         self.abort_in_flight_and_wait().await;
-                        return self.disable_terminal(ProviderError::Invariant("rate gate closed"));
+                        return self.terminal_failure(ProviderError::Invariant("rate gate closed"));
                     }
                     InFlightWake::Gate(Ok(RateGateState::Open | RateGateState::TimedUntil(_))) => {
                         continue;
@@ -213,7 +304,7 @@ impl HistoryCoordinator {
                     Ok(Err(error)) => self.handle_error(error),
                     Err(error) if error.is_cancelled() => HistoryProgress::Cancelled,
                     Err(_) => {
-                        self.disable_terminal(ProviderError::Invariant("history task failed"))
+                        self.terminal_failure(ProviderError::Invariant("history task failed"))
                     }
                 };
             }
@@ -227,15 +318,15 @@ impl HistoryCoordinator {
             }
 
             match self.observe_gate() {
-                Some(RateGateState::TimedUntil(observed)) => {
+                Ok(RateGateState::TimedUntil(observed)) => {
                     deadline = deadline.max(observed);
                     self.retry_deadline = Some(deadline);
                 }
-                Some(RateGateState::ProcessBlocked(blocker)) => {
+                Ok(RateGateState::ProcessBlocked(blocker)) => {
                     return self.disable_blocked(blocker, ProviderError::InvalidBanExpiry);
                 }
-                Some(RateGateState::Open) => {}
-                None => return HistoryProgress::PermanentlyDisabled,
+                Ok(RateGateState::Open) => {}
+                Err(error) => return self.terminal_failure(error),
             }
 
             if self.clock.now() >= deadline {
@@ -259,7 +350,7 @@ impl HistoryCoordinator {
                         }
                         Ok(RateGateState::Open) => {}
                         Err(_) => {
-                            return self.disable_terminal(ProviderError::Invariant("rate gate closed"));
+                            return self.terminal_failure(ProviderError::Invariant("rate gate closed"));
                         }
                     }
                 }
@@ -293,19 +384,19 @@ impl HistoryCoordinator {
             return HistoryProgress::Idle;
         };
         match self.observe_gate() {
-            Some(RateGateState::Open) => {}
-            Some(RateGateState::TimedUntil(deadline)) if deadline > self.clock.now() => {
+            Ok(RateGateState::Open) => {}
+            Ok(RateGateState::TimedUntil(deadline)) if deadline > self.clock.now() => {
                 self.retry_deadline = Some(
                     self.retry_deadline
                         .map_or(deadline, |current| current.max(deadline)),
                 );
                 return HistoryProgress::RetryDeferred(self.retry_deadline.expect("set above"));
             }
-            Some(RateGateState::TimedUntil(_)) => {}
-            Some(RateGateState::ProcessBlocked(blocker)) => {
+            Ok(RateGateState::TimedUntil(_)) => {}
+            Ok(RateGateState::ProcessBlocked(blocker)) => {
                 return self.disable_blocked(blocker, ProviderError::InvalidBanExpiry);
             }
-            None => return HistoryProgress::PermanentlyDisabled,
+            Err(error) => return self.terminal_failure(error),
         }
         let request = match HistoryRequest::older(oldest, HISTORY_PAGE_LIMIT) {
             Ok(request) => request,
@@ -332,12 +423,18 @@ impl HistoryCoordinator {
         series: &mut CandleSeries,
         view: &mut ChartViewState,
         plot_width: usize,
-    ) -> HistoryProgress {
+    ) -> HistoryApplyResult {
         let Some(page) = self.completed_page.take() else {
-            return HistoryProgress::Idle;
+            return HistoryApplyResult {
+                progress: HistoryProgress::Idle,
+                mutation: None,
+            };
         };
         if self.cancellation.is_cancelled() {
-            return HistoryProgress::Cancelled;
+            return HistoryApplyResult {
+                progress: HistoryProgress::Cancelled,
+                mutation: None,
+            };
         }
         let previous_oldest = series.oldest_open_time();
         let summary = series.merge(page);
@@ -349,7 +446,11 @@ impl HistoryCoordinator {
             (previous_oldest, self.oldest_open_time),
             (Some(previous), Some(current)) if current < previous
         );
-        if summary.empty_input || summary.duplicate_only || summary.no_progress || !advanced_older {
+        let progress = if summary.empty_input
+            || summary.duplicate_only
+            || summary.no_progress
+            || !advanced_older
+        {
             self.end_latched = true;
             HistoryProgress::EndReached
         } else {
@@ -358,6 +459,10 @@ impl HistoryCoordinator {
             // exactly one canonical re-evaluation even when the viewport remains inside.
             self.boundary_recheck_armed = true;
             HistoryProgress::PageApplied
+        };
+        HistoryApplyResult {
+            progress,
+            mutation: Some(summary),
         }
     }
 
@@ -377,14 +482,20 @@ impl HistoryCoordinator {
                 // repeated Inside observations into an unbounded request loop: only a later
                 // Outside -> Inside crossing may start again.
                 self.boundary_recheck_armed = false;
-                if self.boundary == HistoryBoundary::Inside
-                    && let Some(RateGateState::TimedUntil(deadline)) = self.observe_gate()
-                {
-                    self.retry_deadline = Some(
-                        self.retry_deadline
-                            .map_or(deadline, |old| old.max(deadline)),
-                    );
-                    return HistoryProgress::RetryDeferred(self.retry_deadline.expect("set above"));
+                if self.boundary == HistoryBoundary::Inside {
+                    match self.observe_gate() {
+                        Ok(RateGateState::TimedUntil(deadline)) => {
+                            self.retry_deadline = Some(
+                                self.retry_deadline
+                                    .map_or(deadline, |old| old.max(deadline)),
+                            );
+                            return HistoryProgress::RetryDeferred(
+                                self.retry_deadline.expect("set above"),
+                            );
+                        }
+                        Err(error) => return self.terminal_failure(error),
+                        Ok(RateGateState::Open | RateGateState::ProcessBlocked(_)) => {}
+                    }
                 }
                 HistoryProgress::Idle
             }
@@ -396,14 +507,10 @@ impl HistoryCoordinator {
         }
     }
 
-    fn observe_gate(&mut self) -> Option<RateGateState> {
-        match self.gate.current() {
-            Ok(state) => Some(state),
-            Err(_) => {
-                self.disable_terminal(ProviderError::Invariant("rate gate closed"));
-                None
-            }
-        }
+    fn observe_gate(&self) -> Result<RateGateState, ProviderError> {
+        self.gate
+            .current()
+            .map_err(|_| ProviderError::Invariant("rate gate closed"))
     }
 
     fn disable_blocked(
@@ -422,6 +529,13 @@ impl HistoryCoordinator {
         self.terminal_disabled = true;
         self.last_error = Some(error);
         HistoryProgress::PermanentlyDisabled
+    }
+
+    fn terminal_failure(&mut self, error: ProviderError) -> HistoryProgress {
+        self.retry_deadline = None;
+        self.terminal_disabled = true;
+        self.last_error = Some(error.clone());
+        HistoryProgress::TerminalFailure(error)
     }
 
     async fn abort_in_flight_and_wait(&mut self) {

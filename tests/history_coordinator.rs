@@ -7,7 +7,7 @@ use fccli::{
     chart::ChartViewState,
     clock::ManualClock,
     error::{ErrorContext, ErrorOperation, ProviderError, SanitizedCause, TimeoutKind},
-    history::{HISTORY_PAGE_LIMIT, HistoryCoordinator, HistoryProgress},
+    history::{HISTORY_PAGE_LIMIT, HistoryCoordinator, HistoryJoinError, HistoryProgress},
     model::{
         Candle, CandleSeries, HistoryRequest, Instrument, InstrumentSpec, Market, MonoInstant,
         ProcessBlocker, ProviderId, RateGateState, Timeframe,
@@ -217,10 +217,20 @@ async fn crossing_boundary_requests_checked_oldest_minus_one_limit_1000_and_appl
     );
     assert_eq!(h.coordinator.drive().await, HistoryProgress::PageReady);
     assert_eq!(
-        h.coordinator
-            .apply_completed(&mut h.series, &mut h.view, 20),
-        HistoryProgress::PageApplied
+        h.coordinator.drive().await,
+        HistoryProgress::PageReady,
+        "a completed page remains actionable until the caller can apply it"
     );
+    let applied = h
+        .coordinator
+        .apply_completed(&mut h.series, &mut h.view, 20);
+    assert_eq!(applied.progress, HistoryProgress::PageApplied);
+    assert!(applied.changed());
+    let summary = applied
+        .mutation
+        .as_ref()
+        .expect("completed page has a mutation summary");
+    assert_eq!((summary.inserted, summary.replaced), (1, 0));
     let requests = h.provider.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].end_time(), Some(999_999));
@@ -279,11 +289,19 @@ async fn empty_and_duplicate_pages_latch_end_and_unrelated_insertions_do_not_ree
         duplicate_h.coordinator.drive().await,
         HistoryProgress::PageReady
     );
-    assert_eq!(
+    let duplicate_apply =
         duplicate_h
             .coordinator
-            .apply_completed(&mut duplicate_h.series, &mut duplicate_h.view, 20),
-        HistoryProgress::EndReached
+            .apply_completed(&mut duplicate_h.series, &mut duplicate_h.view, 20);
+    assert_eq!(duplicate_apply.progress, HistoryProgress::EndReached);
+    assert!(!duplicate_apply.changed());
+    let duplicate_summary = duplicate_apply
+        .mutation
+        .as_ref()
+        .expect("duplicate page has a mutation summary");
+    assert_eq!(
+        (duplicate_summary.inserted, duplicate_summary.replaced),
+        (0, 0)
     );
     assert!(duplicate_h.coordinator.end_latched());
 
@@ -403,7 +421,7 @@ async fn client_4xx_is_permanent_and_preserves_accepted_series_and_view() {
 }
 
 #[tokio::test]
-async fn invalid_ban_process_block_and_closed_observer_permanently_disable() {
+async fn invalid_ban_and_process_block_are_nonfatal_but_closed_observer_is_terminal() {
     let mut invalid = harness([Response::Ready(Err(ProviderError::InvalidBanExpiry))], 10);
     invalid.coordinator.update_boundary(0, &invalid.series);
     assert_eq!(
@@ -428,7 +446,7 @@ async fn invalid_ban_process_block_and_closed_observer_permanently_disable() {
     closed.provider.close_gate();
     assert_eq!(
         closed.coordinator.update_boundary(0, &closed.series),
-        HistoryProgress::PermanentlyDisabled
+        HistoryProgress::TerminalFailure(ProviderError::Invariant("rate gate closed"))
     );
     assert!(closed.coordinator.terminal_disabled());
     assert!(matches!(
@@ -589,13 +607,18 @@ async fn provider_task_panic_becomes_sanitized_terminal_state() {
     );
     assert_eq!(
         h.coordinator.drive().await,
-        HistoryProgress::PermanentlyDisabled
+        HistoryProgress::TerminalFailure(ProviderError::Invariant("history task failed"))
     );
     assert!(h.coordinator.terminal_disabled());
     assert!(matches!(
         h.coordinator.last_error(),
         Some(ProviderError::Invariant("history task failed"))
     ));
+    assert_eq!(
+        h.coordinator.update_boundary(0, &h.series),
+        HistoryProgress::PermanentlyDisabled,
+        "the fatal task failure is emitted exactly once"
+    );
 }
 
 #[tokio::test]
@@ -656,13 +679,18 @@ async fn already_panicked_task_loses_to_cancellation_block_and_gate_closure() {
     closed.provider.close_gate();
     assert_eq!(
         closed.coordinator.drive().await,
-        HistoryProgress::PermanentlyDisabled
+        HistoryProgress::TerminalFailure(ProviderError::Invariant("rate gate closed"))
     );
     assert!(closed.coordinator.terminal_disabled());
     assert!(matches!(
         closed.coordinator.last_error(),
         Some(ProviderError::Invariant("rate gate closed"))
     ));
+    assert_eq!(
+        closed.coordinator.update_boundary(0, &closed.series),
+        HistoryProgress::PermanentlyDisabled,
+        "the fatal gate closure is emitted exactly once"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -703,6 +731,51 @@ async fn dropped_drive_during_abort_wait_retains_task_ownership() {
     assert_eq!(h.coordinator.drive().await, HistoryProgress::Cancelled);
     assert!(!h.coordinator.in_flight());
     assert!(!h.coordinator.terminal_disabled());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_history_join_retains_handle_until_aborted_task_terminates() {
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let mut h = harness(
+        [Response::BlockingPanic {
+            entered: entered_tx,
+            release: release_rx,
+        }],
+        10,
+    );
+    assert_eq!(
+        h.coordinator.update_boundary(0, &h.series),
+        HistoryProgress::RequestStarted
+    );
+    entered_rx
+        .recv()
+        .expect("provider task entered blocking poll");
+    let deadline = MonoInstant::from_nanos(5);
+    h.clock.advance_to(deadline).unwrap();
+
+    {
+        let mut join = Box::pin(h.coordinator.join(deadline));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut join)
+                .await
+                .is_err(),
+            "deadline cleanup must await actual task termination"
+        );
+    }
+    assert!(
+        h.coordinator.in_flight(),
+        "cancelling join must leave the JoinHandle owned by the coordinator"
+    );
+
+    release_tx.send(()).expect("release provider task");
+    assert!(matches!(
+        h.coordinator.join(deadline).await,
+        Err(HistoryJoinError::DeadlineElapsed
+            | HistoryJoinError::Aborted
+            | HistoryJoinError::JoinFailure)
+    ));
+    assert!(!h.coordinator.in_flight());
 }
 
 #[tokio::test]
@@ -753,9 +826,15 @@ async fn dropped_drive_future_keeps_request_owned_and_ready_page_blocks_stale_cu
         );
     }
     assert!(h.coordinator.in_flight());
+    assert!(h.coordinator.has_owned_task());
     tx.send(Ok(vec![candle(940_000)])).unwrap();
     assert_eq!(h.coordinator.drive().await, HistoryProgress::PageReady);
     assert!(h.coordinator.in_flight());
+    assert!(h.coordinator.has_completed_page());
+    assert!(
+        !h.coordinator.has_owned_task(),
+        "a retained completed page is in-flight App work but no longer an owned task"
+    );
     assert_eq!(
         h.coordinator.update_boundary(0, &h.series),
         HistoryProgress::Idle
@@ -827,7 +906,7 @@ async fn hung_request_observes_gate_closure_without_late_commit_or_retry() {
     h.provider.close_gate();
     assert_eq!(
         h.coordinator.drive().await,
-        HistoryProgress::PermanentlyDisabled
+        HistoryProgress::TerminalFailure(ProviderError::Invariant("rate gate closed"))
     );
     assert!(h.coordinator.terminal_disabled());
     assert!(matches!(

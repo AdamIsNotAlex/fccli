@@ -59,6 +59,10 @@ pub trait TerminalDriver: Send + Sync {
     fn disable_mouse(&self) -> io::Result<()>;
     fn leave_alternate(&self) -> io::Result<()>;
     fn disable_raw(&self) -> io::Result<()>;
+    /// Samples the current render target size. Test drivers may return scripted changes.
+    fn size(&self) -> io::Result<(u16, u16)> {
+        crossterm::terminal::size()
+    }
 }
 
 /// Crossterm-backed production driver bound to the process standard streams.

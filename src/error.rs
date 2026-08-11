@@ -395,4 +395,9 @@ pub enum AppError {
     Render(#[from] RenderError),
     #[error("application invariant failed: {0}")]
     Invariant(&'static str),
+    #[error("{primary}; secondary failure: {secondary}")]
+    PrimaryWithSecondary {
+        primary: Box<AppError>,
+        secondary: Box<AppError>,
+    },
 }

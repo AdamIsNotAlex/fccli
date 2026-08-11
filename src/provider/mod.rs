@@ -43,15 +43,39 @@ pub trait MarketDataProvider: Send + Sync {
 #[derive(Clone)]
 pub struct ProviderRegistry {
     binance: Arc<binance::BinanceProvider>,
+    #[cfg(feature = "test-transport")]
+    injected: Option<Arc<dyn MarketDataProvider>>,
 }
 
 impl ProviderRegistry {
     #[must_use]
     pub fn new(binance: Arc<binance::BinanceProvider>) -> Self {
-        Self { binance }
+        Self {
+            binance,
+            #[cfg(feature = "test-transport")]
+            injected: None,
+        }
+    }
+
+    #[cfg(feature = "test-transport")]
+    #[must_use]
+    pub fn with_test_provider(
+        binance: Arc<binance::BinanceProvider>,
+        provider: Arc<dyn MarketDataProvider>,
+    ) -> Self {
+        Self {
+            binance,
+            injected: Some(provider),
+        }
     }
 
     pub fn get(&self, id: ProviderId) -> Result<Arc<dyn MarketDataProvider>, ProviderError> {
+        #[cfg(feature = "test-transport")]
+        if id.as_str() == "binance"
+            && let Some(provider) = &self.injected
+        {
+            return Ok(Arc::clone(provider));
+        }
         match id.as_str() {
             "binance" => Ok(self.binance.clone()),
             _ => Err(ProviderError::Configuration(

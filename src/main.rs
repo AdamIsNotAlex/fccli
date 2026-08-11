@@ -1,1 +1,91 @@
-fn main() {}
+use std::{
+    ffi::OsString,
+    io::{self, Write},
+    process::ExitCode,
+};
+
+use fccli::cli::{Cli, canonicalize_binance};
+
+#[cfg(feature = "production-transport")]
+use fccli::{
+    app::{CrosstermTerminalInput, RunDependencies, run_with_dependencies},
+    clock::{Clock, SystemClock},
+    provider::{ProviderRegistry, binance::BinanceProvider},
+    terminal::CrosstermTerminalDriver,
+};
+#[cfg(feature = "production-transport")]
+use std::{io::IsTerminal, sync::Arc};
+
+fn main() -> ExitCode {
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let cli = match parse_cli(&args) {
+        Ok(cli) => cli,
+        Err(code) => return code,
+    };
+    if let Err(error) = canonicalize_binance(cli.instrument()) {
+        eprintln!("fccli: {error}");
+        return ExitCode::FAILURE;
+    }
+    run_valid(args)
+}
+
+fn parse_cli(args: &[OsString]) -> Result<Cli, ExitCode> {
+    Cli::try_parse_from(args.iter().cloned()).map_err(|error| {
+        let mut target: Box<dyn Write> = if error.use_stderr() {
+            Box::new(io::stderr())
+        } else {
+            Box::new(io::stdout())
+        };
+        let _ = target.write_all(error.to_string().as_bytes());
+        ExitCode::from(if error.use_stderr() { 2 } else { 0 })
+    })
+}
+
+#[cfg(feature = "production-transport")]
+fn run_valid(args: Vec<OsString>) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            eprintln!("fccli: failed to start async runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(async move {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let provider = match BinanceProvider::new(Arc::clone(&clock)) {
+            Ok(provider) => Arc::new(provider),
+            Err(error) => {
+                eprintln!("fccli: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let dependencies = RunDependencies {
+            providers: ProviderRegistry::new(provider),
+            clock,
+            terminal: CrosstermTerminalDriver::production_driver(),
+            input: Box::new(CrosstermTerminalInput::new()),
+            stdout: Box::new(io::stdout()),
+            stderr: Box::new(io::stderr()),
+            stdin_is_tty: io::stdin().is_terminal(),
+            stdout_is_tty: io::stdout().is_terminal(),
+        };
+        match run_with_dependencies(args, dependencies).await {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("fccli: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+#[cfg(feature = "test-transport")]
+fn run_valid(_args: Vec<OsString>) -> ExitCode {
+    // Valid modes are integration-tested through `run_with_dependencies` with explicit local
+    // dependencies. The test-feature binary exists only for parse-time help/version/error exits.
+    eprintln!("fccli: valid modes require direct injected dependencies in test builds");
+    ExitCode::FAILURE
+}
