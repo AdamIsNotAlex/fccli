@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, fmt, ops::Range, str::FromStr};
+use std::{collections::VecDeque, fmt, ops::Range, str::FromStr, sync::Arc};
 
 use time::{Date, Month, OffsetDateTime};
 
@@ -662,6 +662,11 @@ impl CandleSeries {
     #[must_use]
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Candle> + ExactSizeIterator {
         self.candles.iter()
+    }
+    /// Consumes the series and moves its candles into shared contiguous storage.
+    #[must_use]
+    pub fn into_arc(self) -> Arc<[Candle]> {
+        Arc::from(self.candles.into_iter().collect::<Vec<_>>())
     }
 
     #[must_use]

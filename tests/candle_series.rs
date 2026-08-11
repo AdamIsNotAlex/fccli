@@ -105,6 +105,27 @@ fn replacement_is_initial_only_including_empty_initialization() {
 }
 
 #[test]
+fn consuming_into_arc_preserves_candle_order_and_content() {
+    let mut series = CandleSeries::new(Timeframe::Minute1);
+    series
+        .replace(vec![
+            rest(BASE, 10.0),
+            ws(BASE + MINUTE, 11.0, false),
+            ws(BASE + 2 * MINUTE, 12.0, true),
+        ])
+        .expect("initial replacement succeeds");
+    let expected: Vec<_> = series.iter().cloned().collect();
+
+    let candles = series.into_arc();
+
+    assert_eq!(&*candles, &expected);
+    assert_eq!(std::sync::Arc::strong_count(&candles), 1);
+
+    let empty = CandleSeries::new(Timeframe::Minute1).into_arc();
+    assert!(empty.is_empty());
+}
+
+#[test]
 fn empty_singleton_and_current_open_series_are_safe() {
     let mut series = CandleSeries::new(Timeframe::Minute1);
 
