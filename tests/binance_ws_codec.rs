@@ -675,14 +675,13 @@ async fn raw_socket_reports_stalled_application_write() {
 
     let outcome = timeout(Duration::from_secs(2), async {
         loop {
-            match fccli::provider::binance::send_raw_websocket(
+            if let Err(error) = fccli::provider::binance::send_raw_websocket(
                 &mut socket,
                 Message::Binary(vec![0; 64 * 1024].into()),
             )
             .await
             {
-                Err(error) => break error,
-                Ok(()) => {}
+                break error;
             }
         }
     })

@@ -6,7 +6,7 @@ use std::{
 
 use fccli::cli::{Cli, canonicalize_binance};
 
-#[cfg(feature = "production-transport")]
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
 use fccli::{
     app::{CrosstermTerminalInput, RunDependencies, run_with_dependencies},
     chart::{detect_render_policy, no_color_present},
@@ -14,7 +14,7 @@ use fccli::{
     provider::{ProviderRegistry, binance::BinanceProvider},
     terminal::CrosstermTerminalDriver,
 };
-#[cfg(feature = "production-transport")]
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
 use std::{io::IsTerminal, sync::Arc};
 
 fn main() -> ExitCode {
@@ -27,7 +27,18 @@ fn main() -> ExitCode {
         eprintln!("fccli: {error}");
         return ExitCode::FAILURE;
     }
-    run_valid(args)
+    #[cfg(any(
+        all(feature = "production-transport", not(feature = "test-transport")),
+        all(feature = "test-transport", not(feature = "production-transport"))
+    ))]
+    {
+        run_valid(args)
+    }
+    #[cfg(all(feature = "production-transport", feature = "test-transport"))]
+    {
+        let _ = args;
+        ExitCode::FAILURE
+    }
 }
 
 fn parse_cli(args: &[OsString]) -> Result<Cli, ExitCode> {
@@ -42,7 +53,7 @@ fn parse_cli(args: &[OsString]) -> Result<Cli, ExitCode> {
     })
 }
 
-#[cfg(feature = "production-transport")]
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
 fn run_valid(args: Vec<OsString>) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -89,7 +100,7 @@ fn run_valid(args: Vec<OsString>) -> ExitCode {
     })
 }
 
-#[cfg(feature = "test-transport")]
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 fn run_valid(_args: Vec<OsString>) -> ExitCode {
     // Valid modes are integration-tested through `run_with_dependencies` with explicit local
     // dependencies. The test-feature binary exists only for parse-time help/version/error exits.

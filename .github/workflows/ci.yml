@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: 1
+
+jobs:
+  test-and-clippy:
+    name: Test and Clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
+
+      - name: Clippy test-transport targets
+        run: cargo clippy --locked --all-targets --no-default-features --features test-transport -- -D warnings
+
+      - name: Test test-transport targets (macOS and Windows)
+        if: runner.os != 'Linux'
+        run: cargo test --locked --all-targets --no-default-features --features test-transport
+
+      - name: Fetch locked dependencies before Linux egress isolation
+        if: runner.os == 'Linux'
+        run: cargo fetch --locked
+
+      - name: Test test-transport targets with Linux egress denied
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "CARGO_NET_OFFLINE=true" \
+            unshare --net bash -c '
+              set -euo pipefail
+              ip link set lo up
+              exec cargo test --locked --all-targets --no-default-features --features test-transport
+            '
+
+  linux-contracts:
+    name: Linux contract gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Check production transport
+        run: cargo check --locked --all-targets --no-default-features --features production-transport
+
+      - name: Clippy production transport
+        run: cargo clippy --locked --all-targets --no-default-features --features production-transport -- -D warnings
+
+      - name: Verify Linux PTY lifecycle
+        run: cargo test --locked --test terminal_lifecycle --no-default-features --features test-transport linux_openpty_restores_kernel_state -- --exact
+
+      - name: Verify default feature selection
+        run: cargo test --locked --test feature_selection default_is_production_only -- --exact
+
+      - name: Verify mutually exclusive features fail for the dedicated reason
+        shell: bash
+        run: |
+          set +e
+          output="$(cargo check --locked --all-targets --no-default-features --features production-transport,test-transport 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+
+          if [[ $status -ne 101 ]]; then
+            echo "Expected Cargo exit 101 for mutually exclusive features, got $status" >&2
+            exit 1
+          fi
+
+          expected='error: features `test-transport` and `production-transport` are mutually exclusive'
+          if [[ "$(printf '%s\n' "$output" | awk -v expected="$expected" '$0 == expected { count++ } END { print count + 0 }')" -ne 1 ]]; then
+            echo "Expected exactly one dedicated feature-conflict compile_error" >&2
+            exit 1
+          fi
+
+          if [[ "$(printf '%s\n' "$output" | awk '/^error(\[[^]]+\])?:/ && $0 !~ /^error: could not compile / { count++ } END { print count + 0 }')" -ne 1 ]]; then
+            echo "Mutual-exclusion check failed for an additional compiler error" >&2
+            exit 1
+          fi
+
+      - name: Verify constructor boundaries
+        run: cargo test --locked --test api_boundaries --no-default-features --features test-transport combined_production_constructors_are_unnameable -- --exact
+
+      - name: Verify constructor boundaries under production transport
+        run: cargo test --locked --test api_boundaries --no-default-features --features production-transport combined_production_constructors_are_unnameable -- --exact
+
+      - name: Verify reconciliation state persistence
+        run: cargo test --locked --test app_live_contract --no-default-features --features test-transport reconciliation_target_and_state_persistence -- --exact

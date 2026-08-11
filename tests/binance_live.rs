@@ -613,8 +613,10 @@ async fn acknowledgement_timeout_emits_exact_error_then_backoff_before_second_ge
     });
 
     let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
-    let mut live = LiveSupervisorConfig::default();
-    live.reconcile_ack_timeout = Duration::from_secs(2);
+    let live = LiveSupervisorConfig {
+        reconcile_ack_timeout: Duration::from_secs(2),
+        ..LiveSupervisorConfig::default()
+    };
     let provider = provider(&rest.uri(), &ws_uri, manual.clone(), live);
     let (request, _watermark_tx, _ack_tx) = request(Some(OPEN_TIME));
     let mut feed = provider.open_live(request).await.expect("live feed");
@@ -694,8 +696,10 @@ async fn unacknowledged_generations_use_full_capped_backoff_sequence() {
         }
     });
     let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
-    let mut live = LiveSupervisorConfig::default();
-    live.reconcile_ack_timeout = Duration::from_millis(1);
+    let live = LiveSupervisorConfig {
+        reconcile_ack_timeout: Duration::from_millis(1),
+        ..LiveSupervisorConfig::default()
+    };
     let provider = provider(&rest.uri(), &ws_uri, manual.clone(), live);
     let (request, _watermark_tx, _ack_tx) = request(Some(OPEN_TIME));
     let mut feed = provider.open_live(request).await.expect("feed");
@@ -1741,8 +1745,10 @@ async fn ignored_frames_cannot_starve_first_kline_deadline() {
         }
     });
     let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
-    let mut live = LiveSupervisorConfig::default();
-    live.first_kline_timeout = Duration::from_secs(1);
+    let live = LiveSupervisorConfig {
+        first_kline_timeout: Duration::from_secs(1),
+        ..LiveSupervisorConfig::default()
+    };
     let provider = provider(&rest.uri(), &ws_uri, manual.clone(), live);
     let (request, _watermark_tx, _ack_tx) = request(None);
     let mut feed = provider.open_live(request).await.expect("feed");
@@ -1896,8 +1902,10 @@ async fn connection_max_age_is_not_starved_by_continuously_ready_candle_frames()
         let _ = websocket.next().await;
     });
     let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
-    let mut live = LiveSupervisorConfig::default();
-    live.max_connection_age = Duration::from_secs(5);
+    let live = LiveSupervisorConfig {
+        max_connection_age: Duration::from_secs(5),
+        ..LiveSupervisorConfig::default()
+    };
     let provider = provider(&rest.uri(), &ws_uri, manual.clone(), live);
     let (request, _watermark_tx, ack_tx) = request(Some(OPEN_TIME));
     let mut feed = provider.open_live(request).await.expect("feed");
@@ -2020,10 +2028,12 @@ async fn saturated_app_channel_keeps_pong_progress_and_uses_emergency_pair_befor
     });
     let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
     let clock: Arc<dyn Clock> = manual.clone();
-    let mut live = LiveSupervisorConfig::default();
-    live.keyed_candle_capacity = 1;
-    live.control_capacity = 1;
-    live.market_event_capacity = 1;
+    let live = LiveSupervisorConfig {
+        keyed_candle_capacity: 1,
+        control_capacity: 1,
+        market_event_capacity: 1,
+        ..LiveSupervisorConfig::default()
+    };
     let provider = provider(&rest.uri(), &ws_uri, clock, live);
     let (request, _watermark_tx, ack_tx) = request(Some(OPEN_TIME));
     let mut feed = provider.open_live(request).await.expect("feed");
@@ -2178,10 +2188,12 @@ async fn cancellation_while_saturation_pair_is_queued_emits_only_stopped() {
     });
     let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
     let clock: Arc<dyn Clock> = manual.clone();
-    let mut live = LiveSupervisorConfig::default();
-    live.keyed_candle_capacity = 1;
-    live.control_capacity = 1;
-    live.market_event_capacity = 1;
+    let live = LiveSupervisorConfig {
+        keyed_candle_capacity: 1,
+        control_capacity: 1,
+        market_event_capacity: 1,
+        ..LiveSupervisorConfig::default()
+    };
     let provider = provider(&rest.uri(), &ws_uri, clock, live);
     let (request, _watermark_tx, ack_tx) = request(Some(OPEN_TIME));
     let cancellation = request.cancellation.clone();
@@ -2415,10 +2427,12 @@ async fn dropping_saturated_event_receiver_unblocks_the_producer() {
     });
     let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
     let clock: Arc<dyn Clock> = manual;
-    let mut live = LiveSupervisorConfig::default();
-    live.keyed_candle_capacity = 1;
-    live.control_capacity = 1;
-    live.market_event_capacity = 1;
+    let live = LiveSupervisorConfig {
+        keyed_candle_capacity: 1,
+        control_capacity: 1,
+        market_event_capacity: 1,
+        ..LiveSupervisorConfig::default()
+    };
     let provider = provider(&rest.uri(), &ws_uri, clock, live);
     let (request, _watermark_tx, ack_tx) = request(Some(OPEN_TIME));
     let mut feed = provider.open_live(request).await.expect("feed");
@@ -3121,8 +3135,10 @@ async fn preconnected_max_age_and_backoff_deadlines_fire_at_exact_equality() {
     });
     let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
     let clock: Arc<dyn Clock> = manual.clone();
-    let mut live = LiveSupervisorConfig::default();
-    live.max_connection_age = Duration::from_secs(5);
+    let live = LiveSupervisorConfig {
+        max_connection_age: Duration::from_secs(5),
+        ..LiveSupervisorConfig::default()
+    };
     let provider = provider(&rest.uri(), &ws_uri, clock, live);
     let (request, _watermark_tx, _ack_tx) = request(Some(OPEN_TIME));
     let mut feed = provider.open_live(request).await.expect("feed");
@@ -3714,8 +3730,10 @@ async fn stalled_write_recovers_reconnects_and_preserves_pong_continuity() {
 
     let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
     let clock: Arc<dyn Clock> = manual.clone();
-    let mut live = LiveSupervisorConfig::default();
-    live.stalled_write_probe_frames = 256;
+    let mut live = LiveSupervisorConfig {
+        stalled_write_probe_frames: 256,
+        ..LiveSupervisorConfig::default()
+    };
     live.ws_config.stalled_write_timeout = Duration::from_millis(20);
     let provider = provider(&rest.uri(), &ws_uri, clock, live);
     let (request, _watermark_tx, ack_tx) = request(Some(OPEN_TIME));

@@ -193,6 +193,7 @@ struct TerminalLog {
     trace: Arc<Mutex<Vec<&'static str>>>,
     fail_size_at_call: AtomicUsize,
     size_calls: AtomicUsize,
+    fail_raw_restore: AtomicBool,
 }
 
 impl Default for TerminalLog {
@@ -209,6 +210,7 @@ impl TerminalLog {
             trace: Arc::new(Mutex::new(Vec::new())),
             fail_size_at_call: AtomicUsize::new(usize::MAX),
             size_calls: AtomicUsize::new(0),
+            fail_raw_restore: AtomicBool::new(false),
         }
     }
     fn with_trace(mut self, trace: Arc<Mutex<Vec<&'static str>>>) -> Self {
@@ -234,6 +236,9 @@ impl TerminalLog {
     fn fail_next_size(&self) {
         self.fail_size_at_call
             .store(self.size_calls.load(Ordering::SeqCst), Ordering::SeqCst);
+    }
+    fn fail_raw_restore(&self) {
+        self.fail_raw_restore.store(true, Ordering::SeqCst);
     }
     fn record(&self, action: &'static str) {
         self.actions.acquire().push(action);
@@ -272,7 +277,11 @@ impl TerminalDriver for TerminalLog {
     }
     fn disable_raw(&self) -> std::io::Result<()> {
         self.record("raw-");
-        Ok(())
+        if self.fail_raw_restore.load(Ordering::SeqCst) {
+            Err(std::io::Error::other("injected raw restore failure"))
+        } else {
+            Ok(())
+        }
     }
     fn size(&self) -> std::io::Result<(u16, u16)> {
         let call = self.size_calls.fetch_add(1, Ordering::SeqCst);
@@ -1667,14 +1676,18 @@ async fn history_task_panic_is_a_one_shot_fatal_app_failure() {
 }
 
 #[tokio::test]
-async fn closed_rate_gate_is_a_fatal_sanitized_app_failure() {
+async fn closed_rate_gate_preserves_primary_through_restore_and_producer_cleanup() {
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
     let initial = (0..30)
         .map(|index| candle(index * 60_000, index * 60_000 + 59_999))
         .collect::<Vec<_>>();
-    let provider = Arc::new(FakeProvider::new(initial, vec![], Arc::clone(&clock)));
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(
+        FakeProvider::new(initial, vec![], Arc::clone(&clock)).with_trace(Arc::clone(&trace)),
+    );
     provider.close_gate();
-    let terminal = Arc::new(TerminalLog::with_sizes([(100, 30)]));
+    let terminal = Arc::new(TerminalLog::with_sizes([(100, 30)]).with_trace(Arc::clone(&trace)));
+    terminal.fail_raw_restore();
 
     let error = run_with_dependencies(
         ["fccli", "btc", "1m", "--interactive"],
@@ -1688,8 +1701,32 @@ async fn closed_rate_gate_is_a_fatal_sanitized_app_failure() {
     )
     .await
     .expect_err("closed rate-gate observer must terminate the App");
-    assert!(error.to_string().contains("rate gate closed"));
-    assert_eq!(terminal.actions().last(), Some(&"raw-"));
+    let rendered = error.to_string();
+    assert!(rendered.starts_with("provider invariant failed: provider rate gate closed"));
+    assert!(rendered.contains("secondary failure: terminal restoration failed"));
+
+    let trace = trace.acquire();
+    let restore = trace
+        .iter()
+        .position(|entry| *entry == "raw-")
+        .expect("raw restoration was attempted");
+    let producer_cleanup = trace
+        .iter()
+        .position(|entry| *entry == "producer-cleaned")
+        .expect("live producer was cancelled and joined");
+    assert!(
+        restore < producer_cleanup,
+        "terminal restoration must precede bounded producer join cleanup"
+    );
+    assert!(
+        terminal
+            .actions()
+            .iter()
+            .filter(|action| **action == "raw-")
+            .count()
+            >= 2,
+        "Drop retries the failed inverse after explicit aggregated cleanup"
+    );
 }
 
 #[tokio::test]
@@ -1960,37 +1997,29 @@ async fn pending_history_join_aborts_after_restoration_at_manual_deadline() {
     );
     let advance = async {
         for _ in 0..10_000 {
-            let trace = trace.acquire();
-            let restored = trace.iter().any(|entry| *entry == "raw-");
-            let producer_joined = trace.iter().any(|entry| *entry == "producer-cleaned");
-            drop(trace);
+            let (restored, producer_joined) = {
+                let trace = trace.acquire();
+                (trace.contains(&"raw-"), trace.contains(&"producer-cleaned"))
+            };
             if restored && producer_joined {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        let before_deadline = trace.acquire();
-        assert!(before_deadline.iter().any(|entry| *entry == "raw-"));
-        assert!(
-            before_deadline
-                .iter()
-                .any(|entry| *entry == "producer-cleaned")
-        );
-        drop(before_deadline);
-        assert!(
-            !trace
-                .acquire()
-                .iter()
-                .any(|entry| *entry == "history-cleaned")
-        );
+        let (restored_before_deadline, producer_joined_before_deadline) = {
+            let before_deadline = trace.acquire();
+            (
+                before_deadline.contains(&"raw-"),
+                before_deadline.contains(&"producer-cleaned"),
+            )
+        };
+        assert!(restored_before_deadline);
+        assert!(producer_joined_before_deadline);
+        assert!(!trace.acquire().contains(&"history-cleaned"));
         for _ in 0..20 {
             manual.advance_by(Duration::from_secs(1)).unwrap();
             tokio::task::yield_now().await;
-            if trace
-                .acquire()
-                .iter()
-                .any(|entry| *entry == "history-cleaned")
-            {
+            if trace.acquire().contains(&"history-cleaned") {
                 break;
             }
         }
@@ -2376,15 +2405,15 @@ async fn completed_history_page_survives_layout_pending_until_first_ready_resize
         if is_pending_backfill
             && completed.load(Ordering::Acquire)
             && observation.source_counts[3] > 0
+            && let Some(sender) = pending_page_tx.acquire().take()
         {
-            if let Some(sender) = pending_page_tx.acquire().take() {
-                let _ = sender.send(());
-            }
+            let _ = sender.send(());
         }
-        if observation.snapshot.candles.len() == 50 && viewport_signature(&observation).is_some() {
-            if let Some(sender) = ready_tx.acquire().take() {
-                let _ = sender.send(());
-            }
+        if observation.snapshot.candles.len() == 50
+            && viewport_signature(&observation).is_some()
+            && let Some(sender) = ready_tx.acquire().take()
+        {
+            let _ = sender.send(());
         }
         captured.acquire().push(observation);
     }));
@@ -2474,10 +2503,12 @@ async fn retained_history_page_at_max_clock_clears_without_join_deadline_overflo
         if retained {
             release.store(true, Ordering::Release);
         }
-        if retained && completed.load(Ordering::Acquire) && observation.source_counts[3] > 0 {
-            if let Some(sender) = pending_page_tx.acquire().take() {
-                let _ = sender.send(());
-            }
+        if retained
+            && completed.load(Ordering::Acquire)
+            && observation.source_counts[3] > 0
+            && let Some(sender) = pending_page_tx.acquire().take()
+        {
+            let _ = sender.send(());
         }
     }));
 
@@ -3471,14 +3502,15 @@ async fn direct_rate_gate_transitions_are_monotonic_quota_controlled_and_closure
             expected: RateGateState,
         ) -> usize {
             for _ in 0..10_000 {
-                let observations = observations.acquire();
-                if let Some(offset) = observations[start..]
-                    .iter()
-                    .position(|observation| observation.snapshot.rate_gate == expected)
-                {
+                let matching_offset = {
+                    let observations = observations.acquire();
+                    observations[start..]
+                        .iter()
+                        .position(|observation| observation.snapshot.rate_gate == expected)
+                };
+                if let Some(offset) = matching_offset {
                     return start + offset;
                 }
-                drop(observations);
                 tokio::task::yield_now().await;
             }
             panic!("rate gate state was not reduced after observation {start}: {expected:?}");

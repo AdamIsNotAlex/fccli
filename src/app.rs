@@ -918,9 +918,62 @@ async fn run_interactive(
         ),
     };
     let rate_gate_observer = provider.rate_gate();
-    let initial_rate_gate = rate_gate_observer
-        .current()
-        .map_err(|_| ProviderError::Invariant("provider rate gate closed"))?;
+    let initial_rate_gate = match rate_gate_observer.current() {
+        Ok(state) => state,
+        Err(_) => {
+            let mut primary = Some(AppError::Provider(ProviderError::Invariant(
+                "provider rate gate closed",
+            )));
+            cancellation.cancel();
+            live.request_shutdown();
+            history.request_shutdown();
+
+            if let Err(failures) = session.restore() {
+                primary = Some(attach_secondary(
+                    primary,
+                    AppError::Terminal(TerminalError::Restore {
+                        operation: "interactive terminal cleanup",
+                        cause: if failures.is_empty() {
+                            SanitizedCause::Other
+                        } else {
+                            SanitizedCause::Io
+                        },
+                    }),
+                ));
+            }
+            drop(session);
+
+            let now = dependencies.clock.now();
+            let deadline = cleanup_deadline(
+                now,
+                PRODUCER_JOIN_TIMEOUT,
+                &mut primary,
+                "live producer join deadline overflow",
+            );
+            if let Err(error) = live.join(deadline).await {
+                primary = Some(attach_secondary(primary, map_live_join(error)));
+            }
+
+            if history.in_flight() {
+                let now = dependencies.clock.now();
+                let deadline = if history.has_owned_task() {
+                    cleanup_deadline(
+                        now,
+                        HISTORY_JOIN_TIMEOUT,
+                        &mut primary,
+                        "history join deadline overflow",
+                    )
+                } else {
+                    now
+                };
+                if let Err(error) = history.join(deadline).await {
+                    primary = Some(attach_secondary(primary, map_history_join(error)));
+                }
+            }
+
+            return Err(primary.expect("closed rate gate is primary"));
+        }
+    };
     let rate_gate = initial_rate_gate;
     let mut app = App {
         instrument,

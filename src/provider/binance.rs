@@ -56,10 +56,10 @@ pub const REST_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REST_BODY_LIMIT: usize = 2 * 1024 * 1024;
 pub const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(30);
 
-#[cfg(feature = "production-transport")]
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
 const PRODUCTION_REST_BASE: &str = "https://data-api.binance.vision";
 
-#[cfg(feature = "production-transport")]
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
 const PRODUCTION_WS_BASE: &str = "wss://data-stream.binance.vision";
 const WS_BYTE_LIMIT_MAX: usize = 16 * 1024 * 1024;
 pub const WS_READ_BUFFER_SIZE: usize = 128 * 1024;
@@ -89,7 +89,7 @@ pub struct LiveSupervisorConfig {
     pub reconcile_ack_timeout: Duration,
     pub max_connection_age: Duration,
     pub ws_config: WsConfig,
-    #[cfg(feature = "test-transport")]
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub stalled_write_probe_frames: usize,
 }
 
@@ -103,7 +103,7 @@ impl Default for LiveSupervisorConfig {
             reconcile_ack_timeout: RECONCILE_ACK_TIMEOUT,
             max_connection_age: MAX_CONNECTION_AGE,
             ws_config: WsConfig::default(),
-            #[cfg(feature = "test-transport")]
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             stalled_write_probe_frames: 0,
         }
     }
@@ -122,7 +122,7 @@ impl LiveSupervisorConfig {
                 ));
             }
         }
-        #[cfg(feature = "test-transport")]
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         if self.stalled_write_probe_frames > MAX_SUPERVISOR_CAPACITY {
             return Err(ProviderError::Configuration(
                 "live supervisor stalled-write probe is outside 0..=65536",
@@ -288,13 +288,13 @@ struct WsKline {
     #[serde(rename = "x")]
     closed: bool,
 }
-#[cfg(feature = "production-transport")]
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
 pub fn websocket_url(instrument: &Instrument, timeframe: Timeframe) -> Result<Url, ProviderError> {
     websocket_url_from_base(PRODUCTION_WS_BASE, instrument, timeframe, false)
         .map_err(|error| contextualize_websocket_configuration(error, instrument, timeframe))
 }
 
-#[cfg(feature = "test-transport")]
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 pub fn test_websocket_url(
     base_url: &str,
     instrument: &Instrument,
@@ -760,7 +760,7 @@ impl RawWebSocket {
     }
 }
 
-#[cfg(feature = "production-transport")]
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
 pub async fn connect_websocket(
     instrument: &Instrument,
     timeframe: Timeframe,
@@ -770,7 +770,7 @@ pub async fn connect_websocket(
     connect_websocket_url(&url, instrument, timeframe, config).await
 }
 
-#[cfg(feature = "test-transport")]
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 pub async fn connect_test_websocket(
     base_url: &str,
     instrument: &Instrument,
@@ -906,11 +906,11 @@ pub struct BinanceProvider {
     body_limit: usize,
     rate_limit_fallback: Duration,
     live: LiveSupervisorConfig,
-    #[cfg(feature = "test-transport")]
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     ws_base_url: Option<String>,
 }
 
-#[cfg(feature = "test-transport")]
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[derive(Clone, Debug)]
 pub struct BinanceTestConfig {
     pub base_url: String,
@@ -919,7 +919,7 @@ pub struct BinanceTestConfig {
     pub rate_limit_fallback: Duration,
 }
 
-#[cfg(feature = "test-transport")]
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 impl BinanceTestConfig {
     #[must_use]
     pub fn loopback(base_url: impl Into<String>) -> Self {
@@ -941,7 +941,7 @@ impl BinanceTestConfig {
     }
 }
 
-#[cfg(feature = "test-transport")]
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[derive(Clone, Debug)]
 pub struct BinanceLiveTestConfig {
     pub rest: BinanceTestConfig,
@@ -950,7 +950,7 @@ pub struct BinanceLiveTestConfig {
 }
 
 impl BinanceProvider {
-    #[cfg(feature = "production-transport")]
+    #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
     pub fn new(clock: Arc<dyn Clock>) -> Result<Self, ProviderError> {
         Self::build(
             Url::parse(PRODUCTION_REST_BASE)
@@ -963,7 +963,7 @@ impl BinanceProvider {
         )
     }
 
-    #[cfg(feature = "test-transport")]
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub fn new_test(
         base_url: impl AsRef<str>,
         clock: Arc<dyn Clock>,
@@ -971,7 +971,7 @@ impl BinanceProvider {
         Self::new_test_with_config_and_clock(BinanceTestConfig::loopback(base_url.as_ref()), clock)
     }
 
-    #[cfg(feature = "test-transport")]
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub fn new_test_with_config_and_clock(
         config: BinanceTestConfig,
         clock: Arc<dyn Clock>,
@@ -988,7 +988,7 @@ impl BinanceProvider {
         )
     }
 
-    #[cfg(feature = "test-transport")]
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub fn new_test_live(
         config: BinanceLiveTestConfig,
         clock: Arc<dyn Clock>,
@@ -1013,7 +1013,11 @@ impl BinanceProvider {
         body_limit: usize,
         rate_limit_fallback: Duration,
         live: LiveSupervisorConfig,
-        #[cfg(feature = "test-transport")] ws_base_url: Option<String>,
+        #[cfg(all(
+            feature = "test-transport",
+            not(feature = "production-transport")
+        ))]
+        ws_base_url: Option<String>,
     ) -> Result<Self, ProviderError> {
         if request_timeout.is_zero() || body_limit == 0 || rate_limit_fallback.is_zero() {
             return Err(ProviderError::Configuration(
@@ -1038,7 +1042,7 @@ impl BinanceProvider {
             body_limit,
             rate_limit_fallback,
             live,
-            #[cfg(feature = "test-transport")]
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             ws_base_url,
         })
     }
@@ -1198,11 +1202,11 @@ impl BinanceProvider {
         instrument: &Instrument,
         timeframe: Timeframe,
     ) -> Result<RawWebSocket, ProviderError> {
-        #[cfg(feature = "production-transport")]
+        #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
         {
             connect_websocket(instrument, timeframe, self.live.ws_config).await
         }
-        #[cfg(feature = "test-transport")]
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         {
             let base = self
                 .ws_base_url
@@ -1211,6 +1215,11 @@ impl BinanceProvider {
                     "test WebSocket base URL is required for live feeds",
                 ))?;
             connect_test_websocket(base, instrument, timeframe, self.live.ws_config).await
+        }
+        #[cfg(all(feature = "production-transport", feature = "test-transport"))]
+        {
+            let _ = (instrument, timeframe);
+            unreachable!("mutually exclusive transport features are rejected by src/lib.rs")
         }
     }
 
@@ -1387,7 +1396,7 @@ impl BinanceProvider {
             },
         )
         .await?;
-        #[cfg(feature = "test-transport")]
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         if self.live.stalled_write_probe_frames != 0 {
             let payload_size = self
                 .live

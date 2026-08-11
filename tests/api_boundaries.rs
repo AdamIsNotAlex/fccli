@@ -13,6 +13,10 @@ struct CompileFixture {
 
 impl CompileFixture {
     fn new(name: &str, dependency_feature: &str, source: &str) -> Self {
+        Self::new_with_features(name, &[dependency_feature], source)
+    }
+
+    fn new_with_features(name: &str, dependency_features: &[&str], source: &str) -> Self {
         let id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "fccli-api-boundary-{name}-{}-{id}",
@@ -23,8 +27,13 @@ impl CompileFixture {
         let package_name = format!("fccli-api-boundary-{name}");
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let dependency_path = toml_string(manifest_dir);
+        let features = dependency_features
+            .iter()
+            .map(|feature| format!("{feature:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let manifest = format!(
-            "[package]\nname = {package_name:?}\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\nfccli = {{ path = {dependency_path}, default-features = false, features = [{dependency_feature:?}] }}\n"
+            "[package]\nname = {package_name:?}\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\nfccli = {{ path = {dependency_path}, default-features = false, features = [{features}] }}\n"
         );
         fs::write(root.join("Cargo.toml"), manifest).expect("write compile fixture manifest");
         fs::write(root.join("src/main.rs"), source).expect("write compile fixture source");
@@ -302,5 +311,35 @@ fn main() {
     let _socket = fccli::provider::binance::connect_test_websocket();
 }
 "#,
+    );
+}
+
+#[test]
+fn mutually_exclusive_transports_emit_only_the_dedicated_compile_error() {
+    let fixture = CompileFixture::new_with_features(
+        "mutually-exclusive-transports",
+        &["production-transport", "test-transport"],
+        "fn main() {}\n",
+    );
+    let output = fixture.check();
+    assert!(
+        !output.status.success(),
+        "mutually exclusive transport features unexpectedly compiled"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let dedicated = "features `test-transport` and `production-transport` are mutually exclusive";
+    assert!(
+        stderr.contains(dedicated),
+        "missing dedicated mutual-exclusion diagnostic:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("error[E"),
+        "mutual-exclusion failure emitted a secondary Rust type/name error:\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches(&format!("error: {dedicated}")).count(),
+        1,
+        "dedicated mutual-exclusion error header was emitted more than once:\n{stderr}"
     );
 }
