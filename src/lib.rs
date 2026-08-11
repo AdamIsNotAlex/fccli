@@ -7,6 +7,7 @@ pub mod chart;
 pub mod cli;
 pub mod clock;
 pub mod error;
+pub mod history;
 pub mod model;
 pub mod provider;
 pub mod snapshot;
