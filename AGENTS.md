@@ -3,3 +3,6 @@
 - Interactive input dependencies must use a bounded, cancellation-safe `TerminalInput`, never an arbitrary blocking `Read`, so shutdown can join input work before restoring the terminal.
 - Guard every transport-specific use site with mutually exclusive feature `cfg`s; enabling both transport features must produce only the dedicated `compile_error!` diagnostic.
 - Keep environment-validation accounting distinct: tracker completion records that work was attempted/accounted for, while `FINAL-SCOPE` `PASS` requires authoritative native evidence and native-environment blockers remain explicitly blocked.
+- Cargo 1.96 registry extractions use `.cargo-ok` without per-file `.cargo-checksum.json`; verify dependency integrity by matching every cached `.crate` SHA-256 to `Cargo.lock` and comparing archive members byte-for-byte with extracted sources.
+- CI must disable checkout credential persistence, fetch locked dependencies before compilation, restrict runner egress with pinned Harden-Runner v2.20.1, and compile with Cargo offline; Linux also runs compile/test work in a loopback-only network namespace.
+- Dependency policy gates pin `cargo-audit` 0.22.2 and `cargo-deny` 0.20.2; unknown registries, Git sources, and wildcard dependency requirements are denied.

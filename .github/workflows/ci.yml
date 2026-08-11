@@ -12,8 +12,50 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  dependency-policy:
+    name: Dependency security policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden runner egress
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: block
+          disable-telemetry: true
+          allowed-endpoints: >
+            api.github.com:443
+            crates.io:443
+            github.com:443
+            index.crates.io:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            static.crates.io:443
+            static.rust-lang.org:443
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal
+
+      - name: Install pinned dependency security tools
+        run: |
+          cargo +1.96.0 install --locked --version 0.22.2 cargo-audit
+          cargo +1.96.0 install --locked --version 0.20.2 cargo-deny
+
+      - name: Check out repository without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Audit RustSec advisories
+        run: cargo audit
+
+      - name: Enforce dependency policy
+        run: cargo deny --locked check advisories bans sources
+
   test-and-clippy:
     name: Test and Clippy (${{ matrix.os }})
+    needs: dependency-policy
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -23,24 +65,33 @@ jobs:
           - macos-latest
           - windows-latest
     steps:
-      - name: Check out repository
+      - name: Harden runner egress
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: block
+          disable-telemetry: true
+          allowed-endpoints: >
+            api.github.com:443
+            crates.io:443
+            github.com:443
+            index.crates.io:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            static.crates.io:443
+            static.rust-lang.org:443
+
+      - name: Check out repository without persisted credentials
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
 
-      - name: Clippy test-transport targets
-        run: cargo clippy --locked --all-targets --no-default-features --features test-transport -- -D warnings
-
-      - name: Test test-transport targets (macOS and Windows)
-        if: runner.os != 'Linux'
-        run: cargo test --locked --all-targets --no-default-features --features test-transport
-
-      - name: Fetch locked dependencies before Linux egress isolation
-        if: runner.os == 'Linux'
+      - name: Fetch locked dependencies before compilation
         run: cargo fetch --locked
 
-      - name: Test test-transport targets with Linux egress denied
+      - name: Clippy and test with Linux egress denied
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -49,18 +100,49 @@ jobs:
             "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
             "CARGO_NET_OFFLINE=true" \
-            unshare --net bash -c '
-              set -euo pipefail
-              ip link set lo up
-              exec cargo test --locked --all-targets --no-default-features --features test-transport
-            '
+            unshare --net bash -s <<'EOF'
+          set -euo pipefail
+          ip link set lo up
+          cargo clippy --locked --all-targets --no-default-features --features test-transport -- -D warnings
+          cargo test --locked --all-targets --no-default-features --features test-transport
+          EOF
+
+      - name: Clippy test-transport targets offline
+        if: runner.os != 'Linux'
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: cargo clippy --locked --all-targets --no-default-features --features test-transport -- -D warnings
+
+      - name: Test test-transport targets offline
+        if: runner.os != 'Linux'
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: cargo test --locked --all-targets --no-default-features --features test-transport
 
   linux-contracts:
     name: Linux contract gates
+    needs: dependency-policy
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
+      - name: Harden runner egress
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: block
+          disable-telemetry: true
+          allowed-endpoints: >
+            api.github.com:443
+            crates.io:443
+            github.com:443
+            index.crates.io:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            static.crates.io:443
+            static.rust-lang.org:443
+
+      - name: Check out repository without persisted credentials
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
@@ -68,21 +150,26 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
-      - name: Check production transport
-        run: cargo check --locked --all-targets --no-default-features --features production-transport
+      - name: Fetch locked dependencies before compilation
+        run: cargo fetch --locked
 
-      - name: Clippy production transport
-        run: cargo clippy --locked --all-targets --no-default-features --features production-transport -- -D warnings
-
-      - name: Verify Linux PTY lifecycle
-        run: cargo test --locked --test terminal_lifecycle --no-default-features --features test-transport linux_openpty_restores_kernel_state -- --exact
-
-      - name: Verify default feature selection
-        run: cargo test --locked --test feature_selection default_is_production_only -- --exact
-
-      - name: Verify mutually exclusive features fail for the dedicated reason
+      - name: Run Linux contract gates with egress denied
         shell: bash
         run: |
+          sudo env \
+            "PATH=$PATH" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "CARGO_NET_OFFLINE=true" \
+            unshare --net bash -s <<'EOF'
+          set -euo pipefail
+          ip link set lo up
+
+          cargo check --locked --all-targets --no-default-features --features production-transport
+          cargo clippy --locked --all-targets --no-default-features --features production-transport -- -D warnings
+          cargo test --locked --test terminal_lifecycle --no-default-features --features test-transport linux_openpty_restores_kernel_state -- --exact
+          cargo test --locked --test feature_selection default_is_production_only -- --exact
+
           set +e
           output="$(cargo check --locked --all-targets --no-default-features --features production-transport,test-transport 2>&1)"
           status=$?
@@ -94,7 +181,7 @@ jobs:
             exit 1
           fi
 
-          expected='error: features `test-transport` and `production-transport` are mutually exclusive'
+          expected="error: features \`test-transport\` and \`production-transport\` are mutually exclusive"
           if [[ "$(printf '%s\n' "$output" | awk -v expected="$expected" '$0 == expected { count++ } END { print count + 0 }')" -ne 1 ]]; then
             echo "Expected exactly one dedicated feature-conflict compile_error" >&2
             exit 1
@@ -105,11 +192,7 @@ jobs:
             exit 1
           fi
 
-      - name: Verify constructor boundaries
-        run: cargo test --locked --test api_boundaries --no-default-features --features test-transport combined_production_constructors_are_unnameable -- --exact
-
-      - name: Verify constructor boundaries under production transport
-        run: cargo test --locked --test api_boundaries --no-default-features --features production-transport combined_production_constructors_are_unnameable -- --exact
-
-      - name: Verify reconciliation state persistence
-        run: cargo test --locked --test app_live_contract --no-default-features --features test-transport reconciliation_target_and_state_persistence -- --exact
+          cargo test --locked --test api_boundaries --no-default-features --features test-transport combined_production_constructors_are_unnameable -- --exact
+          cargo test --locked --test api_boundaries --no-default-features --features production-transport combined_production_constructors_are_unnameable -- --exact
+          cargo test --locked --test app_live_contract --no-default-features --features test-transport reconciliation_target_and_state_persistence -- --exact
+          EOF
