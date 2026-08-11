@@ -268,7 +268,9 @@ pub enum TerminalError {
         #[source]
         cause: SanitizedCause,
     },
-    #[error("interactive mode requires both stdin and stdout to be terminals")]
+    #[error(
+        "interactive mode requires both stdin and stdout to be terminals; run without --interactive to render a snapshot"
+    )]
     TtyRequired,
 }
 

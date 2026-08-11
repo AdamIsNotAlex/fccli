@@ -919,6 +919,7 @@ fn dependencies(
         stderr: Box::new(SharedWriter::default()),
         stdin_is_tty: true,
         stdout_is_tty: true,
+        render_policy: fccli::chart::RenderPolicy::StyleFree,
         epoch_observer: None,
     }
 }
@@ -933,17 +934,15 @@ async fn direct_interactive_dispatch_fetches_before_terminal_and_restores_on_q()
     );
     let terminal = Arc::new(TerminalLog::default().with_trace(Arc::clone(&trace)));
     let output = SharedWriter::default();
-    let result = run_with_dependencies(
-        ["fccli", "btc", "1m", "--interactive"],
-        dependencies(
-            provider.clone(),
-            key_input('q'),
-            terminal.clone(),
-            output,
-            clock,
-        ),
-    )
-    .await;
+    let mut deps = dependencies(
+        provider.clone(),
+        key_input('q'),
+        terminal.clone(),
+        output.clone(),
+        clock,
+    );
+    deps.render_policy = fccli::chart::RenderPolicy::Color;
+    let result = run_with_dependencies(["fccli", "btc", "1m", "--interactive"], deps).await;
     assert_eq!(trace.acquire().first(), Some(&"history"));
     assert_eq!(result.unwrap(), ExitCode::SUCCESS);
     assert_eq!(provider.requests.acquire()[0].limit(), 500);
@@ -953,6 +952,46 @@ async fn direct_interactive_dispatch_fetches_before_terminal_and_restores_on_q()
             "raw+", "alt+", "mouse+", "cursor-", "cursor+", "mouse-", "alt-", "raw-"
         ]
     );
+    assert!(
+        output
+            .0
+            .acquire()
+            .windows(b"\x1b[32m".len())
+            .any(|window| window == b"\x1b[32m"),
+        "explicit interactive color policy must emit the bull-candle green SGR"
+    );
+}
+
+#[tokio::test]
+async fn interactive_non_tty_error_is_stable_actionable_and_side_effect_free() {
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+    let provider = Arc::new(FakeProvider::new(
+        vec![candle(0, 59_999)],
+        vec![],
+        Arc::clone(&clock),
+    ));
+    let terminal = Arc::new(TerminalLog::default());
+    let mut deps = dependencies(
+        provider.clone(),
+        Box::new(ScriptedTerminalInput::new([])),
+        terminal.clone(),
+        SharedWriter::default(),
+        clock,
+    );
+    deps.stdin_is_tty = false;
+    let error = run_with_dependencies(["fccli", "btc", "1m", "--interactive"], deps)
+        .await
+        .expect_err("interactive mode must reject a non-TTY endpoint");
+
+    assert_eq!(error, AppError::Terminal(TerminalError::TtyRequired));
+    assert_eq!(
+        error.to_string(),
+        "interactive mode requires both stdin and stdout to be terminals; run without --interactive to render a snapshot"
+    );
+    assert!(provider.requests.acquire().is_empty());
+    assert_eq!(provider.canonicalize_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.open_live_calls.load(Ordering::SeqCst), 0);
+    assert!(terminal.actions().is_empty());
 }
 
 #[tokio::test]
@@ -1223,6 +1262,7 @@ async fn direct_snapshot_dispatch_uses_the_real_injected_runner() {
     );
     deps.stdin_is_tty = false;
     deps.stdout_is_tty = false;
+    deps.render_policy = fccli::chart::RenderPolicy::Color;
     let result = run_with_dependencies(["fccli", "btc", "1m"], deps).await;
     assert_eq!(result.unwrap(), ExitCode::SUCCESS);
     assert_eq!(provider.requests.acquire()[0].limit(), 500);
@@ -1230,6 +1270,8 @@ async fn direct_snapshot_dispatch_uses_the_real_injected_runner() {
     let rendered = String::from_utf8_lossy(&output.0.acquire()).into_owned();
     assert!(rendered.contains("SNAPSHOT"));
     assert_eq!(rendered.lines().count(), 36);
+    assert!(!rendered.contains('\x1b'));
+    assert!(rendered.contains('█'));
 }
 
 #[tokio::test]
@@ -1307,6 +1349,8 @@ async fn direct_tty_snapshot_uses_injected_60_by_19_size_for_one_provider_reques
     assert_eq!(rows.len(), 18);
     assert!(rows.iter().all(|row| row.chars().count() == 60));
     assert!(rendered.contains("SNAPSHOT"));
+    assert!(!rendered.contains('\x1b'));
+    assert!(rendered.contains('█'));
 }
 
 #[tokio::test]

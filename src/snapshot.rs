@@ -126,7 +126,7 @@ pub async fn run_snapshot(
     })
 }
 
-fn serialize_frame(
+pub(crate) fn serialize_frame(
     buffer: &Buffer,
     target: SnapshotOutputTarget,
     policy: RenderPolicy,

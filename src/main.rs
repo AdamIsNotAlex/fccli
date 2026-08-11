@@ -9,6 +9,7 @@ use fccli::cli::{Cli, canonicalize_binance};
 #[cfg(feature = "production-transport")]
 use fccli::{
     app::{CrosstermTerminalInput, RunDependencies, run_with_dependencies},
+    chart::{detect_render_policy, no_color_present},
     clock::{Clock, SystemClock},
     provider::{ProviderRegistry, binance::BinanceProvider},
     terminal::CrosstermTerminalDriver,
@@ -54,6 +55,11 @@ fn run_valid(args: Vec<OsString>) -> ExitCode {
         }
     };
     runtime.block_on(async move {
+        let stdin_is_tty = io::stdin().is_terminal();
+        let stdout_is_tty = io::stdout().is_terminal();
+        let no_color = std::env::var_os("NO_COLOR");
+        let render_policy =
+            detect_render_policy(stdout_is_tty, no_color_present(no_color.as_deref()));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let provider = match BinanceProvider::new(Arc::clone(&clock)) {
             Ok(provider) => Arc::new(provider),
@@ -69,8 +75,9 @@ fn run_valid(args: Vec<OsString>) -> ExitCode {
             input: Box::new(CrosstermTerminalInput::new()),
             stdout: Box::new(io::stdout()),
             stderr: Box::new(io::stderr()),
-            stdin_is_tty: io::stdin().is_terminal(),
-            stdout_is_tty: io::stdout().is_terminal(),
+            stdin_is_tty,
+            stdout_is_tty,
+            render_policy,
         };
         match run_with_dependencies(args, dependencies).await {
             Ok(code) => code,

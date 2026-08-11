@@ -472,6 +472,7 @@ pub struct RunDependencies {
     pub stderr: Box<dyn std::io::Write + Send>,
     pub stdin_is_tty: bool,
     pub stdout_is_tty: bool,
+    pub render_policy: RenderPolicy,
 }
 pub async fn run_with_dependencies<I, T>(
     args: I,
@@ -555,6 +556,7 @@ The canonical invalid/missing-418 error and producer sequence are exactly `Marke
 - PTY automation 只证明 Linux command/lifecycle contract；tmux、Terminal.app/iTerm2、Windows Terminal 仍需 manual smoke。鼠标 availability 依赖 terminal event reporting，键盘和 cleanup 是硬保证。
 
 - **Superseding locked-decision correction (2026-08-11, append-only):** the earlier canonical `RunDependencies.stdin: Box<dyn std::io::Read + Send>` shape is withdrawn because a blocking `Read::read` has no portable bounded interruption/cancellation guarantee. It is superseded by `RunDependencies.input: Box<dyn TerminalInput>` and the finite `poll(timeout)`/owner-cancellation-and-join contract above. This correction is required by the existing no-leak shutdown invariant: the input owner must stop and join before `TerminalSession` restoration, rather than leaving a detached or indefinitely blocked reader after raw/alternate/mouse/cursor teardown.
+- **Superseding locked-decision correction (2026-08-11, append-only):** `RunDependencies` carries the sole explicit `render_policy: RenderPolicy`. Production `main` captures stdout TTY capability and `NO_COLOR` presence exactly once, before dependency construction, through the pure public `detect_render_policy(stdout_is_tty, no_color_present)` boundary; any present value, including empty or non-Unicode, disables color. Snapshot and interactive dispatch consume this captured policy without a second environment read or per-render detection, while every non-TTY output is unconditionally `StyleFree`. This supersedes the earlier implicit style-free interactive/snapshot dispatch because it could not express the locked TTY-color-without-`NO_COLOR` behavior or prove deterministic environment isolation.
 
 ## Dependency-ordered implementation chunks
 
@@ -1536,6 +1538,18 @@ Chunk-17 append-only formatter and reconciliation-state update (authoritative ov
 The canonical total is therefore **117 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-117`, accompanied by Main `artifact://3134`. `DET-RECONCILIATION-STATE=PASS` now relies on the superseding exact Main execution in `artifact://3136`, where the named aggregate passed 1 test with 39 filtered out; the prior successful Main `artifact://3075`, `artifact://3016`, and `artifact://2965` attempts remain preserved as history. Main artifacts are counted only as stated, subagent runs are excluded, and the successful check, broader test, App-test, and Clippy stages in `artifact://3134` do not promote any unrelated ledger record.
 
 Chunk-17 final evidence-role clarification (append-only; no formatter execution is added and the canonical `DET-FMT` total remains 117): Main `artifact://3134` is the authoritative full chain—190 default-feature tests, 318 test-transport tests, all 40 App tests, Cargo check, and Clippy passed—while Main `artifact://3136` is only the exact `reconciliation_target_and_state_persistence` execution, with 1 passed and 39 filtered out. This clarification preserves `fmt-exec-117`/`artifact://3134` as the current `DET-FMT` basis and `artifact://3136` as the current `DET-RECONCILIATION-STATE` basis.
+
+Chunk-18 append-only formatter update (authoritative over the earlier 117-execution total and `fmt-exec-117` current basis, both of which remain preserved as historical accounting; only the retained Main command is credited, subagent runs are excluded, and no chunk-19 platform/final or other ledger record is promoted):
+
+| Record ID | Attempt/date | Requirement | Status after attempt | Environment | Command/scenario | PASS semantics | Observed result | Evidence | Blocker/next action | Supersedes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| DET-FMT | `attempt-2026-08-11-chunk18-1` / 2026-08-11 | REQUIRED | `PASS` | Linux workspace, final chunk-18 tree | `cargo fmt --check` within the retained Main final-success command accompanied by `artifact://3220` | exit 0 | PASS; formatting and Cargo check passed, the default-feature suite passed 191 tests, the test-transport suite passed 320 tests, the exact App target passed all 41 tests, and the final Clippy stage passed | Main `artifact://3220` records the final successful chain progressing beyond `cargo fmt --check` through every later stage, proving the formatter stage exited 0 without diagnostics. | — | `attempt-2026-08-11-chunk17-8` |
+
+| Record ID | True occurrence | Canonical execution identity | Exact invocation/result evidence | Historical rows accounted for |
+|---|---:|---|---|---|
+| DET-FMT | 118 | `fmt-exec-118` | The retained Main final-success command accompanied by `artifact://3220` contains `cargo fmt --check`; formatting and Cargo check passed, the default-feature suite passed 191 tests, the test-transport suite passed 320 tests, the exact App target passed all 41 tests, and the final Clippy stage passed, so formatting exited 0 without diagnostics. | `attempt-2026-08-11-chunk18-1` is the execution row and supplies current `DET-FMT=PASS`. |
+
+The canonical total is therefore **118 `DET-FMT` executions**. Current `DET-FMT=PASS` relies on `fmt-exec-118`, accompanied by Main `artifact://3220`. Main artifacts are counted only as stated, subagent runs are excluded, and the successful check, broader test, exact App-test, and Clippy stages do not promote chunk-19 platform/final records or any other unrelated ledger record.
 The final planned test inventory includes `tests/app_live_contract.rs` and contains no `tests/app_integration.rs`; this is not a precreation requirement. Chunk 2 creates and uses `tests/feature_selection.rs` only for its named feature-selection gates; `tests/app_live_contract.rs` MUST NOT exist before chunk 17, where the real App reducer/sole MarketEvent consumer contract is introduced. The final inventory also contains exactly `tests/terminal_lifecycle.rs` and `tests/api_boundaries.rs` for the other named specialized gates. `terminal_pty` and `transport_api_boundary` are not API/test-target names.
 ### Smoke and delivery references（ledger-only）
 

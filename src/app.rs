@@ -199,6 +199,7 @@ pub struct RunDependencies {
     pub stderr: Box<dyn Write + Send>,
     pub stdin_is_tty: bool,
     pub stdout_is_tty: bool,
+    pub render_policy: RenderPolicy,
     #[cfg(feature = "test-transport")]
     pub epoch_observer: Option<EpochObserver>,
 }
@@ -236,6 +237,11 @@ where
         .get(cli.instrument().provider().clone())?;
     match cli.mode() {
         Mode::Snapshot => {
+            let render_policy = if dependencies.stdout_is_tty {
+                dependencies.render_policy
+            } else {
+                RenderPolicy::StyleFree
+            };
             let target = if dependencies.stdout_is_tty {
                 let (width, height) =
                     dependencies
@@ -256,7 +262,7 @@ where
                 cli.instrument(),
                 cli.timeframe(),
                 target,
-                RenderPolicy::StyleFree,
+                render_policy,
                 CancellationToken::new(),
                 &mut dependencies.stdout,
             )
@@ -957,6 +963,7 @@ async fn run_interactive(
             &cancellation,
             &mut input_rx,
             dependencies.terminal.as_ref(),
+            dependencies.render_policy,
             &mut dependencies.stdout,
         )
         .await;
@@ -1033,6 +1040,7 @@ async fn run_app_loop(
     cancellation: &CancellationToken,
     input_rx: &mut mpsc::UnboundedReceiver<InputEvent>,
     terminal: &dyn crate::terminal::TerminalDriver,
+    render_policy: RenderPolicy,
     output: &mut dyn Write,
 ) -> Option<AppError> {
     let mut input_open = true;
@@ -1065,7 +1073,7 @@ async fn run_app_loop(
             }
         }
         if app.dirty {
-            if let Err(error) = render(app, output) {
+            if let Err(error) = render(app, render_policy, output) {
                 return Some(error);
             }
             app.dirty = false;
@@ -1410,7 +1418,7 @@ impl Drop for InputReaderTask {
     }
 }
 
-fn render(app: &App, output: &mut dyn Write) -> Result<(), AppError> {
+fn render(app: &App, policy: RenderPolicy, output: &mut dyn Write) -> Result<(), AppError> {
     let frame = match &app.layout {
         ChartLayoutResult::LayoutPending { actual, .. } => {
             Rect::new(0, 0, actual.width, actual.height)
@@ -1419,19 +1427,16 @@ fn render(app: &App, output: &mut dyn Write) -> Result<(), AppError> {
     };
     let mut buffer = Buffer::empty(frame);
     let snapshot = app.snapshot();
-    ChartWidget::new(&snapshot, &app.layout, RenderPolicy::StyleFree).render_to(frame, &mut buffer);
+    ChartWidget::new(&snapshot, &app.layout, policy).render_to(frame, &mut buffer);
     output.write_all(b"\x1b[H").map_err(output_error)?;
-    for y in frame.y..frame.y.saturating_add(frame.height) {
-        for x in frame.x..frame.x.saturating_add(frame.width) {
-            output
-                .write_all(buffer[(x, y)].symbol().as_bytes())
-                .map_err(output_error)?;
-        }
-        if y + 1 < frame.y.saturating_add(frame.height) {
-            output.write_all(b"\r\n").map_err(output_error)?;
-        }
-    }
-    output.flush().map_err(output_error)
+    crate::snapshot::serialize_frame(
+        &buffer,
+        SnapshotOutputTarget::Tty {
+            physical_size: Size::new(frame.width, frame.height.saturating_add(1)),
+        },
+        policy,
+        output,
+    )
 }
 
 fn map_terminal_lifecycle(error: TerminalLifecycleError) -> AppError {

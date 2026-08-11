@@ -1,6 +1,6 @@
 //! Pure Ratatui `Buffer` renderer for the shared chart view.
 
-use std::{fmt, fmt::Write as _, sync::Arc};
+use std::{ffi::OsStr, fmt, fmt::Write as _, sync::Arc};
 
 use ratatui::{
     buffer::Buffer,
@@ -35,6 +35,26 @@ pub enum RenderMode {
 pub enum RenderPolicy {
     Color,
     StyleFree,
+}
+
+/// Reports whether `NO_COLOR` was present in a single captured environment lookup.
+///
+/// Presence alone is authoritative, including empty, Unicode, and non-Unicode values.
+#[must_use]
+pub const fn no_color_present(value: Option<&OsStr>) -> bool {
+    value.is_some()
+}
+
+/// Selects the sole rendering policy from the captured output capability and `NO_COLOR`
+/// presence. The environment value is intentionally irrelevant: an empty or non-Unicode value
+/// still means that `NO_COLOR` is present.
+#[must_use]
+pub const fn detect_render_policy(stdout_is_tty: bool, no_color_present: bool) -> RenderPolicy {
+    if stdout_is_tty && !no_color_present {
+        RenderPolicy::Color
+    } else {
+        RenderPolicy::StyleFree
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

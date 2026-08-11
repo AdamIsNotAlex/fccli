@@ -1726,3 +1726,28 @@ fn offscreen_doji_body_is_not_clamped_into_view_when_only_wick_intersects() {
             || symbol(&rendered, center, y) == "╵"
     }));
 }
+
+#[test]
+fn render_policy_detection_uses_captured_tty_and_no_color_presence_only() {
+    use std::ffi::OsStr;
+
+    use fccli::chart::{detect_render_policy, no_color_present};
+
+    assert!(!no_color_present(None));
+    assert!(no_color_present(Some(OsStr::new(""))));
+    assert!(no_color_present(Some(OsStr::new("1"))));
+    assert!(no_color_present(Some(OsStr::new("禁止"))));
+
+    #[cfg(unix)]
+    {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let non_unicode = OsString::from_vec(vec![0xff, 0xfe]);
+        assert!(no_color_present(Some(non_unicode.as_os_str())));
+    }
+
+    assert_eq!(detect_render_policy(true, false), RenderPolicy::Color);
+    assert_eq!(detect_render_policy(true, true), RenderPolicy::StyleFree);
+    assert_eq!(detect_render_policy(false, false), RenderPolicy::StyleFree);
+    assert_eq!(detect_render_policy(false, true), RenderPolicy::StyleFree);
+}

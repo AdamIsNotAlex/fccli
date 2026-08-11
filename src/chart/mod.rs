@@ -21,5 +21,5 @@ pub use state::{
 };
 pub use widget::{
     ChartWidget, DisplayStatus, EMPTY_MESSAGE, FOOTER_MESSAGE, RESIZE_MESSAGE, RenderMode,
-    RenderPolicy, RendererSnapshot,
+    RenderPolicy, RendererSnapshot, detect_render_policy, no_color_present,
 };
