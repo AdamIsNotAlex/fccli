@@ -2,16 +2,16 @@
 
 Terminal candlestick charts for Binance Spot markets.
 
-![fccli rendering a BTC/USDT 1h candlestick chart](assets/fccli-demo.png)
-
 _Example: `fccli btc 1h`_
+
+![fccli rendering a BTC/USDT 1h candlestick chart](assets/fccli-demo.png)
 
 ## Install
 
 Requires Rust 1.96 or newer.
 
 ```sh
-cargo install --path .
+cargo install --git https://github.com/AdamIsNotAlex/fccli
 ```
 
 ## Usage
