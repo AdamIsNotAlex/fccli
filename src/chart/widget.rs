@@ -548,6 +548,16 @@ fn render_candles(
             let y = layout.main_plot.y.saturating_add(relative_row);
             let body_overlaps =
                 upper_weight == StrokeWeight::Heavy || lower_weight == StrokeWeight::Heavy;
+            if direction != Direction::Doji
+                && let Some(body_edge) = body_edge_glyph(upper_weight, lower_weight)
+            {
+                for x in slot.painted_range() {
+                    let x = x as u16;
+                    if x != slot.center() {
+                        set_cell(buffer, x, y, body_edge, style);
+                    }
+                }
+            }
             let symbol = if policy == RenderPolicy::StyleFree
                 && body_overlaps
                 && direction != Direction::Doji
@@ -565,7 +575,9 @@ fn render_candles(
                 .main_plot
                 .y
                 .saturating_add(price_half(candle.open(), range, layout.main_plot) / 2);
-            set_cell(buffer, slot.center(), row, "━", style);
+            for x in slot.painted_range() {
+                set_cell(buffer, x as u16, row, "━", style);
+            }
         }
     }
 }
@@ -652,6 +664,15 @@ fn half_cell_glyph(upper: StrokeWeight, lower: StrokeWeight) -> Option<&'static 
     }
 }
 
+fn body_edge_glyph(upper: StrokeWeight, lower: StrokeWeight) -> Option<&'static str> {
+    match (upper == StrokeWeight::Heavy, lower == StrokeWeight::Heavy) {
+        (false, false) => None,
+        (true, false) => Some("▀"),
+        (false, true) => Some("▄"),
+        (true, true) => Some("█"),
+    }
+}
+
 fn render_volume(
     layout: ChartLayout,
     candles: &[Candle],
@@ -680,7 +701,7 @@ fn render_volume(
         let symbol = volume_symbol(direction, policy);
         let style = price_candle_style(direction, policy);
         for y in start..layout.volume.bottom() {
-            for x in slot.start()..slot.end() {
+            for x in slot.painted_range() {
                 set_cell(buffer, x as u16, y, symbol, style);
             }
         }

@@ -1,5 +1,7 @@
 //! Shared candle-slot projection for rendering and pointer interaction.
 
+use std::ops::Range;
+
 /// One candle's half-open horizontal slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CandleSlot {
@@ -31,6 +33,21 @@ impl CandleSlot {
     #[must_use]
     pub const fn center(self) -> u16 {
         (self.start + (self.end - self.start - 1) / 2) as u16
+    }
+
+    /// Columns painted by the candle body and its volume bar.
+    ///
+    /// Multi-column slots reserve their rightmost column as a visual gap.
+    /// Single-column slots remain fully painted because no nonzero gap can fit.
+    /// Pointer ownership remains the complete slot.
+    #[must_use]
+    pub const fn painted_range(self) -> Range<u32> {
+        let end = if self.end - self.start > 1 {
+            self.end - 1
+        } else {
+            self.end
+        };
+        self.start..end
     }
 
     /// Whether `x` belongs to this half-open slot.

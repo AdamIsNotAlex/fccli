@@ -36,6 +36,24 @@ fn partitions_nondivisible_width_with_remainder_on_the_left() {
 }
 
 #[test]
+fn painted_ranges_reserve_one_right_column_when_possible() {
+    let geometry = CandleSlotGeometry::new(10, 15, 5).expect("valid geometry");
+
+    for index in 0..5 {
+        let slot = geometry.slot(index).expect("valid slot");
+        let painted = slot.painted_range();
+        assert_eq!(painted, slot.start()..slot.end() - 1);
+        assert_eq!(painted.end - painted.start, u32::from(slot.width() - 1));
+        assert!(painted.contains(&u32::from(slot.center())));
+        assert_eq!(
+            geometry.index_at_x(u16::try_from(slot.end() - 1).expect("gap cell")),
+            Some(index),
+            "visual gaps retain slot ownership"
+        );
+    }
+}
+
+#[test]
 fn inverse_mapping_obeys_half_open_edges_and_nonzero_origin() {
     let geometry = CandleSlotGeometry::new(37, 8, 3).expect("valid geometry");
 
@@ -114,5 +132,6 @@ fn single_column_slots_round_trip() {
             (u32::from(x), u32::from(x) + 1, x)
         );
         assert_eq!(geometry.index_at_x(x), Some(index));
+        assert_eq!(slot.painted_range(), slot.start()..slot.end());
     }
 }

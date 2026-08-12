@@ -101,7 +101,7 @@ fn symbols_in(buffer: &Buffer, area: Rect) -> Vec<String> {
 fn is_price_candle_glyph(symbol: &str) -> bool {
     matches!(
         symbol,
-        "█" | "▓" | "━" | "│" | "┃" | "╽" | "╿" | "╷" | "╵" | "╻" | "╹"
+        "█" | "▓" | "▀" | "▄" | "━" | "│" | "┃" | "╽" | "╿" | "╷" | "╵" | "╻" | "╹"
     )
 }
 
@@ -740,7 +740,7 @@ fn row_text(buffer: &Buffer, rect: Rect, y: u16) -> String {
 }
 
 #[test]
-fn projection_table_covers_every_half_cell_body_doji_clip_and_single_column_strokes() {
+fn projection_table_covers_every_half_cell_body_doji_clip_and_dynamic_body_widths() {
     let area = Rect::new(4, 3, 60, 18);
     let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, LayoutMode::Snapshot)
     else {
@@ -848,19 +848,38 @@ fn projection_table_covers_every_half_cell_body_doji_clip_and_single_column_stro
         );
         for x in slot.start()..slot.end() {
             let x = u16::try_from(x).expect("valid layout slot coordinate fits u16");
-            if x != center {
-                assert!(
-                    !is_price_candle_glyph(symbol(&buffer, x, layout.main_plot.y + body_row)),
-                    "price candle spilled outside center column for slot {index}"
+            if x == u16::try_from(slot.end() - 1).expect("gap column") {
+                assert!(!is_price_candle_glyph(symbol(
+                    &buffer,
+                    x,
+                    layout.main_plot.y + body_row
+                )));
+            } else if x != center {
+                assert_eq!(
+                    symbol(&buffer, x, layout.main_plot.y + body_row),
+                    "█",
+                    "body edge slot {index}"
+                );
+            }
+        }
+    }
+    for (index, relative_row, expected) in [(5_usize, 1_u16, "▄"), (6, 3, "▄"), (7, 3, "▄")] {
+        let slot = geometry.slot(index).expect("slot");
+        for x in slot.painted_range() {
+            let x = u16::try_from(x).expect("painted coordinate");
+            if x != slot.center() {
+                assert_eq!(
+                    symbol(&buffer, x, layout.main_plot.y + relative_row),
+                    expected,
+                    "half-cell body edge slot {index}"
                 );
             }
         }
     }
     let doji = geometry.slot(2).expect("doji slot");
-    let doji_center = doji.center();
     for x in doji.start()..doji.end() {
         let x = u16::try_from(x).expect("valid layout slot coordinate fits u16");
-        if x == doji_center {
+        if x < u16::try_from(doji.painted_range().end).expect("painted end") {
             assert_eq!(symbol(&buffer, x, layout.main_plot.y + 2), "━");
         } else {
             assert_ne!(symbol(&buffer, x, layout.main_plot.y + 2), "━");
@@ -1143,7 +1162,7 @@ fn candles_and_volume_overwrite_only_their_exact_cells_on_horizontal_grid() {
                         assert!(tick_rows.contains(&y), "grid outside tick row ({x}, {y})");
                         assert_complete_style(cell, grid_fg, Color::Reset);
                     }
-                    "│" | "┃" | "╷" | "╵" | "╻" | "╹" | "╽" | "╿" | "█" | "▓" | "━" =>
+                    "│" | "┃" | "╷" | "╵" | "╻" | "╹" | "╽" | "╿" | "█" | "▓" | "▀" | "▄" | "━" =>
                         {}
                     " " => assert!(
                         !tick_rows.contains(&y),
@@ -1369,7 +1388,7 @@ fn one_column_slots_preserve_bull_and_bear_direction() {
 }
 
 #[test]
-fn multi_column_slots_render_price_candles_only_at_the_center() {
+fn multi_column_slots_share_dynamic_width_between_price_and_volume() {
     let area = Rect::new(0, 0, 60, 18);
     let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, LayoutMode::Snapshot)
     else {
@@ -1406,17 +1425,21 @@ fn multi_column_slots_render_price_candles_only_at_the_center() {
     assert!(
         (layout.main_plot.y..layout.main_plot.bottom())
             .any(|y| symbol(&rendered, center, y) == "┃"),
-        "reference-style body stroke"
+        "center preserves half-cell projection"
     );
-    for x in slot.start()..slot.end() {
+    let body_row = (layout.main_plot.y..layout.main_plot.bottom())
+        .find(|&y| symbol(&rendered, center, y) == "┃")
+        .expect("body row");
+    for x in slot.painted_range() {
         let x = u16::try_from(x).expect("valid layout slot coordinate fits u16");
         if x != center {
-            assert!(
-                (layout.main_plot.y..layout.main_plot.bottom())
-                    .all(|y| { !is_price_candle_glyph(symbol(&rendered, x, y)) })
-            );
+            assert_eq!(symbol(&rendered, x, body_row), "█");
         }
+        assert_eq!(symbol(&rendered, x, layout.volume.bottom() - 1), "█");
     }
+    let gap = u16::try_from(slot.end() - 1).expect("gap column");
+    assert!(!is_price_candle_glyph(symbol(&rendered, gap, body_row)));
+    assert_ne!(symbol(&rendered, gap, layout.volume.bottom() - 1), "█");
 }
 
 #[test]
