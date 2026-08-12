@@ -789,11 +789,11 @@ fn render_crosshair(
         Style::default()
     };
     for row in layout.main_plot.y..layout.main_plot.bottom() {
-        set_cell(buffer, x, row, "┆", style);
+        set_overlay_cell(buffer, x, row, "┆", style);
     }
     fill_overlay_row(buffer, layout.main_plot, y, "┄", style);
     fill_row(buffer, layout.gutter, y, "┄", style);
-    set_cell(buffer, x, y, "┼", style);
+    set_overlay_cell(buffer, x, y, "┼", style);
 
     let overlay_style = if policy == RenderPolicy::Color {
         Style::default().fg(Color::Black).bg(Color::Yellow)

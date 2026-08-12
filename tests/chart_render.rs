@@ -559,34 +559,50 @@ fn crosshair_is_last_continues_through_gutter_and_axes_are_final() {
     )
     .render(area, &mut buffer);
 
-    let intersection = (layout.main_plot.y..layout.main_plot.bottom())
-        .flat_map(|y| (layout.main_plot.x..layout.main_plot.right()).map(move |x| (x, y)))
-        .find(|&(x, y)| symbol(&buffer, x, y) == "┼")
-        .expect("intersection");
-    assert_eq!(
-        style(&buffer, intersection.0, intersection.1).fg,
-        Some(Color::Yellow)
-    );
+    let geometry = fccli::chart::CandleSlotGeometry::new(
+        layout.main_plot.x,
+        layout.main_plot.width,
+        series.len(),
+    )
+    .expect("geometry");
+    let crosshair_x = geometry.center(1).expect("hovered candle center");
+    let crosshair_y = layout.main_plot.y
+        + ((112.0 - 100.0) / 20.0 * f64::from(layout.main_plot.height - 1)).round() as u16;
+
+    assert!(is_price_candle_glyph(symbol(
+        &buffer,
+        crosshair_x,
+        crosshair_y
+    )));
     for x in layout.gutter.x..layout.gutter.right() {
-        assert_eq!(symbol(&buffer, x, intersection.1), "┄");
-        assert_eq!(style(&buffer, x, intersection.1).fg, Some(Color::Yellow));
+        assert_eq!(symbol(&buffer, x, crosshair_y), "┄");
+        assert_eq!(style(&buffer, x, crosshair_y).fg, Some(Color::Yellow));
     }
     let axis_text: String = (layout.price_axis.x..layout.price_axis.right())
-        .map(|x| symbol(&buffer, x, intersection.1))
+        .map(|x| symbol(&buffer, x, crosshair_y))
         .collect();
     assert_eq!(
         axis_text.chars().count(),
         usize::from(layout.price_axis.width)
     );
     for x in layout.price_axis.x..layout.price_axis.right() {
-        assert_eq!(style(&buffer, x, intersection.1).fg, Some(Color::Black));
-        assert_eq!(style(&buffer, x, intersection.1).bg, Some(Color::Yellow));
+        assert_eq!(style(&buffer, x, crosshair_y).fg, Some(Color::Black));
+        assert_eq!(style(&buffer, x, crosshair_y).bg, Some(Color::Yellow));
     }
-    for y in layout.main_plot.y..layout.main_plot.bottom() {
-        assert!(matches!(symbol(&buffer, intersection.0, y), "┆" | "┼"));
-    }
-    assert_ne!(symbol(&buffer, intersection.0, layout.volume.y), "┆");
-    assert_ne!(symbol(&buffer, intersection.0, layout.header.y), "┆");
+    assert!(
+        (layout.main_plot.y..layout.main_plot.bottom()).all(|y| matches!(
+            symbol(&buffer, crosshair_x, y),
+            "┆"
+        ) || is_price_candle_glyph(
+            symbol(&buffer, crosshair_x, y)
+        ))
+    );
+    assert!(
+        (layout.main_plot.y..layout.main_plot.bottom())
+            .any(|y| symbol(&buffer, crosshair_x, y) == "┆")
+    );
+    assert_ne!(symbol(&buffer, crosshair_x, layout.volume.y), "┆");
+    assert_ne!(symbol(&buffer, crosshair_x, layout.header.y), "┆");
 }
 #[test]
 fn current_price_uses_canonical_tail_and_crosshair_wins_same_row() {
@@ -1446,16 +1462,22 @@ fn exact_style_and_overwrite_table_resets_hostile_cells_for_both_policies() {
             grid.fg.unwrap_or(Color::Reset),
             Color::Reset,
         );
-        let intersection = (layout.main_plot.y..layout.main_plot.bottom())
-            .flat_map(|y| (layout.main_plot.x..layout.main_plot.right()).map(move |x| (x, y)))
-            .find(|&(x, y)| symbol(&buffer, x, y) == "┼")
-            .expect("crosshair over candle/grid");
+        let crosshair_x = geometry.center(1).expect("hovered candle center");
+        let crosshair_y = layout.main_plot.y
+            + ((112.0 - 100.0) / 20.0 * f64::from(layout.main_plot.height - 1)).round() as u16;
+        assert!(is_price_candle_glyph(symbol(
+            &buffer,
+            crosshair_x,
+            crosshair_y
+        )));
+        let vertical_overlay_y = (layout.main_plot.y..layout.main_plot.bottom())
+            .find(|&y| symbol(&buffer, crosshair_x, y) == "┆")
+            .expect("crosshair vertical overlay on non-candle cell");
         assert_complete_style(
-            &buffer[(intersection.0, intersection.1)],
+            &buffer[(crosshair_x, vertical_overlay_y)],
             crosshair.fg.unwrap_or(Color::Reset),
             Color::Reset,
         );
-        assert_eq!(symbol(&buffer, intersection.0, intersection.1), "┼");
         for y in layout.frame.y..layout.frame.bottom() {
             for x in layout.frame.x..layout.frame.right() {
                 let cell = &buffer[(x, y)];
