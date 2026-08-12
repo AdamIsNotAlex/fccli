@@ -51,21 +51,35 @@ fn candle(authority: FinalityAuthority) -> Candle {
 }
 
 #[test]
-fn all_sixteen_timeframes_round_trip_and_minutes_are_distinct_from_months() {
-    let spellings = [
-        "1s", "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d",
-        "1w", "1M",
-    ];
+fn timeframes_accept_canonical_and_unit_only_spellings() {
+    let canonical_spellings = Timeframe::INPUT_SPELLINGS
+        .into_iter()
+        .filter(|(spelling, timeframe)| *spelling == timeframe.as_str());
 
-    assert_eq!(Timeframe::ALL.len(), spellings.len());
-    for (timeframe, spelling) in Timeframe::ALL.into_iter().zip(spellings) {
+    assert_eq!(Timeframe::ALL.len(), canonical_spellings.clone().count());
+    for (timeframe, (spelling, mapped_timeframe)) in
+        Timeframe::ALL.into_iter().zip(canonical_spellings)
+    {
+        assert_eq!(mapped_timeframe, timeframe);
         assert_eq!(timeframe.as_str(), spelling);
         assert_eq!(timeframe.to_string(), spelling);
         assert_eq!(Timeframe::from_str(spelling), Ok(timeframe));
     }
 
-    assert_ne!(Timeframe::from_str("1m"), Timeframe::from_str("1M"));
-    for invalid in ["1S", "1month", "60m", "", " 1m"] {
+    for (alias, expected) in [
+        ("s", Timeframe::Second1),
+        ("m", Timeframe::Minute1),
+        ("h", Timeframe::Hour1),
+        ("d", Timeframe::Day1),
+        ("w", Timeframe::Week1),
+        ("M", Timeframe::Month1),
+    ] {
+        assert_eq!(Timeframe::from_str(alias), Ok(expected), "{alias}");
+        assert_eq!(expected.to_string(), format!("1{alias}"), "{alias}");
+    }
+
+    assert_ne!(Timeframe::from_str("m"), Timeframe::from_str("M"));
+    for invalid in ["S", "H", "D", "W", "1S", "1month", "60m", "", " 1m"] {
         assert_eq!(
             Timeframe::from_str(invalid),
             Err(ModelError::InvalidTimeframe)

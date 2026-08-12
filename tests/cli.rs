@@ -8,6 +8,11 @@ fn parse(instrument: &str, timeframe: &str) -> Cli {
     Cli::try_parse_from(["fccli", instrument, timeframe]).expect("valid CLI arguments")
 }
 
+fn parse_args(arguments: &[&str]) -> Cli {
+    Cli::try_parse_from(std::iter::once("fccli").chain(arguments.iter().copied()))
+        .expect("valid CLI arguments")
+}
+
 #[test]
 fn valid_symbol_forms_canonicalize_to_locked_binance_spot_identifiers() {
     let cases = [
@@ -84,23 +89,30 @@ fn direct_instrument_specs_are_canonicalized_independently_of_cli_preprocessing(
 }
 
 #[test]
-fn all_sixteen_intervals_parse_exactly_and_minute_is_distinct_from_month() {
-    let spellings = [
-        "1s", "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d",
-        "1w", "1M",
-    ];
-
-    for (expected, spelling) in Timeframe::ALL.into_iter().zip(spellings) {
+fn canonical_and_unit_only_intervals_parse_with_distinct_minutes_and_months() {
+    for expected in Timeframe::ALL {
+        let spelling = expected.as_str();
         assert_eq!(parse("btc", spelling).timeframe(), expected, "{spelling}");
     }
-    assert_eq!(parse("btc", "1m").timeframe(), Timeframe::Minute1);
-    assert_eq!(parse("btc", "1M").timeframe(), Timeframe::Month1);
+    for (alias, expected) in [
+        ("s", Timeframe::Second1),
+        ("m", Timeframe::Minute1),
+        ("h", Timeframe::Hour1),
+        ("d", Timeframe::Day1),
+        ("w", Timeframe::Week1),
+        ("M", Timeframe::Month1),
+    ] {
+        assert_eq!(parse("btc", alias).timeframe(), expected, "{alias}");
+    }
+    assert_eq!(parse("btc", "m").timeframe(), Timeframe::Minute1);
+    assert_eq!(parse("btc", "M").timeframe(), Timeframe::Month1);
 
-    for invalid in ["1S", "1month", "60m", "1 m", "1m "] {
+    for invalid in ["S", "H", "1S", "1month", "60m", "1 m", "1m "] {
         let error = Cli::try_parse_from(["fccli", "btc", invalid]).expect_err(invalid);
         assert_eq!(error.kind(), ErrorKind::ValueValidation, "{invalid}");
         let rendered = error.to_string();
         assert!(rendered.contains("unsupported timeframe"), "{rendered}");
+        assert!(rendered.contains("unit-only values mean 1"), "{rendered}");
         assert!(rendered.contains("case-sensitive"), "{rendered}");
     }
 }
@@ -127,6 +139,26 @@ fn provider_defaults_to_binance_and_explicit_provider_is_preserved_until_canonic
         canonicalize_binance(wrong_case.instrument()),
         Err(CanonicalizationError::UnsupportedProvider { .. })
     ));
+}
+
+#[test]
+fn omitted_targets_use_defaults_and_one_token_is_always_an_instrument() {
+    for (arguments, expected_base) in [
+        (&[][..], "BTC"),
+        (&["eth"][..], "ETH"),
+        (&["h"][..], "H"),
+        (&["60m"][..], "60M"),
+    ] {
+        let cli = parse_args(arguments);
+        assert_eq!(
+            cli.instrument().provider().as_str(),
+            "binance",
+            "{arguments:?}"
+        );
+        assert_eq!(cli.instrument().base(), expected_base, "{arguments:?}");
+        assert_eq!(cli.instrument().quote(), None, "{arguments:?}");
+        assert_eq!(cli.timeframe(), Timeframe::Hour1, "{arguments:?}");
+    }
 }
 
 #[test]
@@ -334,11 +366,16 @@ fn parser_error_precedence_is_stable_and_actionable() {
         "{timeframe_second}"
     );
 
-    let missing = Cli::try_parse_from(["fccli"]).expect_err("missing positionals");
-    assert_eq!(missing.kind(), ErrorKind::MissingRequiredArgument);
-    let rendered = missing.to_string();
-    assert!(rendered.contains("<INSTRUMENT>"), "{rendered}");
-    assert!(rendered.contains("<TIMEFRAME>"), "{rendered}");
+    let defaulted = Cli::try_parse_from(["fccli"]).expect("positionals have defaults");
+    assert_eq!(defaulted.instrument().base(), "BTC");
+    assert_eq!(defaulted.timeframe(), Timeframe::Hour1);
+
+    let extra = Cli::try_parse_from(["fccli", "btc", "1h", "secret-extra"])
+        .expect_err("third positional is rejected");
+    assert_eq!(extra.kind(), ErrorKind::TooManyValues);
+    let rendered = extra.to_string();
+    assert!(rendered.contains("unexpected extra argument"), "{rendered}");
+    assert!(!rendered.contains("secret-extra"), "{rendered}");
 }
 
 #[test]
@@ -348,9 +385,10 @@ fn help_version_and_command_rendering_are_library_only_and_stable() {
     let help = help.to_string();
     for expected in [
         "Render Binance Spot candlestick charts",
-        "Usage: fccli [OPTIONS] <INSTRUMENT> <TIMEFRAME>",
+        "Usage: fccli [OPTIONS] [INSTRUMENT] [TIMEFRAME]",
         "-i, --interactive",
-        "case-sensitive",
+        "default: binance:btc",
+        "unit-only s/m/h/d/w/M means 1",
         "fccli binance:btc/usdc 1h",
     ] {
         assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
@@ -381,34 +419,33 @@ fn help_version_and_command_rendering_are_library_only_and_stable() {
 }
 
 #[test]
-fn parse_market_target_matches_startup_grammar_for_valid_inputs() {
-    for (instrument, timeframe) in [
-        ("btc", "1m"),
-        ("binance:btc", "1h"),
-        ("btc/usdc", "1M"),
-        ("btc-usdt", "1d"),
-        ("BTCUSDT", "1s"),
+fn parse_market_target_matches_startup_grammar_for_zero_one_and_two_fields() {
+    for fields in [
+        &[][..],
+        &["eth"][..],
+        &["h"][..],
+        &["60m"][..],
+        &["btc", "m"][..],
+        &["btc/usdc", "M"][..],
+        &["binance:btc", "1h"][..],
     ] {
-        let cli = Cli::try_parse_from(["fccli", instrument, timeframe]).expect("valid CLI");
-        let target =
-            parse_market_target(&format!("{instrument} {timeframe}")).expect("valid target");
-        assert_eq!(
-            target.instrument,
-            *cli.instrument(),
-            "{instrument} {timeframe}"
-        );
-        assert_eq!(
-            target.timeframe,
-            cli.timeframe(),
-            "{instrument} {timeframe}"
-        );
+        let cli = parse_args(fields);
+        let target = parse_market_target(&fields.join(" ")).expect("valid target");
+        assert_eq!(target.instrument, *cli.instrument(), "{fields:?}");
+        assert_eq!(target.timeframe, cli.timeframe(), "{fields:?}");
     }
 }
 
 #[test]
-fn parse_market_target_rejects_missing_extra_and_invalid_tokens() {
-    assert!(parse_market_target("").is_err());
-    assert!(parse_market_target("btc").is_err());
+fn parse_market_target_defaults_missing_fields_and_rejects_extra_or_invalid_tokens() {
+    let defaulted = parse_market_target("").expect("empty target uses defaults");
+    assert_eq!(defaulted.instrument.base(), "BTC");
+    assert_eq!(defaulted.timeframe, Timeframe::Hour1);
+
+    let market_only = parse_market_target("h").expect("one field is an instrument");
+    assert_eq!(market_only.instrument.base(), "H");
+    assert_eq!(market_only.timeframe, Timeframe::Hour1);
+
     assert!(parse_market_target("btc 1m 1h").is_err());
     assert!(parse_market_target("btc/usdt/eth 1m").is_err());
     assert!(parse_market_target("btc 60m").is_err());

@@ -194,6 +194,31 @@ impl Timeframe {
         Self::Month1,
     ];
 
+    pub const INPUT_SPELLINGS: [(&'static str, Self); 22] = [
+        ("s", Self::Second1),
+        ("m", Self::Minute1),
+        ("h", Self::Hour1),
+        ("d", Self::Day1),
+        ("w", Self::Week1),
+        ("M", Self::Month1),
+        ("1s", Self::Second1),
+        ("1m", Self::Minute1),
+        ("3m", Self::Minute3),
+        ("5m", Self::Minute5),
+        ("15m", Self::Minute15),
+        ("30m", Self::Minute30),
+        ("1h", Self::Hour1),
+        ("2h", Self::Hour2),
+        ("4h", Self::Hour4),
+        ("6h", Self::Hour6),
+        ("8h", Self::Hour8),
+        ("12h", Self::Hour12),
+        ("1d", Self::Day1),
+        ("3d", Self::Day3),
+        ("1w", Self::Week1),
+        ("1M", Self::Month1),
+    ];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Second1 => "1s",
@@ -226,9 +251,9 @@ impl FromStr for Timeframe {
     type Err = ModelError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::ALL
+        Self::INPUT_SPELLINGS
             .into_iter()
-            .find(|timeframe| timeframe.as_str() == value)
+            .find_map(|(spelling, timeframe)| (spelling == value).then_some(timeframe))
             .ok_or(ModelError::InvalidTimeframe)
     }
 }

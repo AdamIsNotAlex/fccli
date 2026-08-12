@@ -1894,7 +1894,7 @@ fn binary_help_version_and_argument_errors_exit_before_valid_dispatch() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unsupported timeframe"));
-    assert!(stderr.contains("use one of: 1s, 1m"));
+    assert!(stderr.contains("use one of: s, m, h, d, w, M, 1s, 1m"));
     assert!(!stderr.contains("not-an-interval"));
     assert!(!stderr.contains("valid modes require direct injected dependencies"));
 }
@@ -3724,6 +3724,38 @@ async fn same_canonical_target_is_noop_and_does_not_open_a_second_live_feed() {
 }
 
 #[tokio::test]
+async fn empty_interactive_target_resolves_to_default_market_and_timeframe() {
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+    let provider = Arc::new(FakeProvider::new(
+        vec![candle(0, 59_999)],
+        vec![],
+        Arc::clone(&clock),
+    ));
+    let observations = Arc::new(Mutex::new(Vec::<EpochObservation>::new()));
+    let run = run_with_observations(
+        provider.clone(),
+        switch_then_quit_input(&[""]),
+        clock,
+        Arc::clone(&observations),
+    );
+    assert_eq!(run.await.unwrap(), ExitCode::SUCCESS);
+
+    assert_eq!(provider.open_live_calls.load(Ordering::SeqCst), 2);
+    let observations = observations.acquire();
+    let switched_index = observations
+        .iter()
+        .position(|observation| observation.snapshot.timeframe == Timeframe::Hour1)
+        .expect("empty target switches the initial BTC 1m session to default BTC 1h");
+    assert_eq!(
+        observations[switched_index]
+            .snapshot
+            .instrument
+            .provider_symbol(),
+        "BTCUSDT"
+    );
+}
+
+#[tokio::test]
 async fn invalid_command_shows_footer_error_and_preserves_old_chart() {
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
     let provider = Arc::new(FakeProvider::new(
@@ -3789,6 +3821,43 @@ async fn successful_switch_commits_new_session_and_resets_view() {
         observations[switched_index].snapshot.candles[0].open_time(),
         switched[0].open_time()
     );
+}
+
+#[tokio::test]
+async fn interactive_single_market_and_unit_aliases_reach_canonical_session_identity() {
+    for (target, expected_timeframe) in [
+        ("eth", Timeframe::Hour1),
+        ("eth m", Timeframe::Minute1),
+        ("eth M", Timeframe::Month1),
+    ] {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+        let initial = vec![candle(0, 59_999)];
+        let switched = vec![candle(3_600_000, 3_600_000 + 59_999)];
+        let provider = Arc::new(
+            FakeProvider::new(initial.clone(), vec![], Arc::clone(&clock))
+                .with_history_pages([Ok(initial), Ok(switched)]),
+        );
+        let observations = Arc::new(Mutex::new(Vec::<EpochObservation>::new()));
+        let run = run_with_observations(
+            provider.clone(),
+            switch_then_quit_input(&[target]),
+            clock,
+            Arc::clone(&observations),
+        );
+        assert_eq!(run.await.unwrap(), ExitCode::SUCCESS, "{target}");
+
+        let observations = observations.acquire();
+        let switched_index = wait_for_instrument_sync(&observations, 0, "ETHUSDT");
+        assert_eq!(
+            observations[switched_index].snapshot.timeframe, expected_timeframe,
+            "{target}"
+        );
+        assert_eq!(
+            provider.open_live_calls.load(Ordering::SeqCst),
+            2,
+            "{target}"
+        );
+    }
 }
 
 #[tokio::test]

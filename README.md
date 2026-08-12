@@ -17,20 +17,24 @@ cargo install --git https://github.com/AdamIsNotAlex/fccli
 ## Usage
 
 ```text
-fccli [OPTIONS] <INSTRUMENT> <TIMEFRAME>
+fccli [OPTIONS] [INSTRUMENT] [TIMEFRAME]
 ```
 
-By default, `fccli` renders one chart snapshot. Add `-i` or `--interactive` to open the interactive terminal UI.
+By default, `fccli` renders one chart snapshot. With no positionals, it uses `binance:btc`
+at `1h`. With one positional, that value is always the instrument and the timeframe remains
+`1h`. Add `-i` or `--interactive` to open the interactive terminal UI.
 
 ```sh
-fccli btc 1m
+fccli
+fccli eth
+fccli btc h
 fccli binance:btc/usdc 1h
-fccli BTCUSDT 1M --interactive
+fccli BTCUSDT M --interactive
 ```
 
-An instrument may be an asset (`btc`, quoted in USDT), pair (`btc/usdc` or `btc-usdc`), Binance symbol (`BTCUSDT`), or provider-prefixed pair (`binance:btc/usdc`).
+An instrument may be an asset (`btc`, quoted in USDT), pair (`btc/usdc` or `btc-usdt`), Binance symbol (`BTCUSDT`), or provider-prefixed pair (`binance:btc/usdc`). For example, `fccli h` selects the instrument `h` at the default `1h`; a single positional is never interpreted as a timeframe.
 
-Supported timeframes: `1s`, `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, `1M`. Timeframes are case-sensitive.
+Supported canonical timeframes: `1s`, `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, `1M`. The unit-only aliases `s`, `m`, `h`, `d`, `w`, and `M` mean one unit. Timeframes are case-sensitive: `m` is one minute and `M` is one month.
 
 ### Interactive controls
 
@@ -43,13 +47,16 @@ Supported timeframes: `1s`, `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6
 - `r`: reset the view
 - `q`, `Esc`, `Ctrl-C`, or `Ctrl-D`: quit
 
-While the command line is open, enter a target using the same instrument and timeframe syntax as
-the startup command, then press `Enter`:
+While the command line is open, enter a target using the same zero-, one-, or two-field grammar as
+the startup command, then press `Enter`. Empty input selects `binance:btc 1h`; one field is always
+the instrument and uses timeframe `1h`:
 
 ```text
-:btc 1m
+:
+:eth
+:btc m
 :binance:btc/usdc 1h
-:BTCUSDT 1M
+:BTCUSDT M
 ```
 
 The current chart remains live while the new market loads. A successful switch resets the chart
