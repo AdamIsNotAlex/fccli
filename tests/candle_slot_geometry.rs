@@ -36,18 +36,20 @@ fn partitions_nondivisible_width_with_remainder_on_the_left() {
 }
 
 #[test]
-fn painted_ranges_only_reserve_a_gap_for_slots_at_least_three_columns_wide() {
-    for (width, expected_painted_width, expected_gap_width) in
-        [(1, 1, 0), (2, 2, 0), (3, 2, 1), (7, 6, 1)]
-    {
-        let geometry = CandleSlotGeometry::new(10, width, 1).expect("valid geometry");
-        let slot = geometry.slot(0).expect("valid slot");
-        let painted = slot.painted_range();
+fn painted_ranges_reserve_one_right_column_when_possible() {
+    let geometry = CandleSlotGeometry::new(10, 15, 5).expect("valid geometry");
 
-        assert_eq!(painted.start, slot.start());
-        assert_eq!(painted.end - painted.start, expected_painted_width);
-        assert_eq!(u32::from(slot.width()) - expected_painted_width, expected_gap_width);
+    for index in 0..5 {
+        let slot = geometry.slot(index).expect("valid slot");
+        let painted = slot.painted_range();
+        assert_eq!(painted, slot.start()..slot.end() - 1);
+        assert_eq!(painted.end - painted.start, u32::from(slot.width() - 1));
         assert!(painted.contains(&u32::from(slot.center())));
+        assert_eq!(
+            geometry.index_at_x(u16::try_from(slot.end() - 1).expect("gap cell")),
+            Some(index),
+            "visual gaps retain slot ownership"
+        );
     }
 }
 
