@@ -750,7 +750,8 @@ fn render_current_price(
     }
 
     let (symbol, color) = match snapshot.current_price_freshness {
-        CurrentPriceFreshness::Fresh => ("═", Color::Cyan),
+        CurrentPriceFreshness::Fresh => ("┄", Color::Cyan),
+
         CurrentPriceFreshness::Stale => ("╌", Color::DarkGray),
     };
     let style = if policy == RenderPolicy::Color {

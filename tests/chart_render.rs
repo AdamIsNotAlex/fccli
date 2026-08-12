@@ -493,7 +493,7 @@ fn color_policy_uses_direction_grid_and_volume_styles() {
     }
     let doji_x = geometry.center(2).expect("doji center");
     let current_price_y = (layout.main_plot.y..layout.main_plot.bottom())
-        .find(|&y| symbol(&buffer, doji_x, y) == "═")
+        .find(|&y| symbol(&buffer, doji_x, y) == "┄")
         .expect("current price overlays latest doji close");
     assert_complete_style(
         &buffer[(doji_x, current_price_y)],
@@ -621,7 +621,7 @@ fn current_price_fresh_stale_and_offscreen_contracts_cover_both_policies() {
         (
             CurrentPriceFreshness::Fresh,
             RenderPolicy::Color,
-            "═",
+            "┄",
             Color::Cyan,
         ),
         (
@@ -633,7 +633,7 @@ fn current_price_fresh_stale_and_offscreen_contracts_cover_both_policies() {
         (
             CurrentPriceFreshness::Fresh,
             RenderPolicy::StyleFree,
-            "═",
+            "┄",
             Color::Reset,
         ),
         (
@@ -666,7 +666,7 @@ fn current_price_fresh_stale_and_offscreen_contracts_cover_both_policies() {
     assert!(
         !symbols_in(&rendered, layout.main_plot)
             .iter()
-            .any(|glyph| glyph == "═" || glyph == "╌")
+            .any(|glyph| glyph == "┄" || glyph == "╌")
     );
     assert!(
         (layout.main_plot.y..layout.main_plot.bottom()).all(|y| row_text(
@@ -699,7 +699,6 @@ fn hover_none_reverts_header_to_latest_and_removes_all_overlays() {
 
     let all = symbols_in(&buffer, area).concat();
     assert!(!all.contains('┆'));
-    assert!(!all.contains('┄'));
     assert!(!all.contains('┼'));
     let header: String = (layout.header.x..layout.header.right())
         .map(|x| symbol(&buffer, x, layout.header.y + 1))
@@ -937,7 +936,7 @@ fn projection_table_covers_every_half_cell_body_doji_clip_and_dynamic_body_width
         let x = geometry.center(index).expect("center");
         let y = layout.main_plot.y + row;
         let actual = symbol(&buffer, x, y);
-        if actual != "═" {
+        if actual != "┄" {
             assert_eq!(actual, expected, "slot {index}, row {row}");
         }
     }
@@ -979,7 +978,7 @@ fn projection_table_covers_every_half_cell_body_doji_clip_and_dynamic_body_width
             let x = u16::try_from(x).expect("painted coordinate");
             if x != slot.center() {
                 let actual = symbol(&buffer, x, layout.main_plot.y + relative_row);
-                if actual != "═" {
+                if actual != "┄" {
                     assert_eq!(actual, expected, "half-cell body edge slot {index}");
                 }
             }
@@ -1272,7 +1271,7 @@ fn candles_and_volume_overwrite_only_their_exact_cells_on_horizontal_grid() {
                         assert_complete_style(cell, grid_fg, Color::Reset);
                     }
                     "│" | "┃" | "╷" | "╵" | "╻" | "╹" | "╽" | "╿" | "█" | "▓" | "▀" | "▄" | "━"
-                    | "═" | "╌" => {}
+                    | "┄" | "╌" => {}
                     " " => assert!(
                         !tick_rows.contains(&y),
                         "unowned hole in tick row ({x}, {y})"
@@ -1752,7 +1751,7 @@ fn snapshot_ignores_injected_hover_for_header_and_crosshair() {
     assert!(
         !symbols_in(&rendered, layout.main_plot)
             .iter()
-            .any(|glyph| matches!(glyph.as_str(), "┆" | "┄" | "┼"))
+            .any(|glyph| matches!(glyph.as_str(), "┆" | "┼"))
     );
 }
 
