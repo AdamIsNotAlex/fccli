@@ -566,11 +566,12 @@ fn render_candles(
                     }
                 }
             }
-            let symbol = if policy == RenderPolicy::StyleFree
-                && body_overlaps
-                && direction != Direction::Doji
-            {
-                Some(body_symbol(direction))
+            let symbol = if body_overlaps && direction != Direction::Doji {
+                Some(if policy == RenderPolicy::Color {
+                    "█"
+                } else {
+                    body_symbol(direction)
+                })
             } else {
                 half_cell_glyph(upper_weight, lower_weight)
             };
