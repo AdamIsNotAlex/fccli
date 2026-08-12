@@ -409,7 +409,7 @@ fn style_free_grid_candles_volume_and_axes_use_default_style() {
 }
 
 #[test]
-fn color_projection_uses_thin_glyphs_only_for_pure_wicks() {
+fn half_cell_projection_exercises_complete_wick_and_body_edge_inventory() {
     let area = Rect::new(0, 0, 120, 36);
     let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, LayoutMode::Snapshot)
     else {
@@ -450,7 +450,7 @@ fn color_projection_uses_thin_glyphs_only_for_pure_wicks() {
     .render(area, &mut buffer);
     let symbols: std::collections::BTreeSet<_> =
         symbols_in(&buffer, layout.main_plot).into_iter().collect();
-    for required in ["│", "╷", "╵", "█"] {
+    for required in ["│", "┃", "╷", "╵", "╻", "╹", "╽", "╿"] {
         assert!(
             symbols.contains(required),
             "missing projection glyph {required}"
@@ -931,40 +931,40 @@ fn projection_table_covers_every_half_cell_body_doji_clip_and_dynamic_body_width
     let exact_center_cells = [
         (0, 0, "╷"),
         (0, 1, "│"),
-        (0, 2, "█"),
-        (0, 8, "█"),
+        (0, 2, "┃"),
+        (0, 8, "┃"),
         (0, 9, "│"),
         (0, 10, "│"),
         (0, 11, "╵"),
         (1, 0, "╷"),
         (1, 1, "│"),
-        (1, 2, "█"),
-        (1, 8, "█"),
+        (1, 2, "┃"),
+        (1, 8, "┃"),
         (1, 9, "│"),
         (1, 10, "│"),
         (1, 11, "╵"),
         (2, 0, "╷"),
         (2, 2, "━"),
         (2, 11, "╵"),
-        (3, 0, "█"),
-        (3, 1, "█"),
-        (3, 10, "█"),
-        (3, 11, "█"),
+        (3, 0, "╻"),
+        (3, 1, "┃"),
+        (3, 10, "┃"),
+        (3, 11, "╹"),
         (4, 0, "╷"),
-        (4, 1, "█"),
-        (4, 10, "█"),
+        (4, 1, "┃"),
+        (4, 10, "┃"),
         (4, 11, "╵"),
         (5, 0, "╷"),
-        (5, 1, "█"),
-        (5, 10, "█"),
+        (5, 1, "╽"),
+        (5, 10, "╿"),
         (5, 11, "╵"),
         (6, 0, "╷"),
-        (6, 3, "█"),
-        (6, 9, "█"),
+        (6, 3, "╽"),
+        (6, 9, "╿"),
         (6, 11, "╵"),
         (7, 0, "╷"),
-        (7, 3, "█"),
-        (7, 9, "█"),
+        (7, 3, "╽"),
+        (7, 9, "╿"),
         (7, 11, "╵"),
     ];
     for &(index, row, expected) in &exact_center_cells {
@@ -987,7 +987,7 @@ fn projection_table_covers_every_half_cell_body_doji_clip_and_dynamic_body_width
         let center = slot.center();
         assert_eq!(
             symbol(&buffer, center, layout.main_plot.y + body_row),
-            "█",
+            "┃",
             "center body slot {index}"
         );
         for x in slot.start()..slot.end() {
@@ -1033,10 +1033,10 @@ fn projection_table_covers_every_half_cell_body_doji_clip_and_dynamic_body_width
     let clipped_snapshot = snapshot(&candles, clipped_state, RenderMode::Snapshot);
     let clipped = render_with_sentinel(&clipped_snapshot, layout, RenderPolicy::Color);
     let full_body_center = geometry.center(3).expect("full body center");
-    assert_eq!(symbol(&clipped, full_body_center, layout.main_plot.y), "█");
+    assert_eq!(symbol(&clipped, full_body_center, layout.main_plot.y), "┃");
     assert_eq!(
         symbol(&clipped, full_body_center, layout.main_plot.bottom() - 1),
-        "█"
+        "┃"
     );
 }
 
@@ -1580,7 +1580,7 @@ fn two_column_slots_fully_paint_price_and_volume_in_both_render_modes() {
         .expect("slot");
         assert_eq!(slot.width(), 2);
         let body_row = (layout.main_plot.y..layout.main_plot.bottom())
-            .find(|&y| symbol(&rendered, slot.center(), y) == "█")
+            .find(|&y| symbol(&rendered, slot.center(), y) == "┃")
             .expect("body row");
         for x in slot.start()..slot.end() {
             let x = u16::try_from(x).expect("slot coordinate");
@@ -1627,11 +1627,11 @@ fn multi_column_slots_share_dynamic_width_between_price_and_volume() {
     let center = slot.center();
     assert!(
         (layout.main_plot.y..layout.main_plot.bottom())
-            .any(|y| symbol(&rendered, center, y) == "█"),
-        "center joins the painted body"
+            .any(|y| symbol(&rendered, center, y) == "┃"),
+        "center preserves half-cell projection"
     );
     let body_row = (layout.main_plot.y..layout.main_plot.bottom())
-        .find(|&y| symbol(&rendered, center, y) == "█")
+        .find(|&y| symbol(&rendered, center, y) == "┃")
         .expect("body row");
     for x in slot.painted_range() {
         let x = u16::try_from(x).expect("valid layout slot coordinate fits u16");
