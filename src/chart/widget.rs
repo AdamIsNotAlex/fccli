@@ -529,7 +529,7 @@ fn render_candles(
             let close = price_half(candle.close(), range, layout.main_plot);
             (open.min(close), open.max(close))
         });
-        let style = candle_style(direction, policy);
+        let style = price_candle_style(direction, policy);
 
         for relative_row in high / 2..=low / 2 {
             let upper = relative_row.saturating_mul(2).min(max_half);
@@ -539,23 +539,15 @@ fn render_candles(
             let y = layout.main_plot.y.saturating_add(relative_row);
             let body_overlaps =
                 upper_weight == StrokeWeight::Heavy || lower_weight == StrokeWeight::Heavy;
-            if body_overlaps && direction != Direction::Doji {
-                for x in slot.start()..slot.end() {
-                    set_cell(buffer, x as u16, y, body_symbol(direction), style);
-                }
-            }
-            let body_top_visible = candle.open().max(candle.close()) <= range.high;
-            let body_bottom_visible = candle.open().min(candle.close()) >= range.low;
-            let heavy_edge = upper_weight == StrokeWeight::Heavy
-                && lower_weight == StrokeWeight::Heavy
-                && body.is_some_and(|(body_top, body_bottom)| {
-                    (body_top_visible && (upper == body_top || lower == body_top))
-                        || (body_bottom_visible && (upper == body_bottom || lower == body_bottom))
-                });
-            if (!body_overlaps
-                || (slot.width() > 1 && (upper_weight != lower_weight || heavy_edge)))
-                && let Some(symbol) = half_cell_glyph(upper_weight, lower_weight)
+            let symbol = if policy == RenderPolicy::StyleFree
+                && body_overlaps
+                && direction != Direction::Doji
             {
+                Some(body_symbol(direction))
+            } else {
+                half_cell_glyph(upper_weight, lower_weight)
+            };
+            if let Some(symbol) = symbol {
                 set_cell(buffer, slot.center(), y, symbol, style);
             }
         }
@@ -564,9 +556,7 @@ fn render_candles(
                 .main_plot
                 .y
                 .saturating_add(price_half(candle.open(), range, layout.main_plot) / 2);
-            for x in slot.start()..slot.end() {
-                set_cell(buffer, x as u16, row, "━", style);
-            }
+            set_cell(buffer, slot.center(), row, "━", style);
         }
     }
 }
@@ -595,7 +585,18 @@ fn body_symbol(direction: Direction) -> &'static str {
     }
 }
 
-fn candle_style(direction: Direction, policy: RenderPolicy) -> Style {
+fn price_candle_style(direction: Direction, policy: RenderPolicy) -> Style {
+    if policy == RenderPolicy::StyleFree {
+        return Style::default();
+    }
+    match direction {
+        Direction::Bull => Style::default().fg(Color::Rgb(52, 208, 88)),
+        Direction::Bear => Style::default().fg(Color::Rgb(234, 74, 90)),
+        Direction::Doji => Style::default(),
+    }
+}
+
+fn volume_style(direction: Direction, policy: RenderPolicy) -> Style {
     if policy == RenderPolicy::StyleFree {
         return Style::default();
     }
@@ -670,7 +671,7 @@ fn render_volume(
         let height = (scaled.ceil() as u16).clamp(1, layout.volume.height);
         let start = layout.volume.bottom().saturating_sub(height);
         let symbol = body_symbol(direction(candle));
-        let style = candle_style(direction(candle), policy);
+        let style = volume_style(direction(candle), policy);
         for y in start..layout.volume.bottom() {
             for x in slot.start()..slot.end() {
                 set_cell(buffer, x as u16, y, symbol, style);

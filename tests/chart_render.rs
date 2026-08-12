@@ -97,6 +97,13 @@ fn symbols_in(buffer: &Buffer, area: Rect) -> Vec<String> {
     symbols
 }
 
+fn is_price_candle_glyph(symbol: &str) -> bool {
+    matches!(
+        symbol,
+        "█" | "▓" | "━" | "│" | "┃" | "╽" | "╿" | "╷" | "╵" | "╻" | "╹"
+    )
+}
+
 #[test]
 fn pending_renders_only_stable_resize_message_and_clears_styles() {
     let area = Rect::new(7, 5, 59, 17);
@@ -307,7 +314,7 @@ fn million_character_status_provider_is_bounded_without_hiding_error_token() {
     ChartWidget::new(
         &snapshot,
         &ChartLayoutResult::Ready { layout },
-        RenderPolicy::StyleFree,
+        RenderPolicy::Color,
     )
     .render(area, &mut buffer);
 
@@ -436,7 +443,7 @@ fn half_cell_projection_exercises_complete_wick_and_body_edge_inventory() {
     ChartWidget::new(
         &snapshot,
         &ChartLayoutResult::Ready { layout },
-        RenderPolicy::StyleFree,
+        RenderPolicy::Color,
     )
     .render(area, &mut buffer);
     let symbols: std::collections::BTreeSet<_> =
@@ -466,18 +473,45 @@ fn color_policy_uses_direction_grid_and_volume_styles() {
     )
     .render(area, &mut buffer);
 
-    let mut saw_green = false;
-    let mut saw_red = false;
+    let geometry = fccli::chart::CandleSlotGeometry::new(
+        layout.main_plot.x,
+        layout.main_plot.width,
+        series.len(),
+    )
+    .expect("geometry");
+    for (index, expected) in [(0, Color::Rgb(52, 208, 88)), (1, Color::Rgb(234, 74, 90))] {
+        let x = geometry.center(index).expect("candle center");
+        assert!(
+            (layout.main_plot.y..layout.main_plot.bottom()).any(|y| {
+                is_price_candle_glyph(symbol(&buffer, x, y))
+                    && style(&buffer, x, y).fg == Some(expected)
+            }),
+            "candle {index} did not use {expected:?}"
+        );
+    }
+    let doji_x = geometry.center(2).expect("doji center");
+    let doji_y = (layout.main_plot.y..layout.main_plot.bottom())
+        .find(|&y| symbol(&buffer, doji_x, y) == "━")
+        .expect("doji body");
+    assert_complete_style(&buffer[(doji_x, doji_y)], Color::Reset, Color::Reset);
+
+    let mut saw_volume_green = false;
+    let mut saw_volume_red = false;
     let mut saw_grid = false;
-    for y in layout.main_plot.y..layout.volume.bottom() {
+    for y in layout.volume.y..layout.volume.bottom() {
         for x in layout.main_plot.x..layout.main_plot.right() {
             let cell = &buffer[(x, y)];
-            saw_green |= cell.style().fg == Some(Color::Green);
-            saw_red |= cell.style().fg == Some(Color::Red);
+            saw_volume_green |= cell.style().fg == Some(Color::Green);
+            saw_volume_red |= cell.style().fg == Some(Color::Red);
+        }
+    }
+    for y in layout.main_plot.y..layout.main_plot.bottom() {
+        for x in layout.main_plot.x..layout.main_plot.right() {
+            let cell = &buffer[(x, y)];
             saw_grid |= cell.symbol() == "─" && cell.style().fg == Some(Color::DarkGray);
         }
     }
-    assert!(saw_green && saw_red && saw_grid);
+    assert!(saw_volume_green && saw_volume_red && saw_grid);
 }
 
 #[test]
@@ -703,7 +737,7 @@ fn row_text(buffer: &Buffer, rect: Rect, y: u16) -> String {
 }
 
 #[test]
-fn projection_table_covers_every_half_cell_body_doji_clip_overlap_and_slot_fill() {
+fn projection_table_covers_every_half_cell_body_doji_clip_and_single_column_strokes() {
     let area = Rect::new(4, 3, 60, 18);
     let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, LayoutMode::Snapshot)
     else {
@@ -742,7 +776,7 @@ fn projection_table_covers_every_half_cell_body_doji_clip_overlap_and_slot_fill(
         ChartViewState::snapshot(&candles, usize::from(layout.main_plot.width)),
         RenderMode::Snapshot,
     );
-    let buffer = render_with_sentinel(&renderer_snapshot, layout, RenderPolicy::StyleFree);
+    let buffer = render_with_sentinel(&renderer_snapshot, layout, RenderPolicy::Color);
     let geometry = fccli::chart::CandleSlotGeometry::new(
         layout.main_plot.x,
         layout.main_plot.width,
@@ -769,8 +803,8 @@ fn projection_table_covers_every_half_cell_body_doji_clip_overlap_and_slot_fill(
         (2, 2, "━"),
         (2, 11, "╵"),
         (3, 0, "╻"),
-        (3, 1, "▓"),
-        (3, 10, "▓"),
+        (3, 1, "┃"),
+        (3, 10, "┃"),
         (3, 11, "╹"),
         (4, 0, "╷"),
         (4, 1, "┃"),
@@ -803,43 +837,41 @@ fn projection_table_covers_every_half_cell_body_doji_clip_overlap_and_slot_fill(
             6 | 7 => 6,
             _ => unreachable!(),
         };
-        let expected = if matches!(index, 0 | 3 | 4 | 5 | 6) {
-            "▓"
-        } else {
-            "█"
-        };
+        let center = slot.center();
+        assert_eq!(
+            symbol(&buffer, center, layout.main_plot.y + body_row),
+            "┃",
+            "center body slot {index}"
+        );
         for x in slot.start()..slot.end() {
-            assert_eq!(
-                symbol(
-                    &buffer,
-                    u16::try_from(x).expect("valid layout slot coordinate fits u16"),
-                    layout.main_plot.y + body_row,
-                ),
-                expected,
-                "repeated body slot {index}"
-            );
+            let x = u16::try_from(x).expect("valid layout slot coordinate fits u16");
+            if x != center {
+                assert!(
+                    !is_price_candle_glyph(symbol(&buffer, x, layout.main_plot.y + body_row)),
+                    "price candle spilled outside center column for slot {index}"
+                );
+            }
         }
     }
     let doji = geometry.slot(2).expect("doji slot");
+    let doji_center = doji.center();
     for x in doji.start()..doji.end() {
-        assert_eq!(
-            symbol(
-                &buffer,
-                u16::try_from(x).expect("valid layout slot coordinate fits u16"),
-                layout.main_plot.y + 2,
-            ),
-            "━"
-        );
+        let x = u16::try_from(x).expect("valid layout slot coordinate fits u16");
+        if x == doji_center {
+            assert_eq!(symbol(&buffer, x, layout.main_plot.y + 2), "━");
+        } else {
+            assert_ne!(symbol(&buffer, x, layout.main_plot.y + 2), "━");
+        }
     }
     let mut clipped_state = ChartViewState::snapshot(&candles, usize::from(layout.main_plot.width));
     clipped_state.zoom_y_by_factor(0.5);
     let clipped_snapshot = snapshot(&candles, clipped_state, RenderMode::Snapshot);
-    let clipped = render_with_sentinel(&clipped_snapshot, layout, RenderPolicy::StyleFree);
+    let clipped = render_with_sentinel(&clipped_snapshot, layout, RenderPolicy::Color);
     let full_body_center = geometry.center(3).expect("full body center");
-    assert_eq!(symbol(&clipped, full_body_center, layout.main_plot.y), "▓");
+    assert_eq!(symbol(&clipped, full_body_center, layout.main_plot.y), "┃");
     assert_eq!(
         symbol(&clipped, full_body_center, layout.main_plot.bottom() - 1),
-        "▓"
+        "┃"
     );
 }
 
@@ -1179,16 +1211,6 @@ fn exact_style_and_overwrite_table_resets_hostile_cells_for_both_policies() {
         } else {
             default
         };
-        let bull = if policy == RenderPolicy::Color {
-            default.fg(Color::Green)
-        } else {
-            default
-        };
-        let bear = if policy == RenderPolicy::Color {
-            default.fg(Color::Red)
-        } else {
-            default
-        };
         let geometry =
             fccli::chart::CandleSlotGeometry::new(layout.main_plot.x, layout.main_plot.width, 3)
                 .expect("geometry");
@@ -1224,18 +1246,6 @@ fn exact_style_and_overwrite_table_resets_hostile_cells_for_both_policies() {
         assert_eq!(symbol(&buffer, bull_x, layout.volume.bottom() - 1), "█");
         assert_eq!(symbol(&buffer, bear_x, layout.volume.bottom() - 1), "▓");
         assert_eq!(symbol(&buffer, doji_x, layout.volume.bottom() - 1), "━");
-        for (glyph, expected_style) in [("█", bull), ("▓", bear), ("━", default)] {
-            let candle_cell = (layout.main_plot.y..layout.main_plot.bottom())
-                .flat_map(|y| (layout.main_plot.x..layout.main_plot.right()).map(move |x| (x, y)))
-                .find(|&(x, y)| symbol(&buffer, x, y) == glyph)
-                .unwrap_or_else(|| panic!("missing main-plot {glyph}"));
-            let expected_fg = expected_style.fg.unwrap_or(Color::Reset);
-            assert_complete_style(
-                &buffer[(candle_cell.0, candle_cell.1)],
-                expected_fg,
-                Color::Reset,
-            );
-        }
         let grid_overwritten = (layout.main_plot.y..layout.main_plot.bottom())
             .find_map(|y| {
                 let axis_has_tick = (layout.price_axis.x..layout.price_axis.right())
@@ -1336,12 +1346,22 @@ fn one_column_slots_preserve_bull_and_bear_direction() {
         layout,
         RenderPolicy::StyleFree,
     );
-    assert!(symbols_in(&rendered, layout.main_plot).contains(&"█".to_owned()));
-    assert!(symbols_in(&rendered, layout.main_plot).contains(&"▓".to_owned()));
+    let geometry =
+        fccli::chart::CandleSlotGeometry::new(layout.main_plot.x, layout.main_plot.width, 45)
+            .expect("geometry");
+    for index in 0..45 {
+        let x = geometry.center(index).expect("candle center");
+        let expected = if index % 2 == 0 { "█" } else { "▓" };
+        assert!(
+            (layout.main_plot.y..layout.main_plot.bottom())
+                .any(|y| symbol(&rendered, x, y) == expected),
+            "candle {index} did not preserve direction as {expected}"
+        );
+    }
 }
 
 #[test]
-fn multi_column_body_center_exposes_heavy_edge_and_directional_interiors() {
+fn multi_column_slots_render_price_candles_only_at_the_center() {
     let area = Rect::new(0, 0, 60, 18);
     let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, LayoutMode::Snapshot)
     else {
@@ -1368,7 +1388,7 @@ fn multi_column_body_center_exposes_heavy_edge_and_directional_interiors() {
             RenderMode::Snapshot,
         ),
         layout,
-        RenderPolicy::StyleFree,
+        RenderPolicy::Color,
     );
     let slot = fccli::chart::CandleSlotGeometry::new(layout.main_plot.x, layout.main_plot.width, 3)
         .expect("geometry")
@@ -1378,20 +1398,17 @@ fn multi_column_body_center_exposes_heavy_edge_and_directional_interiors() {
     assert!(
         (layout.main_plot.y..layout.main_plot.bottom())
             .any(|y| symbol(&rendered, center, y) == "┃"),
-        "body boundary heavy edge"
+        "reference-style body stroke"
     );
-    assert!(
-        (layout.main_plot.y..layout.main_plot.bottom())
-            .any(|y| symbol(&rendered, center, y) == "█"),
-        "true body interior remains directional"
-    );
-    assert!((layout.main_plot.y..layout.main_plot.bottom()).any(|y| {
-        symbol(&rendered, center, y) == "┃"
-            && (slot.start()..slot.end()).any(|x| {
-                let x = u16::try_from(x).expect("valid layout slot coordinate fits u16");
-                x != center && symbol(&rendered, x, y) == "█"
-            })
-    }));
+    for x in slot.start()..slot.end() {
+        let x = u16::try_from(x).expect("valid layout slot coordinate fits u16");
+        if x != center {
+            assert!(
+                (layout.main_plot.y..layout.main_plot.bottom())
+                    .all(|y| { !is_price_candle_glyph(symbol(&rendered, x, y)) })
+            );
+        }
+    }
 }
 
 #[test]

@@ -265,7 +265,19 @@ async fn tty_reserves_shell_row_at_exact_layout_boundary() {
 
 #[tokio::test]
 async fn explicit_tty_color_is_deterministic_and_resets_without_mode_sequences() {
-    let provider = FakeProvider::new(candles(20));
+    let mut frame_candles = candles(20);
+    frame_candles[0] = Candle::from_ws(
+        frame_candles[0].open_time(),
+        frame_candles[0].close_time(),
+        101.0,
+        102.0,
+        99.0,
+        100.0,
+        10.0,
+        true,
+    )
+    .expect("bear candle");
+    let provider = FakeProvider::new(frame_candles);
     let mut output = Vec::new();
     run_snapshot(
         &provider,
@@ -283,6 +295,8 @@ async fn explicit_tty_color_is_deterministic_and_resets_without_mode_sequences()
 
     let text = String::from_utf8(output).expect("UTF-8 frame");
     assert!(text.contains("\x1b[32m"));
+    assert!(text.contains("\x1b[38;2;52;208;88m"));
+    assert!(text.contains("\x1b[38;2;234;74;90m"));
     assert!(text.contains("\x1b[0m"));
     for forbidden in ["\x1b[?1049", "\x1b[?25", "\x1b[?1000", "\x1b[2J", "\x1b[H"] {
         assert!(
