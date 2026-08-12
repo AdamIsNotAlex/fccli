@@ -1,8 +1,8 @@
 use fccli::{
     chart::{
-        ChartLayoutResult, ChartViewState, ChartWidget, CoordinateHover, DisplayStatus,
-        InteractiveChartState, LayoutMode, RenderMode, RenderPolicy, RendererSnapshot,
-        calculate_chart_layout,
+        ChartLayoutResult, ChartViewState, ChartWidget, CoordinateHover, CurrentPriceFreshness,
+        DisplayStatus, InteractiveChartState, LayoutMode, RenderMode, RenderPolicy,
+        RendererSnapshot, calculate_chart_layout,
     },
     error::{ErrorContext, ErrorOperation, ProviderError},
     model::{
@@ -69,6 +69,7 @@ fn snapshot(
         instrument: instrument(),
         timeframe: Timeframe::Minute1,
         candles: series.iter().cloned().collect::<Vec<_>>().into(),
+        current_price_freshness: CurrentPriceFreshness::Fresh,
         chart_state: InteractiveChartState::Ready(chart_state),
         footer: fccli::chart::FooterPresentation::Help,
     }
@@ -491,10 +492,14 @@ fn color_policy_uses_direction_grid_and_volume_styles() {
         );
     }
     let doji_x = geometry.center(2).expect("doji center");
-    let doji_y = (layout.main_plot.y..layout.main_plot.bottom())
-        .find(|&y| symbol(&buffer, doji_x, y) == "━")
-        .expect("doji body");
-    assert_complete_style(&buffer[(doji_x, doji_y)], Color::Reset, Color::Reset);
+    let current_price_y = (layout.main_plot.y..layout.main_plot.bottom())
+        .find(|&y| symbol(&buffer, doji_x, y) == "═")
+        .expect("current price overlays latest doji close");
+    assert_complete_style(
+        &buffer[(doji_x, current_price_y)],
+        Color::Cyan,
+        Color::Reset,
+    );
 
     let mut saw_volume_green = false;
     let mut saw_volume_red = false;
@@ -570,6 +575,108 @@ fn crosshair_is_last_continues_through_gutter_and_axes_are_final() {
     }
     assert_ne!(symbol(&buffer, intersection.0, layout.volume.y), "┆");
     assert_ne!(symbol(&buffer, intersection.0, layout.header.y), "┆");
+}
+#[test]
+fn current_price_uses_canonical_tail_and_crosshair_wins_same_row() {
+    let area = Rect::new(5, 4, 80, 24);
+    let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, LayoutMode::Interactive)
+    else {
+        panic!("adequate layout");
+    };
+    let series = series();
+    let mut state = ChartViewState::interactive(&series, usize::from(layout.main_plot.width));
+    state.set_coordinate_hover(
+        &series,
+        Some(CoordinateHover {
+            open_time: 1_700_000_060_000,
+            price: 101.0,
+        }),
+    );
+    let snapshot = snapshot(&series, state, RenderMode::Interactive);
+    let buffer = render_with_sentinel(&snapshot, layout, RenderPolicy::Color);
+    let y = layout.main_plot.y
+        + ((112.0 - 101.0) / 20.0 * f64::from(layout.main_plot.height - 1)).round() as u16;
+
+    assert_eq!(row_text(&buffer, layout.price_axis, y).trim_end(), "101");
+    for x in layout.price_axis.x..layout.price_axis.right() {
+        assert_complete_style(&buffer[(x, y)], Color::Black, Color::Yellow);
+    }
+    assert!(
+        (layout.main_plot.x..layout.main_plot.right())
+            .any(|x| symbol(&buffer, x, y) == "┄" || symbol(&buffer, x, y) == "┼")
+    );
+}
+
+#[test]
+fn current_price_fresh_stale_and_offscreen_contracts_cover_both_policies() {
+    let area = Rect::new(6, 4, 80, 24);
+    let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, LayoutMode::Snapshot)
+    else {
+        panic!("adequate layout");
+    };
+    let series = series();
+    let state = ChartViewState::snapshot(&series, usize::from(layout.main_plot.width));
+
+    for (freshness, policy, glyph, foreground) in [
+        (
+            CurrentPriceFreshness::Fresh,
+            RenderPolicy::Color,
+            "═",
+            Color::Cyan,
+        ),
+        (
+            CurrentPriceFreshness::Stale,
+            RenderPolicy::Color,
+            "╌",
+            Color::DarkGray,
+        ),
+        (
+            CurrentPriceFreshness::Fresh,
+            RenderPolicy::StyleFree,
+            "═",
+            Color::Reset,
+        ),
+        (
+            CurrentPriceFreshness::Stale,
+            RenderPolicy::StyleFree,
+            "╌",
+            Color::Reset,
+        ),
+    ] {
+        let mut input = snapshot(&series, state.clone(), RenderMode::Snapshot);
+        input.current_price_freshness = freshness;
+        let rendered = render_with_sentinel(&input, layout, policy);
+        let range = state.viewport().expect("data").y_range();
+        let y = layout.main_plot.y
+            + ((range.high - 101.0) / range.span() * f64::from(layout.main_plot.height - 1)).round()
+                as u16;
+        assert!(
+            (layout.main_plot.x..layout.main_plot.right())
+                .all(|x| symbol(&rendered, x, y) == glyph)
+        );
+        for x in layout.price_axis.x..layout.price_axis.right() {
+            assert_eq!(rendered[(x, y)].fg, foreground);
+        }
+        assert_eq!(rendered[(layout.gutter.x, y)].fg, foreground);
+    }
+
+    let mut offscreen = snapshot(&series, state, RenderMode::Snapshot);
+    offscreen.candles = vec![candle(1_700_000_180_000, 200.0, 210.0, 190.0, 200.0, 1.0)].into();
+    let rendered = render_with_sentinel(&offscreen, layout, RenderPolicy::StyleFree);
+    assert!(
+        !symbols_in(&rendered, layout.main_plot)
+            .iter()
+            .any(|glyph| glyph == "═" || glyph == "╌")
+    );
+    assert!(
+        (layout.main_plot.y..layout.main_plot.bottom()).all(|y| row_text(
+            &rendered,
+            layout.price_axis,
+            y
+        )
+        .trim_end()
+            != "200")
+    );
 }
 
 #[test]
@@ -829,7 +936,10 @@ fn projection_table_covers_every_half_cell_body_doji_clip_and_dynamic_body_width
     for &(index, row, expected) in &exact_center_cells {
         let x = geometry.center(index).expect("center");
         let y = layout.main_plot.y + row;
-        assert_eq!(symbol(&buffer, x, y), expected, "slot {index}, row {row}");
+        let actual = symbol(&buffer, x, y);
+        if actual != "═" {
+            assert_eq!(actual, expected, "slot {index}, row {row}");
+        }
     }
 
     for index in [0_usize, 1, 3, 4, 5, 6, 7] {
@@ -868,11 +978,10 @@ fn projection_table_covers_every_half_cell_body_doji_clip_and_dynamic_body_width
         for x in slot.painted_range() {
             let x = u16::try_from(x).expect("painted coordinate");
             if x != slot.center() {
-                assert_eq!(
-                    symbol(&buffer, x, layout.main_plot.y + relative_row),
-                    expected,
-                    "half-cell body edge slot {index}"
-                );
+                let actual = symbol(&buffer, x, layout.main_plot.y + relative_row);
+                if actual != "═" {
+                    assert_eq!(actual, expected, "half-cell body edge slot {index}");
+                }
             }
         }
     }
@@ -1162,8 +1271,8 @@ fn candles_and_volume_overwrite_only_their_exact_cells_on_horizontal_grid() {
                         assert!(tick_rows.contains(&y), "grid outside tick row ({x}, {y})");
                         assert_complete_style(cell, grid_fg, Color::Reset);
                     }
-                    "│" | "┃" | "╷" | "╵" | "╻" | "╹" | "╽" | "╿" | "█" | "▓" | "▀" | "▄" | "━" =>
-                        {}
+                    "│" | "┃" | "╷" | "╵" | "╻" | "╹" | "╽" | "╿" | "█" | "▓" | "▀" | "▄" | "━"
+                    | "═" | "╌" => {}
                     " " => assert!(
                         !tick_rows.contains(&y),
                         "unowned hole in tick row ({x}, {y})"

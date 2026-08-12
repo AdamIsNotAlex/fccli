@@ -20,9 +20,9 @@ use tokio::{sync::mpsc, task::JoinHandle as TokioJoinHandle};
 
 use crate::{
     chart::{
-        ChartLayoutResult, ChartViewState, ChartWidget, DisplayStatus, FooterPresentation,
-        InteractionAction, InteractionController, InteractiveChartState, LayoutMode, RenderMode,
-        RenderPolicy, RendererSnapshot, calculate_chart_layout,
+        ChartLayoutResult, ChartViewState, ChartWidget, CurrentPriceFreshness, DisplayStatus,
+        FooterPresentation, InteractionAction, InteractionController, InteractiveChartState,
+        LayoutMode, RenderMode, RenderPolicy, RendererSnapshot, calculate_chart_layout,
     },
     cli::{Cli, MarketTarget, Mode, canonicalize_binance, parse_market_target},
     clock::{Clock, checked_deadline},
@@ -762,6 +762,12 @@ impl App {
             instrument: self.instrument.clone(),
             timeframe: self.timeframe,
             candles: Arc::clone(&self.renderer_candles),
+            current_price_freshness: if self.connection_status == ConnectionStatus::Connected {
+                CurrentPriceFreshness::Fresh
+            } else {
+                CurrentPriceFreshness::Stale
+            },
+
             chart_state: self.chart_state.clone(),
             footer: self.footer.clone(),
         }

@@ -44,6 +44,11 @@ pub enum RenderPolicy {
     Color,
     StyleFree,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CurrentPriceFreshness {
+    Fresh,
+    Stale,
+}
 
 /// Reports whether `NO_COLOR` was present in a single captured environment lookup.
 ///
@@ -104,6 +109,8 @@ pub struct RendererSnapshot {
     pub instrument: Instrument,
     pub timeframe: Timeframe,
     pub candles: Arc<[Candle]>,
+    pub current_price_freshness: CurrentPriceFreshness,
+
     pub chart_state: InteractiveChartState,
     pub footer: FooterPresentation,
 }
@@ -204,6 +211,7 @@ fn render_ready(
     render_candles(layout, candles, geometry, y_range, policy, buffer);
     render_volume(layout, candles, geometry, policy, buffer);
     render_footer(snapshot, layout.footer, buffer);
+    render_current_price(snapshot, layout, y_range, policy, buffer);
 
     if snapshot.mode == RenderMode::Interactive
         && viewport.active_drag().is_none()
@@ -725,6 +733,37 @@ fn render_footer(snapshot: &RendererSnapshot, footer: Option<Rect>, buffer: &mut
         };
         write_clipped(buffer, footer, footer.x, footer.y, &text, Style::default());
     }
+}
+
+fn render_current_price(
+    snapshot: &RendererSnapshot,
+    layout: ChartLayout,
+    range: PriceRange,
+    policy: RenderPolicy,
+    buffer: &mut Buffer,
+) {
+    let Some(price) = snapshot.candles.last().map(Candle::close) else {
+        return;
+    };
+    if !price.is_finite() || price < range.low || price > range.high {
+        return;
+    }
+
+    let (symbol, color) = match snapshot.current_price_freshness {
+        CurrentPriceFreshness::Fresh => ("═", Color::Cyan),
+        CurrentPriceFreshness::Stale => ("╌", Color::DarkGray),
+    };
+    let style = if policy == RenderPolicy::Color {
+        Style::default().fg(color)
+    } else {
+        Style::default()
+    };
+
+    let y = price_row(price, range, layout.main_plot);
+    fill_row(buffer, layout.main_plot, y, symbol, style);
+    fill_row(buffer, layout.gutter, y, symbol, style);
+    let label = compact_price(price);
+    write_padded_row(buffer, layout.price_axis, y, &label, style);
 }
 
 #[allow(clippy::too_many_arguments)]

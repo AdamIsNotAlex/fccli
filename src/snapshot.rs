@@ -10,9 +10,9 @@ use ratatui::{
 
 use crate::{
     chart::{
-        ChartLayoutResult, ChartViewState, ChartWidget, DisplayStatus, InteractiveChartState,
-        LayoutMode, RESIZE_MESSAGE, RenderMode, RenderPolicy, RendererSnapshot,
-        calculate_chart_layout,
+        ChartLayoutResult, ChartViewState, ChartWidget, CurrentPriceFreshness, DisplayStatus,
+        InteractiveChartState, LayoutMode, RESIZE_MESSAGE, RenderMode, RenderPolicy,
+        RendererSnapshot, calculate_chart_layout,
     },
     error::{AppError, RenderError, SanitizedCause},
     model::{CandleSeries, HistoryRequest, InstrumentSpec, Timeframe},
@@ -113,6 +113,8 @@ pub async fn run_snapshot(
         instrument,
         timeframe,
         candles: series.into_arc(),
+        current_price_freshness: CurrentPriceFreshness::Fresh,
+
         chart_state,
         footer: crate::chart::FooterPresentation::Help,
     };
