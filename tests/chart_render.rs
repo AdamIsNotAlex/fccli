@@ -501,8 +501,10 @@ fn color_policy_uses_direction_grid_and_volume_styles() {
     for y in layout.volume.y..layout.volume.bottom() {
         for x in layout.main_plot.x..layout.main_plot.right() {
             let cell = &buffer[(x, y)];
-            saw_volume_green |= cell.style().fg == Some(Color::Green);
-            saw_volume_red |= cell.style().fg == Some(Color::Red);
+            saw_volume_green |=
+                cell.symbol() == "█" && cell.style().fg == Some(Color::Rgb(52, 208, 88));
+            saw_volume_red |=
+                cell.symbol() == "█" && cell.style().fg == Some(Color::Rgb(234, 74, 90));
         }
     }
     for y in layout.main_plot.y..layout.main_plot.bottom() {
@@ -1154,27 +1156,18 @@ fn candles_and_volume_overwrite_only_their_exact_cells_on_horizontal_grid() {
         for y in layout.volume.y..layout.volume.bottom() {
             for x in layout.volume.x..layout.volume.right() {
                 let cell = &rendered[(x, y)];
-                match cell.symbol() {
-                    "█" => assert_complete_style(
-                        cell,
-                        if policy == RenderPolicy::Color {
-                            Color::Green
-                        } else {
-                            Color::Reset
-                        },
-                        Color::Reset,
-                    ),
-                    "▓" => assert_complete_style(
-                        cell,
-                        if policy == RenderPolicy::Color {
-                            Color::Red
-                        } else {
-                            Color::Reset
-                        },
-                        Color::Reset,
-                    ),
-                    "━" | " " => assert_complete_style(cell, Color::Reset, Color::Reset),
-                    glyph => panic!("unexpected volume glyph {glyph:?} at ({x}, {y})"),
+                match (policy, cell.symbol()) {
+                    (RenderPolicy::Color, "█") => assert!(matches!(
+                        cell.style().fg,
+                        Some(Color::Rgb(52, 208, 88) | Color::Rgb(234, 74, 90) | Color::Reset)
+                    )),
+                    (RenderPolicy::Color, " ") => {
+                        assert_complete_style(cell, Color::Reset, Color::Reset)
+                    }
+                    (RenderPolicy::StyleFree, "█" | "▓" | "━" | " ") => {
+                        assert_complete_style(cell, Color::Reset, Color::Reset)
+                    }
+                    (_, glyph) => panic!("unexpected volume glyph {glyph:?} at ({x}, {y})"),
                 }
             }
         }
@@ -1223,7 +1216,7 @@ fn exact_style_and_overwrite_table_resets_hostile_cells_for_both_policies() {
         assert_complete_style(
             &buffer[(bull_x, layout.volume.bottom() - 1)],
             if policy == RenderPolicy::Color {
-                Color::Green
+                Color::Rgb(52, 208, 88)
             } else {
                 Color::Reset
             },
@@ -1232,7 +1225,7 @@ fn exact_style_and_overwrite_table_resets_hostile_cells_for_both_policies() {
         assert_complete_style(
             &buffer[(bear_x, layout.volume.bottom() - 1)],
             if policy == RenderPolicy::Color {
-                Color::Red
+                Color::Rgb(234, 74, 90)
             } else {
                 Color::Reset
             },
@@ -1244,8 +1237,22 @@ fn exact_style_and_overwrite_table_resets_hostile_cells_for_both_policies() {
             Color::Reset,
         );
         assert_eq!(symbol(&buffer, bull_x, layout.volume.bottom() - 1), "█");
-        assert_eq!(symbol(&buffer, bear_x, layout.volume.bottom() - 1), "▓");
-        assert_eq!(symbol(&buffer, doji_x, layout.volume.bottom() - 1), "━");
+        assert_eq!(
+            symbol(&buffer, bear_x, layout.volume.bottom() - 1),
+            if policy == RenderPolicy::Color {
+                "█"
+            } else {
+                "▓"
+            }
+        );
+        assert_eq!(
+            symbol(&buffer, doji_x, layout.volume.bottom() - 1),
+            if policy == RenderPolicy::Color {
+                "█"
+            } else {
+                "━"
+            }
+        );
         let grid_overwritten = (layout.main_plot.y..layout.main_plot.bottom())
             .find_map(|y| {
                 let axis_has_tick = (layout.price_axis.x..layout.price_axis.right())

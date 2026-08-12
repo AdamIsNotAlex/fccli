@@ -596,14 +596,11 @@ fn price_candle_style(direction: Direction, policy: RenderPolicy) -> Style {
     }
 }
 
-fn volume_style(direction: Direction, policy: RenderPolicy) -> Style {
-    if policy == RenderPolicy::StyleFree {
-        return Style::default();
-    }
-    match direction {
-        Direction::Bull => Style::default().fg(Color::Green),
-        Direction::Bear => Style::default().fg(Color::Red),
-        Direction::Doji => Style::default(),
+fn volume_symbol(direction: Direction, policy: RenderPolicy) -> &'static str {
+    if policy == RenderPolicy::Color {
+        "█"
+    } else {
+        body_symbol(direction)
     }
 }
 
@@ -670,8 +667,9 @@ fn render_volume(
         let scaled = candle.base_volume() / maximum * f64::from(layout.volume.height);
         let height = (scaled.ceil() as u16).clamp(1, layout.volume.height);
         let start = layout.volume.bottom().saturating_sub(height);
-        let symbol = body_symbol(direction(candle));
-        let style = volume_style(direction(candle), policy);
+        let direction = direction(candle);
+        let symbol = volume_symbol(direction, policy);
+        let style = price_candle_style(direction, policy);
         for y in start..layout.volume.bottom() {
             for x in slot.start()..slot.end() {
                 set_cell(buffer, x as u16, y, symbol, style);
