@@ -144,6 +144,7 @@ fn keys_map_press_and_repeat_once_release_is_ignored_and_quit_is_deferred() {
         (KeyCode::Char('q'), KeyModifiers::NONE),
         (KeyCode::Esc, KeyModifiers::NONE),
         (KeyCode::Char('c'), KeyModifiers::CONTROL),
+        (KeyCode::Char('d'), KeyModifiers::CONTROL),
     ] {
         assert_eq!(
             controller.key(
@@ -208,12 +209,22 @@ fn key_modifiers_are_exact_and_do_not_leak_into_plain_shortcuts() {
     for (code, modifiers) in [
         (KeyCode::Char('c'), KeyModifiers::CONTROL),
         (KeyCode::Char('C'), KeyModifiers::CONTROL),
+        (KeyCode::Char('d'), KeyModifiers::CONTROL),
+        (KeyCode::Char('D'), KeyModifiers::CONTROL),
         (
             KeyCode::Char('c'),
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ),
         (
             KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ),
+        (
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ),
+        (
+            KeyCode::Char('D'),
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ),
     ] {
@@ -235,17 +246,19 @@ fn key_modifiers_are_exact_and_do_not_leak_into_plain_shortcuts() {
         KeyModifiers::CONTROL | KeyModifiers::SUPER,
         KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT,
     ] {
-        let mut state = ChartViewState::snapshot(&candles, usize::from(layout.main_plot.width));
-        assert_eq!(
-            InteractionController::new().key(
-                key(KeyCode::Char('C'), KeyEventKind::Press, modifiers),
-                &mut state,
-                &candles,
-                &layout,
-            ),
-            InteractionAction::Ignored,
-            "ctrl-C with extras {modifiers:?}"
-        );
+        for code in [KeyCode::Char('C'), KeyCode::Char('D')] {
+            let mut state = ChartViewState::snapshot(&candles, usize::from(layout.main_plot.width));
+            assert_eq!(
+                InteractionController::new().key(
+                    key(code, KeyEventKind::Press, modifiers),
+                    &mut state,
+                    &candles,
+                    &layout,
+                ),
+                InteractionAction::Ignored,
+                "{code:?} with extras {modifiers:?}"
+            );
+        }
     }
 }
 

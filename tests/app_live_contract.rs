@@ -1896,10 +1896,11 @@ async fn direct_dispatch_semantic_validation_precedes_provider_and_terminal_use(
 }
 
 #[tokio::test]
-async fn esc_and_ctrl_c_share_the_graceful_shutdown_path() {
+async fn esc_ctrl_c_and_ctrl_d_share_the_graceful_shutdown_path() {
     for event in [
         key(KeyCode::Esc, KeyModifiers::NONE),
         key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        key(KeyCode::Char('d'), KeyModifiers::CONTROL),
     ] {
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
         let provider = Arc::new(FakeProvider::new(

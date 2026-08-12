@@ -1409,7 +1409,7 @@ fn is_quit(key: KeyEvent) -> bool {
         && ((key.modifiers == KeyModifiers::NONE
             && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc))
             || (key.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key.code, KeyCode::Char('c' | 'C'))))
+                && matches!(key.code, KeyCode::Char('c' | 'C' | 'd' | 'D'))))
 }
 
 struct InputReaderTask {

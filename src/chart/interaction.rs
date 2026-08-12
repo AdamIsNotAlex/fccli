@@ -87,10 +87,10 @@ impl InteractionController {
         let ordinary_char = modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT;
         let unmodified = modifiers == KeyModifiers::NONE;
         let plain_quit = unmodified && matches!(code, KeyCode::Char('q') | KeyCode::Esc);
-        let control_c = matches!(code, KeyCode::Char('c' | 'C'))
+        let control_quit = matches!(code, KeyCode::Char('c' | 'C' | 'd' | 'D'))
             && (modifiers == KeyModifiers::CONTROL
                 || modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT));
-        if plain_quit || control_c {
+        if plain_quit || control_quit {
             return InteractionAction::Quit;
         }
 

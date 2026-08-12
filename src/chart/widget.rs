@@ -23,7 +23,7 @@ use super::{
 pub const RESIZE_MESSAGE: &str = "Resize terminal to at least {required_width}x{required_height} (current {actual_width}x{actual_height})";
 pub const EMPTY_MESSAGE: &str = "Waiting for market data";
 pub const FOOTER_MESSAGE: &str =
-    "A/D or ←/→ pan  W/S or ↑/↓ price  h/H time zoom  v/V price zoom  End live  r reset  q quit";
+    "A/D or ←/→ pan  W/S or ↑/↓ price  h/H time zoom  v/V price zoom  End live  r reset  q/Ctrl-D quit";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderMode {
