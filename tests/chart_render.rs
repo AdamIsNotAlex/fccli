@@ -493,10 +493,22 @@ fn color_policy_uses_direction_grid_and_volume_styles() {
     }
     let doji_x = geometry.center(2).expect("doji center");
     let current_price_y = (layout.main_plot.y..layout.main_plot.bottom())
-        .find(|&y| symbol(&buffer, doji_x, y) == "┄")
-        .expect("current price overlays latest doji close");
+        .find(|&y| {
+            (layout.main_plot.x..layout.main_plot.right()).any(|x| symbol(&buffer, x, y) == "┄")
+        })
+        .expect("current price line present on non-candle columns");
+    // The current-price overlay is candle-transparent: the doji's `━` glyph
+    // is preserved at the doji column, while `┄` appears on empty columns.
+    assert_eq!(symbol(&buffer, doji_x, current_price_y), "━");
+    assert!(
+        (layout.main_plot.x..layout.main_plot.right())
+            .any(|x| symbol(&buffer, x, current_price_y) == "┄")
+    );
+    let overlay_x = (layout.main_plot.x..layout.main_plot.right())
+        .find(|&x| symbol(&buffer, x, current_price_y) == "┄")
+        .expect("non-candle overlay cell");
     assert_complete_style(
-        &buffer[(doji_x, current_price_y)],
+        &buffer[(overlay_x, current_price_y)],
         Color::Cyan,
         Color::Reset,
     );
@@ -650,9 +662,16 @@ fn current_price_fresh_stale_and_offscreen_contracts_cover_both_policies() {
         let y = layout.main_plot.y
             + ((range.high - 101.0) / range.span() * f64::from(layout.main_plot.height - 1)).round()
                 as u16;
+        // The overlay is candle-transparent: non-candle columns show the
+        // price glyph, candle columns preserve the candle glyph.
         assert!(
             (layout.main_plot.x..layout.main_plot.right())
-                .all(|x| symbol(&rendered, x, y) == glyph)
+                .all(|x| is_price_candle_glyph(symbol(&rendered, x, y))
+                    || symbol(&rendered, x, y) == glyph)
+        );
+        assert!(
+            (layout.main_plot.x..layout.main_plot.right())
+                .any(|x| symbol(&rendered, x, y) == glyph)
         );
         for x in layout.price_axis.x..layout.price_axis.right() {
             assert_eq!(rendered[(x, y)].fg, foreground);

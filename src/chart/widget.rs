@@ -761,7 +761,7 @@ fn render_current_price(
     };
 
     let y = price_row(price, range, layout.main_plot);
-    fill_row(buffer, layout.main_plot, y, symbol, style);
+    fill_overlay_row(buffer, layout.main_plot, y, symbol, style);
     fill_row(buffer, layout.gutter, y, symbol, style);
     let label = compact_price(price);
     write_padded_row(buffer, layout.price_axis, y, &label, style);
@@ -791,7 +791,7 @@ fn render_crosshair(
     for row in layout.main_plot.y..layout.main_plot.bottom() {
         set_cell(buffer, x, row, "┆", style);
     }
-    fill_row(buffer, layout.main_plot, y, "┄", style);
+    fill_overlay_row(buffer, layout.main_plot, y, "┄", style);
     fill_row(buffer, layout.gutter, y, "┄", style);
     set_cell(buffer, x, y, "┼", style);
 
@@ -959,6 +959,32 @@ fn clear_rect(rect: Rect, buffer: &mut Buffer) {
             set_cell(buffer, x, y, " ", Style::default());
         }
     }
+}
+
+fn fill_overlay_row(buffer: &mut Buffer, rect: Rect, y: u16, symbol: &str, style: Style) {
+    if y < rect.y || y >= rect.bottom() {
+        return;
+    }
+    for x in rect.x..rect.right() {
+        set_overlay_cell(buffer, x, y, symbol, style);
+    }
+}
+
+fn set_overlay_cell(buffer: &mut Buffer, x: u16, y: u16, symbol: &str, style: Style) {
+    if buffer
+        .cell(Position::new(x, y))
+        .is_some_and(|cell| is_price_candle_glyph(cell.symbol()))
+    {
+        return;
+    }
+    set_cell(buffer, x, y, symbol, style);
+}
+
+fn is_price_candle_glyph(symbol: &str) -> bool {
+    matches!(
+        symbol,
+        "│" | "┃" | "╷" | "╵" | "╻" | "╹" | "╽" | "╿" | "█" | "▓" | "▀" | "▄" | "━"
+    )
 }
 
 fn fill_row(buffer: &mut Buffer, rect: Rect, y: u16, symbol: &str, style: Style) {
