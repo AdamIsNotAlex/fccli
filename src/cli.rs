@@ -11,6 +11,31 @@ use crate::model::{
 const DEFAULT_PROVIDER: &str = "binance";
 const DEFAULT_QUOTE: &str = "USDT";
 
+/// A provider-neutral interactive market/timeframe target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketTarget {
+    pub instrument: InstrumentSpec,
+    pub timeframe: Timeframe,
+}
+
+/// Parse the same instrument and timeframe grammar used by startup CLI arguments.
+pub fn parse_market_target(value: &str) -> Result<MarketTarget, String> {
+    let mut fields = value.split_whitespace();
+    let instrument = fields.next().ok_or_else(|| {
+        "expected an instrument and timeframe (for example `btc/usdt 1m`)".to_owned()
+    })?;
+    let timeframe = fields.next().ok_or_else(|| {
+        "expected an instrument and timeframe (for example `btc/usdt 1m`)".to_owned()
+    })?;
+    if fields.next().is_some() {
+        return Err("expected exactly an instrument and timeframe".to_owned());
+    }
+    Ok(MarketTarget {
+        instrument: parse_instrument_spec(instrument)?,
+        timeframe: parse_timeframe(timeframe)?,
+    })
+}
+
 /// The output mode selected by the command line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {

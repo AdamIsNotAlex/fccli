@@ -6,7 +6,7 @@ use std::{
     io::{self, Write},
     process::ExitCode,
     sync::{Arc, mpsc as std_mpsc},
-    thread::{self, JoinHandle},
+    thread::{self, JoinHandle as ThreadJoinHandle},
     time::Duration,
 };
 
@@ -16,15 +16,15 @@ use ratatui::{
     buffer::Buffer,
     layout::{Rect, Size},
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinHandle as TokioJoinHandle};
 
 use crate::{
     chart::{
-        ChartLayoutResult, ChartViewState, ChartWidget, DisplayStatus, InteractionAction,
-        InteractionController, InteractiveChartState, LayoutMode, RenderMode, RenderPolicy,
-        RendererSnapshot, calculate_chart_layout,
+        ChartLayoutResult, ChartViewState, ChartWidget, DisplayStatus, FooterPresentation,
+        InteractionAction, InteractionController, InteractiveChartState, LayoutMode, RenderMode,
+        RenderPolicy, RendererSnapshot, calculate_chart_layout,
     },
-    cli::{Cli, Mode, canonicalize_binance},
+    cli::{Cli, MarketTarget, Mode, canonicalize_binance, parse_market_target},
     clock::{Clock, checked_deadline},
     error::{AppError, ProviderError, RenderError, SanitizedCause, TerminalError},
     history::{HistoryApplyResult, HistoryCoordinator, HistoryJoinError, HistoryProgress},
@@ -46,6 +46,60 @@ pub const PRODUCER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const HISTORY_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(10);
 const INITIAL_HISTORY_LIMIT: u16 = 500;
+const MAX_COMMAND_BYTES: usize = 512;
+
+#[derive(Default)]
+struct CommandEditor {
+    text: String,
+    cursor: usize,
+}
+
+impl CommandEditor {
+    fn apply(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char(character)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                if self.text.len() + character.len_utf8() <= MAX_COMMAND_BYTES {
+                    self.text.insert(self.cursor, character);
+                    self.cursor += character.len_utf8();
+                }
+            }
+            KeyCode::Left => {
+                self.cursor = self.text[..self.cursor]
+                    .char_indices()
+                    .next_back()
+                    .map_or(0, |(index, _)| index)
+            }
+            KeyCode::Right => {
+                self.cursor = self.text[self.cursor..]
+                    .char_indices()
+                    .nth(1)
+                    .map_or(self.text.len(), |(index, _)| self.cursor + index)
+            }
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = self.text.len(),
+            KeyCode::Backspace if self.cursor != 0 => {
+                let previous = self.text[..self.cursor]
+                    .char_indices()
+                    .next_back()
+                    .map_or(0, |(index, _)| index);
+                self.text.drain(previous..self.cursor);
+                self.cursor = previous;
+            }
+            KeyCode::Delete if self.cursor != self.text.len() => {
+                let next = self.text[self.cursor..]
+                    .char_indices()
+                    .nth(1)
+                    .map_or(self.text.len(), |(index, _)| self.cursor + index);
+                self.text.drain(self.cursor..next);
+            }
+            KeyCode::Enter => return true,
+            _ => {}
+        }
+        false
+    }
+}
 #[cfg(feature = "test-transport")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EpochStop {
@@ -409,9 +463,278 @@ struct App {
     status_detail: Option<ProviderError>,
     rate_gate: RateGateState,
     dirty: bool,
+    footer: FooterPresentation,
+    editor: Option<CommandEditor>,
+    providers: ProviderRegistry,
+    switch_generation: u64,
+    switch: Option<SwitchPreparation>,
+    retired: Vec<TokioJoinHandle<Result<(), AppError>>>,
+    root_cancellation: CancellationToken,
+    quit_requested: bool,
+}
+
+struct PreparedMarket {
+    instrument: crate::model::Instrument,
+    timeframe: crate::model::Timeframe,
+    series: CandleSeries,
+    live: LiveFeed,
+    history: HistoryCoordinator,
+    rate_gate_observer: RateGateSnapshot,
+    rate_gate: RateGateState,
+    accepted_watermark: AcceptedWatermarkSender,
+    reconcile_ack: ReconcileAckSender,
+    startup_watermark: Option<i64>,
+}
+
+struct SwitchPreparation {
+    generation: u64,
+    cancellation: CancellationToken,
+    task: TokioJoinHandle<Result<PreparedMarket, AppError>>,
 }
 
 impl App {
+    fn reap_retired(&mut self) {
+        let mut pending = Vec::with_capacity(self.retired.len());
+        for mut task in self.retired.drain(..) {
+            match (&mut task).now_or_never() {
+                Some(Ok(Ok(()))) => {}
+                Some(Err(error)) if error.is_cancelled() => {}
+                Some(Ok(Err(error))) => {
+                    self.footer = FooterPresentation::Error {
+                        message: error.to_string(),
+                    };
+                    self.dirty = true;
+                }
+                Some(Err(_)) => {
+                    self.footer = FooterPresentation::Error {
+                        message: "market cleanup failed".to_owned(),
+                    };
+                    self.dirty = true;
+                }
+                None => pending.push(task),
+            }
+        }
+        self.retired = pending;
+    }
+
+    fn poll_switch(&mut self, live: &mut LiveFeed) {
+        self.reap_retired();
+        let Some(preparation) = self.switch.as_mut() else {
+            return;
+        };
+        let Some(result) = (&mut preparation.task).now_or_never() else {
+            return;
+        };
+        let generation = preparation.generation;
+        self.switch = None;
+        match result {
+            Ok(Ok(prepared)) if generation == self.switch_generation => {
+                let renderer_candles = prepared.series.iter().cloned().collect();
+                let chart_state = match &self.layout {
+                    ChartLayoutResult::LayoutPending { .. } => InteractiveChartState::LayoutPending,
+                    ChartLayoutResult::Ready { layout } => {
+                        InteractiveChartState::Ready(ChartViewState::interactive(
+                            &prepared.series,
+                            usize::from(layout.main_plot.width),
+                        ))
+                    }
+                };
+                let old_live = std::mem::replace(live, prepared.live);
+                old_live.request_shutdown();
+                let old_history = std::mem::replace(&mut self.history, prepared.history);
+                old_history.request_shutdown();
+                let clock = Arc::clone(&self.clock);
+                self.retired.push(tokio::spawn(async move {
+                    let deadline =
+                        checked_deadline(clock.now(), PRODUCER_JOIN_TIMEOUT).unwrap_or(clock.now());
+                    old_live.join(deadline).await.map_err(map_live_join)?;
+                    let mut old_history = old_history;
+                    if old_history.in_flight() {
+                        let deadline = checked_deadline(clock.now(), HISTORY_JOIN_TIMEOUT)
+                            .unwrap_or(clock.now());
+                        old_history.join(deadline).await.map_err(map_history_join)?;
+                    }
+                    Ok(())
+                }));
+                self.instrument = prepared.instrument;
+                self.timeframe = prepared.timeframe;
+                self.series = prepared.series;
+                self.renderer_candles = renderer_candles;
+                self.chart_state = chart_state;
+                self.interaction = InteractionController::new();
+                self.rate_gate_observer = prepared.rate_gate_observer;
+                self.pending_rate_gate = Some(Ok(prepared.rate_gate));
+                self.rate_gate = prepared.rate_gate;
+                self.accepted_watermark = prepared.accepted_watermark;
+                self.reconcile_ack = prepared.reconcile_ack;
+                self.active_generation = None;
+                self.invalidated_generation = None;
+                self.continuity_start = prepared.startup_watermark;
+                self.connection_status = ConnectionStatus::Connecting;
+                self.status_detail = None;
+                self.footer = FooterPresentation::Help;
+                self.dirty = true;
+            }
+            Ok(Err(error)) if generation == self.switch_generation => {
+                self.footer = FooterPresentation::Error {
+                    message: error.to_string(),
+                };
+                self.dirty = true;
+            }
+            Err(error) if generation == self.switch_generation && !error.is_cancelled() => {
+                self.footer = FooterPresentation::Error {
+                    message: "market preparation failed".to_owned(),
+                };
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+    fn begin_switch(&mut self, target: MarketTarget, root: &CancellationToken) {
+        if let Some(pending) = self.switch.take() {
+            pending.cancellation.cancel();
+            pending.task.abort();
+            let clock = Arc::clone(&self.clock);
+            self.retired.push(tokio::spawn(async move {
+                match pending.task.await {
+                    Ok(Ok(prepared)) => {
+                        prepared.live.request_shutdown();
+                        let deadline = checked_deadline(clock.now(), PRODUCER_JOIN_TIMEOUT)
+                            .unwrap_or(clock.now());
+                        prepared.live.join(deadline).await.map_err(map_live_join)
+                    }
+                    Ok(Err(_)) => Ok(()),
+                    Err(error) if error.is_cancelled() => Ok(()),
+                    Err(_) => Err(AppError::Invariant("market preparation join failed")),
+                }
+            }));
+        }
+        let provider = match self.providers.get(target.instrument.provider().clone()) {
+            Ok(provider) => provider,
+            Err(error) => {
+                self.footer = FooterPresentation::Error {
+                    message: error.to_string(),
+                };
+                self.dirty = true;
+                return;
+            }
+        };
+        let instrument = match provider.canonicalize(&target.instrument) {
+            Ok(instrument) => instrument,
+            Err(error) => {
+                self.footer = FooterPresentation::Error {
+                    message: error.to_string(),
+                };
+                self.dirty = true;
+                return;
+            }
+        };
+        if instrument == self.instrument && target.timeframe == self.timeframe {
+            self.footer = FooterPresentation::Help;
+            self.dirty = true;
+            return;
+        }
+        self.switch_generation = self.switch_generation.wrapping_add(1);
+        let generation = self.switch_generation;
+        let cancellation = root.child_token();
+        let task_cancellation = cancellation.clone();
+        let clock = Arc::clone(&self.clock);
+        let label = format!("{} {}", instrument.provider_symbol(), target.timeframe);
+        self.footer = FooterPresentation::Preparing { target: label };
+        self.dirty = true;
+        let task = tokio::spawn(async move {
+            let candles = provider
+                .history(
+                    &instrument,
+                    target.timeframe,
+                    crate::model::HistoryRequest::latest(INITIAL_HISTORY_LIMIT)?,
+                    task_cancellation.child_token(),
+                )
+                .await?;
+            let mut series = CandleSeries::new(target.timeframe);
+            series
+                .replace(candles)
+                .map_err(|_| AppError::Invariant("switch series initialized twice"))?;
+            let startup_watermark = series.newest_open_time();
+            let (accepted_watermark, accepted_watermark_rx) =
+                accepted_watermark_channel(startup_watermark);
+            let (reconcile_ack, reconcile_ack_rx) = reconcile_ack_channel();
+            let live = provider
+                .open_live(LiveRequest {
+                    instrument: instrument.clone(),
+                    timeframe: target.timeframe,
+                    startup_watermark,
+                    accepted_watermark_rx,
+                    reconcile_ack_rx,
+                    cancellation: task_cancellation.child_token(),
+                })
+                .await?;
+            let rate_gate_observer = provider.rate_gate();
+            let rate_gate = rate_gate_observer
+                .current()
+                .map_err(|_| ProviderError::Invariant("provider rate gate closed"))?;
+            let history = HistoryCoordinator::new(
+                Arc::clone(&provider),
+                instrument.clone(),
+                target.timeframe,
+                clock,
+                task_cancellation.child_token(),
+            );
+            Ok(PreparedMarket {
+                instrument,
+                timeframe: target.timeframe,
+                series,
+                live,
+                history,
+                rate_gate_observer,
+                rate_gate,
+                accepted_watermark,
+                reconcile_ack,
+                startup_watermark,
+            })
+        });
+        self.switch = Some(SwitchPreparation {
+            generation,
+            cancellation,
+            task,
+        });
+    }
+
+    fn handle_editor_key(&mut self, key: KeyEvent) -> bool {
+        if self.editor.is_none() {
+            if key.code == KeyCode::Char(':') && key.modifiers.is_empty() {
+                self.editor = Some(CommandEditor::default());
+                self.footer = FooterPresentation::Editing {
+                    text: String::new(),
+                    cursor: 0,
+                };
+                self.dirty = true;
+                return true;
+            }
+            return false;
+        }
+        let submitted = self.editor.as_mut().is_some_and(|editor| editor.apply(key));
+        if submitted {
+            let text = self.editor.take().expect("editor exists").text;
+            match parse_market_target(&text) {
+                Ok(target) => {
+                    let root = self.root_cancellation.clone();
+                    self.begin_switch(target, &root)
+                }
+                Err(message) => {
+                    self.footer = FooterPresentation::Error { message };
+                    self.dirty = true;
+                }
+            }
+        } else if let Some(editor) = &self.editor {
+            self.footer = FooterPresentation::Editing {
+                text: editor.text.clone(),
+                cursor: editor.cursor,
+            };
+            self.dirty = true;
+        }
+        true
+    }
     fn effective_rate_gate(&self) -> RateGateState {
         match self.rate_gate {
             RateGateState::TimedUntil(deadline) if self.clock.now() >= deadline => {
@@ -440,6 +763,7 @@ impl App {
             timeframe: self.timeframe,
             candles: Arc::clone(&self.renderer_candles),
             chart_state: self.chart_state.clone(),
+            footer: self.footer.clone(),
         }
     }
     fn refresh_renderer_candles(&mut self, summary: &MutationSummary) {
@@ -768,6 +1092,23 @@ impl App {
             self.apply_resize(size);
         }
         for key in epoch.keys {
+            if is_soft_quit(key) {
+                if self.editor.is_none() {
+                    self.quit_requested = true;
+                    break;
+                }
+                // q/Esc cancel editing and remain active; force-quit (Ctrl-C/Ctrl-D) is
+                // already handled by `epoch.quit` in bucket 1.
+                if key.code == KeyCode::Esc {
+                    self.editor = None;
+                    self.footer = FooterPresentation::Help;
+                    self.dirty = true;
+                    continue;
+                }
+            }
+            if self.handle_editor_key(key) {
+                continue;
+            }
             if let (ChartLayoutResult::Ready { layout }, InteractiveChartState::Ready(view)) =
                 (&self.layout, &mut self.chart_state)
             {
@@ -999,6 +1340,14 @@ async fn run_interactive(
         status_detail: None,
         rate_gate,
         dirty: true,
+        footer: FooterPresentation::Help,
+        editor: None,
+        providers: dependencies.providers.clone(),
+        switch_generation: 0,
+        switch: None,
+        retired: Vec::new(),
+        root_cancellation: cancellation.clone(),
+        quit_requested: false,
         #[cfg(feature = "test-transport")]
         epoch_observer: dependencies.epoch_observer.clone(),
     };
@@ -1063,6 +1412,13 @@ async fn run_interactive(
     }
 
     app.history.request_shutdown();
+    if let Some(preparation) = app.switch.take() {
+        preparation.cancellation.cancel();
+        preparation.task.abort();
+    }
+    for handle in app.retired.drain(..) {
+        let _ = handle.await;
+    }
     if app.history.in_flight() {
         let now = dependencies.clock.now();
         let history_deadline = if app.history.has_owned_task() {
@@ -1150,6 +1506,15 @@ async fn run_app_loop(
                         epoch.cancelled = true;
                     }
                 },
+                () = async {
+                    if app.switch.is_some() {
+                        tokio::time::sleep(INPUT_POLL_TIMEOUT).await;
+                    } else {
+                        future::pending().await
+                    }
+                } => {
+                    app.poll_switch(live);
+                },
                 completion = live.producer_completion.changed(), if !producer_finished => {
                     if epoch.admit(EpochSource::ProducerCompletion) {
                         producer_finished = classify_producer_completion(completion, &mut epoch);
@@ -1223,7 +1588,7 @@ async fn run_app_loop(
             }
         }
 
-        if !input_open && !epoch.quit {
+        if !input_open && !epoch.quit && !epoch.keys.iter().copied().any(is_soft_quit) {
             epoch
                 .channel_failures
                 .push(AppError::Invariant("terminal input channel closed"));
@@ -1239,6 +1604,9 @@ async fn run_app_loop(
         }
         if let Some(error) = app.reduce(epoch) {
             return Some(error);
+        }
+        if app.quit_requested {
+            return None;
         }
         if should_finish {
             return None;
@@ -1274,7 +1642,11 @@ fn classify_input(
     terminal: &dyn crate::terminal::TerminalDriver,
 ) -> bool {
     match input {
-        Some(InputEvent::Key(key)) if is_quit(key) => epoch.quit = true,
+        // Ctrl-C/Ctrl-D always quit, even mid-edit. q/Esc quit only when not editing, so they
+        // are pushed to the key queue for an editor-aware decision in `reduce`.
+        Some(InputEvent::Key(key)) if is_force_quit(key) => {
+            epoch.quit = true;
+        }
         Some(InputEvent::Key(key)) => epoch.keys.push(key),
         Some(InputEvent::Mouse(mouse)) => epoch.pointers.push(mouse),
         Some(InputEvent::ResizeRequested) => match terminal.size() {
@@ -1404,17 +1776,21 @@ fn classify_history_progress(progress: HistoryProgress, epoch: &mut Epoch) {
     }
 }
 
-fn is_quit(key: KeyEvent) -> bool {
+fn is_force_quit(key: KeyEvent) -> bool {
     key.kind != KeyEventKind::Release
-        && ((key.modifiers == KeyModifiers::NONE
-            && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc))
-            || (key.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key.code, KeyCode::Char('c' | 'C' | 'd' | 'D'))))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c' | 'C' | 'd' | 'D'))
+}
+
+fn is_soft_quit(key: KeyEvent) -> bool {
+    key.kind != KeyEventKind::Release
+        && key.modifiers == KeyModifiers::NONE
+        && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
 }
 
 struct InputReaderTask {
     cancel: Option<std_mpsc::Sender<()>>,
-    owner: Option<JoinHandle<()>>,
+    owner: Option<ThreadJoinHandle<()>>,
 }
 
 impl InputReaderTask {

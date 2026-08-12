@@ -23,7 +23,15 @@ use super::{
 pub const RESIZE_MESSAGE: &str = "Resize terminal to at least {required_width}x{required_height} (current {actual_width}x{actual_height})";
 pub const EMPTY_MESSAGE: &str = "Waiting for market data";
 pub const FOOTER_MESSAGE: &str =
-    "A/D or ←/→ pan  W/S or ↑/↓ price  h/H time zoom  v/V price zoom  End live  r reset  q/Ctrl-D quit";
+    ": market/timeframe  A/D pan  W/S price  h/H time  v/V price  End live  r reset  q quit";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FooterPresentation {
+    Help,
+    Editing { text: String, cursor: usize },
+    Preparing { target: String },
+    Error { message: String },
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderMode {
@@ -97,6 +105,7 @@ pub struct RendererSnapshot {
     pub timeframe: Timeframe,
     pub candles: Arc<[Candle]>,
     pub chart_state: InteractiveChartState,
+    pub footer: FooterPresentation,
 }
 
 pub struct ChartWidget<'a> {
@@ -683,14 +692,17 @@ fn render_footer(snapshot: &RendererSnapshot, footer: Option<Rect>, buffer: &mut
         return;
     }
     if let Some(footer) = footer {
-        write_clipped(
-            buffer,
-            footer,
-            footer.x,
-            footer.y,
-            FOOTER_MESSAGE,
-            Style::default(),
-        );
+        let text = match &snapshot.footer {
+            FooterPresentation::Help => FOOTER_MESSAGE.to_owned(),
+            FooterPresentation::Editing { text, cursor } => {
+                let cursor = (*cursor).min(text.len());
+                let (before, after) = text.split_at(cursor);
+                format!(":{before}│{after}")
+            }
+            FooterPresentation::Preparing { target } => format!("Preparing {target}…"),
+            FooterPresentation::Error { message } => format!("Error: {message}"),
+        };
+        write_clipped(buffer, footer, footer.x, footer.y, &text, Style::default());
     }
 }
 

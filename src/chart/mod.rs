@@ -20,6 +20,6 @@ pub use state::{
     PriceRange, auto_y_range, bounded_zoom_factor,
 };
 pub use widget::{
-    ChartWidget, DisplayStatus, EMPTY_MESSAGE, FOOTER_MESSAGE, RESIZE_MESSAGE, RenderMode,
-    RenderPolicy, RendererSnapshot, detect_render_policy, no_color_present,
+    ChartWidget, DisplayStatus, EMPTY_MESSAGE, FOOTER_MESSAGE, FooterPresentation, RESIZE_MESSAGE,
+    RenderMode, RenderPolicy, RendererSnapshot, detect_render_policy, no_color_present,
 };

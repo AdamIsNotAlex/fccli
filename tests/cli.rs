@@ -1,6 +1,6 @@
 use clap::error::ErrorKind;
 use fccli::{
-    cli::{CanonicalizationError, Cli, Mode, canonicalize_binance},
+    cli::{CanonicalizationError, Cli, Mode, canonicalize_binance, parse_market_target},
     model::{InstrumentSpec, Market, ProviderId, Timeframe},
 };
 
@@ -378,4 +378,101 @@ fn help_version_and_command_rendering_are_library_only_and_stable() {
             .get_arguments()
             .any(|argument| argument.get_id() == "interactive")
     );
+}
+
+#[test]
+fn parse_market_target_matches_startup_grammar_for_valid_inputs() {
+    for (instrument, timeframe) in [
+        ("btc", "1m"),
+        ("binance:btc", "1h"),
+        ("btc/usdc", "1M"),
+        ("btc-usdt", "1d"),
+        ("BTCUSDT", "1s"),
+    ] {
+        let cli = Cli::try_parse_from(["fccli", instrument, timeframe]).expect("valid CLI");
+        let target =
+            parse_market_target(&format!("{instrument} {timeframe}")).expect("valid target");
+        assert_eq!(
+            target.instrument,
+            *cli.instrument(),
+            "{instrument} {timeframe}"
+        );
+        assert_eq!(
+            target.timeframe,
+            cli.timeframe(),
+            "{instrument} {timeframe}"
+        );
+    }
+}
+
+#[test]
+fn parse_market_target_rejects_missing_extra_and_invalid_tokens() {
+    assert!(parse_market_target("").is_err());
+    assert!(parse_market_target("btc").is_err());
+    assert!(parse_market_target("btc 1m 1h").is_err());
+    assert!(parse_market_target("btc/usdt/eth 1m").is_err());
+    assert!(parse_market_target("btc 60m").is_err());
+    assert!(parse_market_target("btç 1m").is_err());
+}
+
+#[test]
+fn parse_market_target_collapses_internal_whitespace() {
+    let target = parse_market_target("   btc/usdt   1m   ").expect("collapsed whitespace");
+    let cli = Cli::try_parse_from(["fccli", "btc/usdt", "1m"]).expect("valid CLI");
+    assert_eq!(target.instrument, *cli.instrument());
+    assert_eq!(target.timeframe, cli.timeframe());
+}
+
+#[test]
+fn parse_market_target_defaults_absent_provider_to_binance() {
+    let target = parse_market_target("btc 1m").expect("valid target");
+    assert_eq!(target.instrument.provider().as_str(), "binance");
+    let explicit = parse_market_target("binance:btc 1m").expect("valid explicit target");
+    assert_eq!(explicit.instrument.provider().as_str(), "binance");
+    assert_eq!(target.instrument, explicit.instrument);
+}
+
+#[test]
+fn parse_market_target_preserves_unknown_provider_until_canonicalization() {
+    let target = parse_market_target("kraken:btc/usdt 1m").expect("unknown provider parses");
+    assert_eq!(target.instrument.provider().as_str(), "kraken");
+    assert_eq!(
+        canonicalize_binance(&target.instrument),
+        Err(CanonicalizationError::UnsupportedProvider {
+            provider: target.instrument.provider().clone(),
+        })
+    );
+}
+
+#[test]
+fn parse_market_target_rejects_unsafe_payloads_without_echo() {
+    for (value, marker) in [
+        ("btc\ninjected 1m", "injected"),
+        ("btc\u{1b}[31mred 1m", "red"),
+        ("btc\0hidden 1m", "hidden"),
+    ] {
+        let error = parse_market_target(value).expect_err("unsafe target");
+        let rendered = error.to_string();
+        assert!(!rendered.contains(value), "echoed: {rendered:?}");
+        assert!(!rendered.contains(marker), "marker echoed: {rendered:?}");
+        assert!(!rendered.contains('\u{1b}'), "ESC survived: {rendered:?}");
+        assert!(!rendered.contains('\0'), "NUL survived: {rendered:?}");
+    }
+}
+
+#[test]
+fn parse_market_target_rejects_oversized_input_boundedly() {
+    let oversized = format!("{} 1m", "a".repeat(1_000_000));
+    let error = parse_market_target(&oversized).expect_err("oversized target");
+    let rendered = error.to_string();
+    assert!(!rendered.contains(&oversized));
+    assert!(rendered.len() < 4_096, "error rendering was not bounded");
+}
+
+#[test]
+fn market_target_is_clone_debug_eq() {
+    let target = parse_market_target("btc/usdt 1m").expect("valid target");
+    let cloned = target.clone();
+    assert_eq!(target, cloned);
+    assert!(format!("{target:?}").contains("MarketTarget"));
 }

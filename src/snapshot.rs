@@ -114,6 +114,7 @@ pub async fn run_snapshot(
         timeframe,
         candles: series.into_arc(),
         chart_state,
+        footer: crate::chart::FooterPresentation::Help,
     };
 
     let mut buffer = Buffer::empty(frame);

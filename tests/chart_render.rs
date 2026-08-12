@@ -70,6 +70,7 @@ fn snapshot(
         timeframe: Timeframe::Minute1,
         candles: series.iter().cloned().collect::<Vec<_>>().into(),
         chart_state: InteractiveChartState::Ready(chart_state),
+        footer: fccli::chart::FooterPresentation::Help,
     }
 }
 
@@ -1475,8 +1476,9 @@ fn footer_names_h_and_v_zoom_bindings_in_both_cases() {
         layout.footer.expect("footer"),
         layout.footer.expect("footer").y,
     );
-    assert!(footer.contains("h/H time zoom"));
-    assert!(footer.contains("v/V price zoom"));
+    assert!(footer.contains("h/H time"));
+    assert!(footer.contains("v/V price"));
+    assert!(footer.contains(": market/timeframe"));
 }
 
 #[test]
@@ -1774,4 +1776,150 @@ fn render_policy_detection_uses_captured_tty_and_no_color_presence_only() {
     assert_eq!(detect_render_policy(true, true), RenderPolicy::StyleFree);
     assert_eq!(detect_render_policy(false, false), RenderPolicy::StyleFree);
     assert_eq!(detect_render_policy(false, true), RenderPolicy::StyleFree);
+}
+
+#[test]
+fn footer_help_renders_default_bindings() {
+    use fccli::chart::FooterPresentation;
+
+    let area = Rect::new(0, 0, 120, 24);
+    let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, LayoutMode::Interactive)
+    else {
+        panic!("adequate")
+    };
+    let candles = series();
+    let mut snap = snapshot(
+        &candles,
+        ChartViewState::interactive(&candles, usize::from(layout.main_plot.width)),
+        RenderMode::Interactive,
+    );
+    snap.footer = FooterPresentation::Help;
+    let rendered = render_with_sentinel(&snap, layout, RenderPolicy::StyleFree);
+    let footer = row_text(
+        &rendered,
+        layout.footer.expect("footer"),
+        layout.footer.expect("footer").y,
+    );
+    assert!(footer.contains("q quit"));
+    assert!(footer.contains(": market/timeframe"));
+}
+
+#[test]
+fn footer_editing_renders_prompt_and_cursor_marker() {
+    use fccli::chart::FooterPresentation;
+
+    let area = Rect::new(0, 0, 120, 24);
+    let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, LayoutMode::Interactive)
+    else {
+        panic!("adequate")
+    };
+    let candles = series();
+    let mut snap = snapshot(
+        &candles,
+        ChartViewState::interactive(&candles, usize::from(layout.main_plot.width)),
+        RenderMode::Interactive,
+    );
+    snap.footer = FooterPresentation::Editing {
+        text: "btc/usdt 1m".to_owned(),
+        cursor: 3,
+    };
+    let rendered = render_with_sentinel(&snap, layout, RenderPolicy::StyleFree);
+    let footer = row_text(
+        &rendered,
+        layout.footer.expect("footer"),
+        layout.footer.expect("footer").y,
+    );
+    assert!(
+        footer.starts_with(":btc│/usdt 1m"),
+        "footer was: {footer:?}"
+    );
+}
+
+#[test]
+fn footer_preparing_renders_target_label() {
+    use fccli::chart::FooterPresentation;
+
+    let area = Rect::new(0, 0, 120, 24);
+    let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, LayoutMode::Interactive)
+    else {
+        panic!("adequate")
+    };
+    let candles = series();
+    let mut snap = snapshot(
+        &candles,
+        ChartViewState::interactive(&candles, usize::from(layout.main_plot.width)),
+        RenderMode::Interactive,
+    );
+    snap.footer = FooterPresentation::Preparing {
+        target: "BTCUSDT 1m".to_owned(),
+    };
+    let rendered = render_with_sentinel(&snap, layout, RenderPolicy::StyleFree);
+    let footer = row_text(
+        &rendered,
+        layout.footer.expect("footer"),
+        layout.footer.expect("footer").y,
+    );
+    assert!(
+        footer.contains("Preparing BTCUSDT 1m"),
+        "footer was: {footer:?}"
+    );
+}
+
+#[test]
+fn footer_error_renders_message() {
+    use fccli::chart::FooterPresentation;
+
+    let area = Rect::new(0, 0, 120, 24);
+    let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, LayoutMode::Interactive)
+    else {
+        panic!("adequate")
+    };
+    let candles = series();
+    let mut snap = snapshot(
+        &candles,
+        ChartViewState::interactive(&candles, usize::from(layout.main_plot.width)),
+        RenderMode::Interactive,
+    );
+    snap.footer = FooterPresentation::Error {
+        message: "unsupported provider".to_owned(),
+    };
+    let rendered = render_with_sentinel(&snap, layout, RenderPolicy::StyleFree);
+    let footer = row_text(
+        &rendered,
+        layout.footer.expect("footer"),
+        layout.footer.expect("footer").y,
+    );
+    assert!(
+        footer.contains("Error: unsupported provider"),
+        "footer was: {footer:?}"
+    );
+}
+
+#[test]
+fn footer_editing_is_clipped_to_footer_width() {
+    use fccli::chart::FooterPresentation;
+
+    let area = Rect::new(0, 0, 60, 18);
+    let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, LayoutMode::Interactive)
+    else {
+        panic!("adequate")
+    };
+    let candles = series();
+    let mut snap = snapshot(
+        &candles,
+        ChartViewState::interactive(&candles, usize::from(layout.main_plot.width)),
+        RenderMode::Interactive,
+    );
+    let long_text = "btc/usdt 1m ".repeat(20);
+    snap.footer = FooterPresentation::Editing {
+        text: long_text.clone(),
+        cursor: long_text.len(),
+    };
+    let rendered = render_with_sentinel(&snap, layout, RenderPolicy::StyleFree);
+    let footer_rect = layout.footer.expect("footer");
+    let footer = row_text(&rendered, footer_rect, footer_rect.y);
+    assert!(
+        footer.chars().count() <= usize::from(footer_rect.width),
+        "footer exceeded width: {footer:?}"
+    );
 }
