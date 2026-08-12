@@ -37,12 +37,12 @@ impl CandleSlot {
 
     /// Columns painted by the candle body and its volume bar.
     ///
-    /// Multi-column slots reserve their rightmost column as a visual gap.
-    /// Single-column slots remain fully painted because no nonzero gap can fit.
-    /// Pointer ownership remains the complete slot.
+    /// One- and two-column slots remain fully painted. Wider slots reserve
+    /// their rightmost column as a visual gap. Pointer ownership remains the
+    /// complete slot.
     #[must_use]
     pub const fn painted_range(self) -> Range<u32> {
-        let end = if self.end - self.start > 1 {
+        let end = if self.end - self.start >= 3 {
             self.end - 1
         } else {
             self.end

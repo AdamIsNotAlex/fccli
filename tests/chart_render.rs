@@ -1537,6 +1537,60 @@ fn one_column_slots_preserve_bull_and_bear_direction() {
 }
 
 #[test]
+fn two_column_slots_fully_paint_price_and_volume_in_both_render_modes() {
+    let area = Rect::new(0, 0, 60, 18);
+    for (layout_mode, render_mode) in [
+        (LayoutMode::Snapshot, RenderMode::Snapshot),
+        (LayoutMode::Interactive, RenderMode::Interactive),
+    ] {
+        let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, layout_mode) else {
+            panic!("adequate")
+        };
+        let mut candles = CandleSeries::new(Timeframe::Minute1);
+        let _ = candles.replace(
+            (0..23)
+                .map(|index| {
+                    candle(
+                        1_701_100_000_000 + i64::from(index) * 60_000,
+                        4.0,
+                        10.0,
+                        0.0,
+                        8.0,
+                        1.0,
+                    )
+                })
+                .collect(),
+        );
+        let rendered = render_with_sentinel(
+            &snapshot(
+                &candles,
+                ChartViewState::snapshot(&candles, usize::from(layout.main_plot.width)),
+                render_mode,
+            ),
+            layout,
+            RenderPolicy::Color,
+        );
+        let slot = fccli::chart::CandleSlotGeometry::new(
+            layout.main_plot.x,
+            layout.main_plot.width,
+            23,
+        )
+        .expect("geometry")
+        .slot(0)
+        .expect("slot");
+        assert_eq!(slot.width(), 2);
+        let body_row = (layout.main_plot.y..layout.main_plot.bottom())
+            .find(|&y| symbol(&rendered, slot.center(), y) == "┃")
+            .expect("body row");
+        for x in slot.start()..slot.end() {
+            let x = u16::try_from(x).expect("slot coordinate");
+            assert!(is_price_candle_glyph(symbol(&rendered, x, body_row)));
+            assert_eq!(symbol(&rendered, x, layout.volume.bottom() - 1), "█");
+        }
+    }
+}
+
+#[test]
 fn multi_column_slots_share_dynamic_width_between_price_and_volume() {
     let area = Rect::new(0, 0, 60, 18);
     let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, LayoutMode::Snapshot)
