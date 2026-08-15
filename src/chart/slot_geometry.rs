@@ -58,19 +58,21 @@ impl CandleSlot {
     }
 }
 
-/// Nearest-boundary partition of a plot's columns among visible candles.
+/// Equal-width, right-aligned projection of visible candles onto plot columns.
 ///
-/// Each internal boundary is rounded to the nearest column from its ideal
-/// fractional position. This spreads unavoidable remainder columns across the
-/// plot instead of accumulating wider slots on one side. Construction rejects
-/// empty geometry, more candles than columns, and coordinate ranges whose
-/// exclusive end exceeds `65536` (one past the largest `u16` terminal
-/// coordinate).
+/// Every candle receives the same integer slot width. Columns left over after
+/// division form inert visual padding on the left rather than changing gaps
+/// between candles. Pointer projection maps that padding to the first visible
+/// candle so the complete plot remains interactive. Construction rejects empty
+/// geometry, more candles than columns, and coordinate ranges whose exclusive
+/// end exceeds `65536` (one past the largest `u16` terminal coordinate).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CandleSlotGeometry {
     origin: u16,
     width: u16,
     visible_count: u16,
+    slot_width: u16,
+    left_padding: u16,
 }
 
 impl CandleSlotGeometry {
@@ -83,11 +85,14 @@ impl CandleSlotGeometry {
         if u32::from(origin) + u32::from(width) > u32::from(u16::MAX) + 1 {
             return None;
         }
+        let visible_count = u16::try_from(visible_count).ok()?;
 
         Some(Self {
             origin,
             width,
-            visible_count: u16::try_from(visible_count).ok()?,
+            visible_count,
+            slot_width: width / visible_count,
+            left_padding: width % visible_count,
         })
     }
 
@@ -106,12 +111,6 @@ impl CandleSlotGeometry {
         self.visible_count as usize
     }
 
-    fn boundary_offset(self, boundary: u16) -> u32 {
-        debug_assert!(boundary <= self.visible_count);
-        let count = u32::from(self.visible_count);
-        (u32::from(boundary) * u32::from(self.width) + count / 2) / count
-    }
-
     /// Returns the exact half-open slot for a visible-candle index.
     #[must_use]
     pub fn slot(self, index: usize) -> Option<CandleSlot> {
@@ -120,9 +119,11 @@ impl CandleSlotGeometry {
             return None;
         }
 
+        let offset = u32::from(self.left_padding) + u32::from(index) * u32::from(self.slot_width);
+        let start = u32::from(self.origin) + offset;
         Some(CandleSlot {
-            start: u32::from(self.origin) + self.boundary_offset(index),
-            end: u32::from(self.origin) + self.boundary_offset(index + 1),
+            start,
+            end: start + u32::from(self.slot_width),
         })
     }
 
@@ -133,15 +134,13 @@ impl CandleSlotGeometry {
         if offset >= self.width {
             return None;
         }
+        if offset < self.left_padding {
+            return Some(0);
+        }
 
-        // `boundary(i) <= offset` iff
-        // `i * width <= (offset + 1) * count - floor(count / 2) - 1`.
-        // Dividing that upper bound by `width` yields the owning slot directly.
-        let count = u32::from(self.visible_count);
-        let scaled_right = (u32::from(offset) + 1) * count;
-        let index = (scaled_right - count / 2 - 1) / u32::from(self.width);
-        debug_assert!(index < count);
-        usize::try_from(index).ok()
+        let index = (offset - self.left_padding) / self.slot_width;
+        debug_assert!(index < self.visible_count);
+        Some(usize::from(index))
     }
 
     /// Returns the center column for a visible-candle index.

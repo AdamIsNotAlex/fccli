@@ -533,7 +533,7 @@ fn axis_drags_keep_initial_anchors_clamp_frame_and_enforce_x_floor() {
 }
 
 #[test]
-fn axis_drags_use_exact_one_point_zero_five_powers_and_locked_signs() {
+fn axis_drags_keep_exact_y_powers_and_snap_x_to_uniform_cadence() {
     let candles = series(100);
     let layout = layout();
     let mut controller = InteractionController::new();
@@ -592,7 +592,6 @@ fn axis_drags_use_exact_one_point_zero_five_powers_and_locked_signs() {
     let tx = layout.utc_axis.x + 10;
     let ty = layout.utc_axis.y;
     let mut rightward = ChartViewState::snapshot(&candles, usize::from(layout.main_plot.width));
-    let initial = rightward.viewport().unwrap().visible_count();
     controller.mouse(
         mouse(MouseEventKind::Down(MouseButton::Left), tx, ty),
         &mut rightward,
@@ -600,24 +599,20 @@ fn axis_drags_use_exact_one_point_zero_five_powers_and_locked_signs() {
         &layout,
     );
     controller.mouse(
-        mouse(MouseEventKind::Drag(MouseButton::Left), tx + 3, ty),
+        mouse(MouseEventKind::Drag(MouseButton::Left), tx + 10, ty),
         &mut rightward,
         &candles,
         &layout,
     );
-    assert_eq!(
-        rightward.viewport().unwrap().visible_count(),
-        (initial as f64 / 1.05_f64.powi(3)).round() as usize
-    );
+    assert_eq!(rightward.viewport().unwrap().visible_count(), 32);
     controller.mouse(
-        mouse(MouseEventKind::Up(MouseButton::Left), tx + 3, ty),
+        mouse(MouseEventKind::Up(MouseButton::Left), tx + 10, ty),
         &mut rightward,
         &candles,
         &layout,
     );
 
     let mut leftward = ChartViewState::interactive(&candles, usize::from(layout.main_plot.width));
-    let initial = leftward.viewport().unwrap().visible_count();
     controller.mouse(
         mouse(MouseEventKind::Down(MouseButton::Left), tx, ty),
         &mut leftward,
@@ -625,17 +620,14 @@ fn axis_drags_use_exact_one_point_zero_five_powers_and_locked_signs() {
         &layout,
     );
     controller.mouse(
-        mouse(MouseEventKind::Drag(MouseButton::Left), tx - 3, ty),
+        mouse(MouseEventKind::Drag(MouseButton::Left), tx - 10, ty),
         &mut leftward,
         &candles,
         &layout,
     );
-    assert_eq!(
-        leftward.viewport().unwrap().visible_count(),
-        (initial as f64 * 1.05_f64.powi(3)).round() as usize
-    );
+    assert_eq!(leftward.viewport().unwrap().visible_count(), 65);
     controller.mouse(
-        mouse(MouseEventKind::Up(MouseButton::Left), tx - 3, ty),
+        mouse(MouseEventKind::Up(MouseButton::Left), tx - 10, ty),
         &mut leftward,
         &candles,
         &layout,
@@ -762,7 +754,7 @@ fn drag_ownership_survives_leaving_origin_region_and_release_reprojects_or_clear
     controller.mouse(
         mouse(
             MouseEventKind::Drag(MouseButton::Left),
-            x + 4,
+            x + 10,
             layout.header.y,
         ),
         &mut state,

@@ -2,8 +2,6 @@ use std::ops::Range;
 
 use crate::model::{CHART_PRICE_MAX, CandleSeries, MutationSummary};
 
-const X_ZOOM_IN: f64 = 0.8;
-const X_ZOOM_OUT: f64 = 1.25;
 const Y_ZOOM_IN: f64 = 0.8;
 const Y_ZOOM_OUT: f64 = 1.25;
 const X_PAN_FRACTION: f64 = 0.05;
@@ -137,7 +135,7 @@ impl ChartViewState {
             if len < 10 {
                 len.min(plot_width)
             } else {
-                let half_width = plot_width.div_ceil(2);
+                let half_width = plot_width / 2;
                 len.min(plot_width).min(10_usize.max(half_width))
             }
         } else {
@@ -262,14 +260,39 @@ impl ChartViewState {
         refresh_open_time_and_auto_y(view, candles);
     }
 
+    /// Moves to the next wider integer candle-slot cadence.
     pub fn zoom_x_in(&mut self, candles: &CandleSeries, plot_width: usize) {
-        self.zoom_x_by_factor(candles, plot_width, X_ZOOM_IN);
+        assert!(plot_width > 0, "plot_width must be positive");
+        let Some(view) = self.viewport_mut_internal() else {
+            return;
+        };
+        let minimum = Self::min_visible_count(candles.len(), plot_width);
+        if view.visible_count <= minimum {
+            return;
+        }
+        let maximum = candles.len().min(plot_width);
+        let next_slot_width = plot_width / view.visible_count + 1;
+        let next = (plot_width / next_slot_width).clamp(minimum, maximum);
+        set_centered_visible_count(view, candles, next);
     }
 
+    /// Moves to the next narrower integer candle-slot cadence.
     pub fn zoom_x_out(&mut self, candles: &CandleSeries, plot_width: usize) {
-        self.zoom_x_by_factor(candles, plot_width, X_ZOOM_OUT);
+        assert!(plot_width > 0, "plot_width must be positive");
+        let Some(view) = self.viewport_mut_internal() else {
+            return;
+        };
+        let maximum = candles.len().min(plot_width);
+        if view.visible_count >= maximum {
+            return;
+        }
+        let minimum = Self::min_visible_count(candles.len(), plot_width);
+        let next_slot_width = plot_width / (view.visible_count + 1);
+        let next = (plot_width / next_slot_width).clamp(minimum, maximum);
+        set_centered_visible_count(view, candles, next);
     }
 
+    /// Snaps a requested zoom factor to the nearest equal-width slot cadence.
     pub fn zoom_x_by_factor(&mut self, candles: &CandleSeries, plot_width: usize, factor: f64) {
         assert!(plot_width > 0, "plot_width must be positive");
         if !factor.is_finite() || factor <= 0.0 {
@@ -280,22 +303,12 @@ impl ChartViewState {
         };
         let minimum = Self::min_visible_count(candles.len(), plot_width);
         let maximum = candles.len().min(plot_width);
-        let next = round_ties_away(view.visible_count as f64 * factor).clamp(minimum, maximum);
-        if next == view.visible_count {
-            return;
-        }
-        let was_following = view.follow_live;
-        let anchor_index = logical_center_index(view);
-        view.visible_count = next;
-        if was_following {
-            view.right_index = candles.len() - 1;
-            view.follow_live = true;
-        } else {
-            view.right_index = right_index_for_center(anchor_index, next, candles.len());
-            view.follow_live = view.right_index + 1 == candles.len();
-        }
-        refresh_open_time_and_auto_y(view, candles);
+        let target = round_ties_away(view.visible_count as f64 * factor).clamp(minimum, maximum);
+        let next =
+            closest_uniform_visible_count(plot_width, target, view.visible_count, minimum, maximum);
+        set_centered_visible_count(view, candles, next);
     }
+
     /// Zooms X around a fixed candle rather than the viewport center.
     pub(super) fn zoom_x_at(
         &mut self,
@@ -320,7 +333,9 @@ impl ChartViewState {
             .min(view.visible_count - 1);
         let minimum = Self::min_visible_count(candles.len(), plot_width);
         let maximum = candles.len().min(plot_width);
-        let next = round_ties_away(view.visible_count as f64 * factor).clamp(minimum, maximum);
+        let target = round_ties_away(view.visible_count as f64 * factor).clamp(minimum, maximum);
+        let next =
+            closest_uniform_visible_count(plot_width, target, view.visible_count, minimum, maximum);
         if next == view.visible_count {
             return;
         }
@@ -620,6 +635,65 @@ fn zoomed_manual_range(range: PriceRange, factor: f64) -> Option<PriceRange> {
     };
     let half = target_span * 0.5;
     normalized_manual_range(range.center() - half, range.center() + half)
+}
+
+/// Chooses the `floor(plot_width / slot_width)` level nearest a requested
+/// candle count. Direction breaks exact ties so a drag never reverses itself.
+fn closest_uniform_visible_count(
+    plot_width: usize,
+    target: usize,
+    current: usize,
+    minimum: usize,
+    maximum: usize,
+) -> usize {
+    debug_assert!(0 < minimum && minimum <= target && target <= maximum);
+    debug_assert!(maximum <= plot_width);
+    if target == current {
+        return current;
+    }
+
+    let floor_pitch = plot_width / target;
+    let ceil_pitch = plot_width.div_ceil(target);
+    let at_or_above = (plot_width / floor_pitch).clamp(minimum, maximum);
+    let at_or_below = (plot_width / ceil_pitch).clamp(minimum, maximum);
+    let above_distance = at_or_above.abs_diff(target);
+    let below_distance = at_or_below.abs_diff(target);
+    let nearest = if above_distance < below_distance {
+        at_or_above
+    } else if below_distance < above_distance {
+        at_or_below
+    } else if target < current {
+        at_or_below.min(at_or_above)
+    } else {
+        at_or_below.max(at_or_above)
+    };
+
+    if target < current {
+        nearest.min(current)
+    } else {
+        nearest.max(current)
+    }
+}
+
+fn set_centered_visible_count(
+    view: &mut ChartViewport,
+    candles: &CandleSeries,
+    visible_count: usize,
+) {
+    if visible_count == view.visible_count {
+        return;
+    }
+    let was_following = view.follow_live;
+    let anchor_index = logical_center_index(view);
+    view.visible_count = visible_count;
+    if was_following {
+        view.right_index = candles.len() - 1;
+        view.follow_live = true;
+    } else {
+        view.right_index = right_index_for_center(anchor_index, visible_count, candles.len());
+        view.follow_live = view.right_index + 1 == candles.len();
+    }
+    refresh_open_time_and_auto_y(view, candles);
 }
 
 fn logical_center_index(view: &ChartViewport) -> usize {

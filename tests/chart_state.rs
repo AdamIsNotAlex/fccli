@@ -71,7 +71,7 @@ fn initializers_distinguish_empty_snapshot_and_interactive_counts() {
     assert_eq!(data(&snapshot).visible_count(), 30);
     assert_eq!(snapshot.visible_range(), 70..100);
 
-    for (width, expected) in [(1, 1), (9, 9), (20, 10), (21, 11), (40, 20), (200, 100)] {
+    for (width, expected) in [(1, 1), (9, 9), (20, 10), (21, 10), (40, 20), (200, 100)] {
         let state = ChartViewState::interactive(&series, width);
         assert_eq!(data(&state).visible_count(), expected, "width={width}");
         assert_eq!(data(&state).right_index(), 99);
@@ -95,7 +95,7 @@ fn initializer_rejects_zero_plot_width() {
 }
 
 #[test]
-fn x_pan_zoom_use_exact_factors_rounding_and_bounds() {
+fn x_pan_zoom_use_adjacent_integer_slot_levels_and_bounds() {
     let series = candles(100);
     let mut state = ChartViewState::snapshot(&series, 21);
     state.pan_x_older(&series);
@@ -103,25 +103,41 @@ fn x_pan_zoom_use_exact_factors_rounding_and_bounds() {
     assert!(!data(&state).follows_live());
 
     state.zoom_x_in(&series, 21);
-    assert_eq!(data(&state).visible_count(), 17);
+    assert_eq!(data(&state).visible_count(), 10);
     state.zoom_x_out(&series, 21);
     assert_eq!(data(&state).visible_count(), 21);
 
-    while data(&state).visible_count() > 10 {
-        state.zoom_x_in(&series, 21);
-    }
-    assert_eq!(data(&state).visible_count(), 10);
+    state.zoom_x_in(&series, 21);
     let at_floor = state.clone();
     state.zoom_x_in(&series, 21);
     assert_eq!(state, at_floor);
 
     state.end(&series);
-    while data(&state).visible_count() < 21 {
-        state.zoom_x_out(&series, 21);
-    }
+    state.zoom_x_out(&series, 21);
+    assert_eq!(data(&state).visible_count(), 21);
     let at_ceiling = state.clone();
     state.zoom_x_out(&series, 21);
     assert_eq!(state, at_ceiling);
+}
+
+#[test]
+fn keyboard_x_zoom_walks_uniform_integer_pitch_levels() {
+    let series = candles(200);
+    let mut state = ChartViewState::interactive(&series, 105);
+    assert_eq!(data(&state).visible_count(), 52);
+
+    for expected in [35, 26, 21, 17, 15, 13, 11, 10] {
+        state.zoom_x_in(&series, 105);
+        assert_eq!(data(&state).visible_count(), expected);
+    }
+    let at_floor = state.clone();
+    state.zoom_x_in(&series, 105);
+    assert_eq!(state, at_floor);
+
+    for expected in [11, 13, 15, 17, 21, 26, 35, 52, 105] {
+        state.zoom_x_out(&series, 105);
+        assert_eq!(data(&state).visible_count(), expected);
+    }
 }
 
 #[test]
@@ -185,7 +201,7 @@ fn zoom_while_following_stays_latest_and_advances_on_live_append() {
     let mut series = candles(100);
     let mut state = ChartViewState::interactive(&series, 40);
     state.zoom_x_in(&series, 40);
-    assert_eq!(data(&state).visible_count(), 16);
+    assert_eq!(data(&state).visible_count(), 13);
     assert_eq!(data(&state).right_index(), 99);
     assert!(data(&state).follows_live());
 
@@ -214,14 +230,14 @@ fn inverse_and_parity_changing_zoom_preserve_paused_center() {
 }
 
 #[test]
-fn nearest_rounding_uses_ties_away_from_zero_without_mutation_escape_hatch() {
+fn factor_targets_snap_to_the_nearest_uniform_slot_level() {
     let series = candles(100);
     let mut state = ChartViewState::snapshot(&series, 25);
     state.zoom_x_by_factor(&series, 50, 0.5);
     assert_eq!(
         data(&state).visible_count(),
-        13,
-        "12.5 rounds away from zero"
+        12,
+        "target 13 snaps to the nearer four-column cadence"
     );
 
     let series = candles(15);

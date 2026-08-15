@@ -12,8 +12,6 @@ use super::{
     DragKind, PriceRange, bounded_zoom_factor,
 };
 
-const KEYBOARD_X_ZOOM_IN: f64 = 0.8;
-const KEYBOARD_X_ZOOM_OUT: f64 = 1.25;
 const KEYBOARD_Y_ZOOM_IN: f64 = 0.8;
 const KEYBOARD_Y_ZOOM_OUT: f64 = 1.25;
 const MOUSE_ZOOM_STEP: f64 = 1.05;
@@ -129,11 +127,11 @@ impl InteractionController {
                 true
             }
             KeyCode::Char('h') if ordinary_char => {
-                state.zoom_x_by_factor(candles, plot_width, KEYBOARD_X_ZOOM_IN);
+                state.zoom_x_in(candles, plot_width);
                 true
             }
             KeyCode::Char('H') if ordinary_char => {
-                state.zoom_x_by_factor(candles, plot_width, KEYBOARD_X_ZOOM_OUT);
+                state.zoom_x_out(candles, plot_width);
                 true
             }
             KeyCode::Char('v') if ordinary_char => {

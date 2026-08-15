@@ -1130,7 +1130,7 @@ fn utc_and_price_overlays_are_exact_clamped_padded_and_do_not_spill() {
     };
     let mut series = CandleSeries::new(Timeframe::Minute1);
     let count = usize::from(layout.main_plot.width);
-    let visible_count = count.min(10_usize.max(count.div_ceil(2)));
+    let visible_count = count.min(10_usize.max(count / 2));
     let first_visible = count - visible_count;
     let _ = series.replace(
         (0..count)
@@ -1150,7 +1150,7 @@ fn utc_and_price_overlays_are_exact_clamped_padded_and_do_not_spill() {
         (
             1_700_000_000_000 + i64::try_from(first_visible).expect("small") * 1_000,
             layout.utc_axis.x,
-            "22:13:52",
+            "22:13:53",
         ),
         (
             1_700_000_000_000 + i64::try_from(count - 1).expect("small") * 1_000,

@@ -10,7 +10,7 @@ fn rejects_empty_and_invalid_geometry() {
 }
 
 #[test]
-fn partitions_nondivisible_width_around_nearest_ideal_boundaries() {
+fn right_aligns_equal_width_slots_and_keeps_remainder_outside_the_cadence() {
     let geometry = CandleSlotGeometry::new(10, 11, 4).expect("valid geometry");
     let slots = (0..4)
         .map(|index| geometry.slot(index).expect("valid slot"))
@@ -22,12 +22,14 @@ fn partitions_nondivisible_width_around_nearest_ideal_boundaries() {
             .map(|slot| (slot.start(), slot.end(), slot.width(), slot.center()))
             .collect::<Vec<_>>(),
         vec![
-            (10, 13, 3, 11),
-            (13, 16, 3, 14),
-            (16, 18, 2, 16),
-            (18, 21, 3, 19)
+            (13, 15, 2, 13),
+            (15, 17, 2, 15),
+            (17, 19, 2, 17),
+            (19, 21, 2, 19)
         ]
     );
+    assert_eq!(geometry.index_at_x(10), Some(0));
+    assert_eq!(geometry.index_at_x(12), Some(0));
     assert_eq!(geometry.origin(), 10);
     assert_eq!(geometry.width(), 11);
     assert_eq!(geometry.visible_count(), 4);
@@ -36,30 +38,35 @@ fn partitions_nondivisible_width_around_nearest_ideal_boundaries() {
 }
 
 #[test]
-fn every_internal_boundary_stays_within_half_a_cell_of_ideal_spacing() {
+fn every_slot_has_identical_width_center_cadence_and_visual_gap() {
     for width in 1_u16..=128 {
         for visible_count in 1..=usize::from(width) {
             let geometry =
                 CandleSlotGeometry::new(19, width, visible_count).expect("valid geometry");
-            let count = u64::try_from(visible_count).expect("small count");
-            let width = u64::from(width);
+            let slot_width = width / u16::try_from(visible_count).expect("small count");
+            let left_padding = width % u16::try_from(visible_count).expect("small count");
 
-            for boundary in 1..visible_count {
-                let actual = u64::from(
-                    geometry
-                        .slot(boundary)
-                        .expect("internal boundary slot")
-                        .start()
-                        - u32::from(geometry.origin()),
-                );
-                let scaled_error = actual
-                    .saturating_mul(count)
-                    .abs_diff(u64::try_from(boundary).expect("small boundary") * width);
-                assert!(
-                    scaled_error.saturating_mul(2) <= count,
-                    "width={width}, count={count}, boundary={boundary}, actual={actual}"
-                );
+            for index in 0..visible_count {
+                let slot = geometry.slot(index).expect("valid slot");
+                let expected_start = u32::from(geometry.origin())
+                    + u32::from(left_padding)
+                    + u32::try_from(index).expect("small index") * u32::from(slot_width);
+                assert_eq!(slot.start(), expected_start);
+                assert_eq!(slot.width(), slot_width);
+                assert_eq!(geometry.center(index), Some(slot.center()));
+
+                if let Some(next) = geometry.slot(index + 1) {
+                    assert_eq!(next.start() - slot.start(), u32::from(slot_width));
+                    assert_eq!(next.center() - slot.center(), slot_width);
+                    let visual_gap = next.start() - slot.painted_range().end;
+                    assert_eq!(visual_gap, u32::from(slot_width > 1));
+                }
             }
+
+            assert_eq!(
+                geometry.slot(visible_count - 1).expect("last slot").end(),
+                u32::from(geometry.origin()) + u32::from(width)
+            );
         }
     }
 }
@@ -83,14 +90,16 @@ fn painted_ranges_reserve_one_right_column_when_possible() {
 }
 
 #[test]
-fn inverse_mapping_obeys_half_open_edges_and_nonzero_origin() {
+fn inverse_mapping_obeys_padding_half_open_edges_and_nonzero_origin() {
     let geometry = CandleSlotGeometry::new(37, 8, 3).expect("valid geometry");
 
     assert_eq!(geometry.index_at_x(36), None);
     assert_eq!(geometry.index_at_x(37), Some(0));
+    assert_eq!(geometry.index_at_x(38), Some(0));
     assert_eq!(geometry.index_at_x(39), Some(0));
-    assert_eq!(geometry.index_at_x(40), Some(1));
-    assert_eq!(geometry.index_at_x(42), Some(2));
+    assert_eq!(geometry.index_at_x(40), Some(0));
+    assert_eq!(geometry.index_at_x(41), Some(1));
+    assert_eq!(geometry.index_at_x(42), Some(1));
     assert_eq!(geometry.index_at_x(43), Some(2));
     assert_eq!(geometry.index_at_x(44), Some(2));
     assert_eq!(geometry.index_at_x(45), None);
@@ -126,29 +135,32 @@ fn exclusive_bound_65536_round_trips_without_overflow() {
 }
 
 #[test]
-fn every_plot_column_has_exactly_one_owner_with_no_overlap() {
+fn every_plot_column_has_an_interaction_owner_and_slots_never_overlap() {
     for width in 1_u16..=64 {
         for visible_count in 1..=usize::from(width) {
             let geometry =
                 CandleSlotGeometry::new(91, width, visible_count).expect("valid geometry");
-            let mut ownership = vec![0_u8; usize::from(width)];
 
+            for offset in 0..width {
+                assert!(
+                    geometry
+                        .index_at_x(geometry.origin().checked_add(offset).expect("small bound"))
+                        .is_some(),
+                    "width={width}, count={visible_count}, offset={offset}"
+                );
+            }
             for index in 0..visible_count {
                 let slot = geometry.slot(index).expect("valid slot");
                 for x in slot.start()..slot.end() {
                     let cell_x = u16::try_from(x).expect("slot cells are u16 coordinates");
-                    ownership[usize::try_from(x - u32::from(geometry.origin()))
-                        .expect("small offset")] += 1;
                     assert_eq!(geometry.index_at_x(cell_x), Some(index));
+                    assert!(slot.contains(cell_x));
                 }
-                assert_eq!(
-                    geometry.index_at_x(u16::try_from(slot.start()).expect("valid first cell")),
-                    Some(index)
-                );
-                assert_eq!(geometry.center(index), Some(slot.center()));
+                if let Some(next) = geometry.slot(index + 1) {
+                    assert_eq!(slot.end(), next.start());
+                }
             }
 
-            assert!(ownership.iter().all(|count| *count == 1));
             assert_eq!(geometry.index_at_x(geometry.origin() - 1), None);
             assert_eq!(
                 geometry.index_at_x(geometry.origin().checked_add(width).expect("small bound")),
