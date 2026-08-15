@@ -58,18 +58,19 @@ impl CandleSlot {
     }
 }
 
-/// Equal partition of a plot's columns among visible candles.
+/// Nearest-boundary partition of a plot's columns among visible candles.
 ///
-/// Remainder columns are assigned from the left. Construction rejects empty
-/// geometry, more candles than columns, and coordinate ranges whose exclusive
-/// end exceeds `65536` (one past the largest `u16` terminal coordinate).
+/// Each internal boundary is rounded to the nearest column from its ideal
+/// fractional position. This spreads unavoidable remainder columns across the
+/// plot instead of accumulating wider slots on one side. Construction rejects
+/// empty geometry, more candles than columns, and coordinate ranges whose
+/// exclusive end exceeds `65536` (one past the largest `u16` terminal
+/// coordinate).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CandleSlotGeometry {
     origin: u16,
     width: u16,
     visible_count: u16,
-    quotient: u16,
-    remainder: u16,
 }
 
 impl CandleSlotGeometry {
@@ -82,14 +83,11 @@ impl CandleSlotGeometry {
         if u32::from(origin) + u32::from(width) > u32::from(u16::MAX) + 1 {
             return None;
         }
-        let visible_count = u16::try_from(visible_count).ok()?;
 
         Some(Self {
             origin,
             width,
-            visible_count,
-            quotient: width / visible_count,
-            remainder: width % visible_count,
+            visible_count: u16::try_from(visible_count).ok()?,
         })
     }
 
@@ -108,6 +106,12 @@ impl CandleSlotGeometry {
         self.visible_count as usize
     }
 
+    fn boundary_offset(self, boundary: u16) -> u32 {
+        debug_assert!(boundary <= self.visible_count);
+        let count = u32::from(self.visible_count);
+        (u32::from(boundary) * u32::from(self.width) + count / 2) / count
+    }
+
     /// Returns the exact half-open slot for a visible-candle index.
     #[must_use]
     pub fn slot(self, index: usize) -> Option<CandleSlot> {
@@ -116,15 +120,9 @@ impl CandleSlotGeometry {
             return None;
         }
 
-        let index = u32::from(index);
-        let quotient = u32::from(self.quotient);
-        let remainder = u32::from(self.remainder);
-        let offset = index * quotient + index.min(remainder);
-        let next = index + 1;
-        let next_offset = next * quotient + next.min(remainder);
         Some(CandleSlot {
-            start: u32::from(self.origin) + offset,
-            end: u32::from(self.origin) + next_offset,
+            start: u32::from(self.origin) + self.boundary_offset(index),
+            end: u32::from(self.origin) + self.boundary_offset(index + 1),
         })
     }
 
@@ -136,20 +134,13 @@ impl CandleSlotGeometry {
             return None;
         }
 
-        let quotient = u32::from(self.quotient);
-        let remainder = u32::from(self.remainder);
-        let offset = u32::from(offset);
-        let index = if remainder == 0 {
-            offset.checked_div(quotient)?
-        } else {
-            let wide_width = quotient.checked_add(1)?;
-            let wide_columns = wide_width.checked_mul(remainder)?;
-            if offset < wide_columns {
-                offset.checked_div(wide_width)?
-            } else {
-                remainder.checked_add((offset - wide_columns).checked_div(quotient)?)?
-            }
-        };
+        // `boundary(i) <= offset` iff
+        // `i * width <= (offset + 1) * count - floor(count / 2) - 1`.
+        // Dividing that upper bound by `width` yields the owning slot directly.
+        let count = u32::from(self.visible_count);
+        let scaled_right = (u32::from(offset) + 1) * count;
+        let index = (scaled_right - count / 2 - 1) / u32::from(self.width);
+        debug_assert!(index < count);
         usize::try_from(index).ok()
     }
 

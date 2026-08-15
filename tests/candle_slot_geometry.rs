@@ -10,7 +10,7 @@ fn rejects_empty_and_invalid_geometry() {
 }
 
 #[test]
-fn partitions_nondivisible_width_with_remainder_on_the_left() {
+fn partitions_nondivisible_width_around_nearest_ideal_boundaries() {
     let geometry = CandleSlotGeometry::new(10, 11, 4).expect("valid geometry");
     let slots = (0..4)
         .map(|index| geometry.slot(index).expect("valid slot"))
@@ -24,8 +24,8 @@ fn partitions_nondivisible_width_with_remainder_on_the_left() {
         vec![
             (10, 13, 3, 11),
             (13, 16, 3, 14),
-            (16, 19, 3, 17),
-            (19, 21, 2, 19)
+            (16, 18, 2, 16),
+            (18, 21, 3, 19)
         ]
     );
     assert_eq!(geometry.origin(), 10);
@@ -33,6 +33,35 @@ fn partitions_nondivisible_width_with_remainder_on_the_left() {
     assert_eq!(geometry.visible_count(), 4);
     assert_eq!(geometry.slot(4), None);
     assert_eq!(geometry.center(4), None);
+}
+
+#[test]
+fn every_internal_boundary_stays_within_half_a_cell_of_ideal_spacing() {
+    for width in 1_u16..=128 {
+        for visible_count in 1..=usize::from(width) {
+            let geometry =
+                CandleSlotGeometry::new(19, width, visible_count).expect("valid geometry");
+            let count = u64::try_from(visible_count).expect("small count");
+            let width = u64::from(width);
+
+            for boundary in 1..visible_count {
+                let actual = u64::from(
+                    geometry
+                        .slot(boundary)
+                        .expect("internal boundary slot")
+                        .start()
+                        - u32::from(geometry.origin()),
+                );
+                let scaled_error = actual
+                    .saturating_mul(count)
+                    .abs_diff(u64::try_from(boundary).expect("small boundary") * width);
+                assert!(
+                    scaled_error.saturating_mul(2) <= count,
+                    "width={width}, count={count}, boundary={boundary}, actual={actual}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -61,7 +90,7 @@ fn inverse_mapping_obeys_half_open_edges_and_nonzero_origin() {
     assert_eq!(geometry.index_at_x(37), Some(0));
     assert_eq!(geometry.index_at_x(39), Some(0));
     assert_eq!(geometry.index_at_x(40), Some(1));
-    assert_eq!(geometry.index_at_x(42), Some(1));
+    assert_eq!(geometry.index_at_x(42), Some(2));
     assert_eq!(geometry.index_at_x(43), Some(2));
     assert_eq!(geometry.index_at_x(44), Some(2));
     assert_eq!(geometry.index_at_x(45), None);
@@ -78,6 +107,15 @@ fn exclusive_bound_65536_round_trips_without_overflow() {
     assert_eq!(maximum_span.index_at_x(0), None);
     assert_eq!(maximum_span.index_at_x(1), Some(0));
     assert_eq!(maximum_span.index_at_x(u16::MAX), Some(0));
+    let maximum_density = CandleSlotGeometry::new(1, u16::MAX, usize::from(u16::MAX))
+        .expect("valid maximum-density geometry");
+    let final_index = usize::from(u16::MAX) - 1;
+    let final_slot = maximum_density
+        .slot(final_index)
+        .expect("final maximum-density slot");
+    assert_eq!((final_slot.start(), final_slot.end()), (65_535, 65_536));
+    assert_eq!(maximum_density.center(final_index), Some(u16::MAX));
+    assert_eq!(maximum_density.index_at_x(u16::MAX), Some(final_index));
 
     let last_cell = CandleSlotGeometry::new(u16::MAX, 1, 1).expect("valid final cell");
     let last_slot = last_cell.slot(0).expect("single final slot");
