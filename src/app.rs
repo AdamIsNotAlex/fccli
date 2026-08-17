@@ -24,7 +24,7 @@ use crate::{
         FooterPresentation, InteractionAction, InteractionController, InteractiveChartState,
         LayoutMode, RenderMode, RenderPolicy, RendererSnapshot, calculate_chart_layout,
     },
-    cli::{Cli, MarketTarget, Mode, canonicalize_binance, parse_market_target},
+    cli::{Cli, MarketTarget, Mode, canonicalize_instrument, parse_market_target},
     clock::{Clock, checked_deadline},
     error::{AppError, ProviderError, RenderError, SanitizedCause, TerminalError},
     history::{HistoryApplyResult, HistoryCoordinator, HistoryJoinError, HistoryProgress},
@@ -283,8 +283,9 @@ where
             return Ok(ExitCode::from(exit_code));
         }
     };
-    canonicalize_binance(cli.instrument())
-        .map_err(|_| ProviderError::Configuration("instrument is not valid for Binance Spot"))?;
+    canonicalize_instrument(cli.instrument()).map_err(|_| {
+        ProviderError::Configuration("instrument is not valid for the selected market-data provider")
+    })?;
 
     let provider = dependencies
         .providers

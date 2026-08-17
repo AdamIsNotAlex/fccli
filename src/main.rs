@@ -4,7 +4,7 @@ use std::{
     process::ExitCode,
 };
 
-use fccli::cli::{Cli, canonicalize_binance};
+use fccli::cli::{Cli, canonicalize_instrument};
 
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
 use fccli::{
@@ -23,7 +23,7 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(code) => return code,
     };
-    if let Err(error) = canonicalize_binance(cli.instrument()) {
+    if let Err(error) = canonicalize_instrument(cli.instrument()) {
         eprintln!("fccli: {error}");
         return ExitCode::FAILURE;
     }

@@ -11,7 +11,6 @@ use crate::model::{
 const DEFAULT_PROVIDER: &str = "binance";
 const DEFAULT_INSTRUMENT: &str = "binance:btc";
 const DEFAULT_TIMEFRAME: &str = "1h";
-const DEFAULT_QUOTE: &str = "USDT";
 const EXTRA_ARGUMENT_ERROR: &str =
     "unexpected extra argument; use up to an instrument and timeframe";
 
@@ -162,49 +161,62 @@ impl Cli {
     }
 }
 
-/// A stable, actionable failure from Binance-local canonicalization.
+/// A stable, actionable failure from local instrument canonicalization.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum CanonicalizationError {
     #[error(
-        "unsupported provider `{provider}`; use lowercase `binance` (for example `binance:btc`)"
+        "provider `{provider}` has no default-quote rule; use one of `binance`, `okx`, `bybit`, `coinbase`, `kraken`, or `hyperliquid` (lowercase)"
     )]
     UnsupportedProvider { provider: ProviderId },
 
     #[error(
-        "instrument must include a base asset; `USDT` alone is only a quote (try `btc` or `btc/usdt`)"
+        "instrument must include a base asset; the selected provider's default quote alone is only a quote (try `btc` or an explicit pair such as `btc/usdt`)"
     )]
     QuoteOnly,
 
-    #[error("instrument could not be canonicalized; try `btc`, `BTCUSDT`, or `btc/usdt`")]
+    #[error(
+        "instrument could not be canonicalized; try an asset such as `btc` or an explicit pair such as `btc/usdt`"
+    )]
     InvalidInstrument,
 }
 
-/// Resolve a provider-neutral specification to Binance Spot identifiers without I/O.
-pub fn canonicalize_binance(
+/// Canonicalization metadata only. Presence here is not a registered transport.
+fn default_quote_for(provider: &ProviderId) -> Option<&'static str> {
+    match provider.as_str() {
+        "binance" | "okx" | "bybit" => Some("USDT"),
+        "coinbase" | "kraken" => Some("USD"),
+        "hyperliquid" => Some("USDC"),
+        _ => None,
+    }
+}
+
+/// Resolve a provider-neutral specification to Spot identifiers without I/O.
+pub fn canonicalize_instrument(
     specification: &InstrumentSpec,
 ) -> Result<Instrument, CanonicalizationError> {
-    if specification.provider().as_str() != DEFAULT_PROVIDER {
+    let Some(default_quote) = default_quote_for(specification.provider()) else {
         return Err(CanonicalizationError::UnsupportedProvider {
             provider: specification.provider().clone(),
         });
-    }
+    };
 
     let base = specification.base();
     let quote = specification.quote();
-    validate_symbol_lengths(base, quote).map_err(|()| CanonicalizationError::InvalidInstrument)?;
+    validate_symbol_lengths(base, quote, Some(default_quote))
+        .map_err(|()| CanonicalizationError::InvalidInstrument)?;
 
     let normalized_base = base.to_ascii_uppercase();
     let normalized_quote = quote.map(str::to_ascii_uppercase);
     let (base, quote) = match normalized_quote.as_deref() {
         Some(quote) => (normalized_base.as_str(), quote),
         None => {
-            if let Some(base) = normalized_base.strip_suffix(DEFAULT_QUOTE) {
+            if let Some(base) = normalized_base.strip_suffix(default_quote) {
                 if base.is_empty() {
                     return Err(CanonicalizationError::QuoteOnly);
                 }
-                (base, DEFAULT_QUOTE)
+                (base, default_quote)
             } else {
-                (normalized_base.as_str(), DEFAULT_QUOTE)
+                (normalized_base.as_str(), default_quote)
             }
         }
     };
@@ -238,7 +250,8 @@ fn parse_timeframe(value: &str) -> Result<Timeframe, TargetParseError> {
 fn parse_instrument_spec(value: &str) -> Result<InstrumentSpec, TargetParseError> {
     let (provider, pair) = split_provider(value)?;
     let (base, quote) = split_pair(pair)?;
-    validate_symbol_lengths(base, quote).map_err(|()| TargetParseError::InvalidInstrument)?;
+    validate_symbol_lengths(base, quote, default_quote_for(&provider))
+        .map_err(|()| TargetParseError::InvalidInstrument)?;
 
     InstrumentSpec::new(
         provider,
@@ -311,16 +324,24 @@ fn split_pair(value: &str) -> Result<(&str, Option<&str>), TargetParseError> {
     Ok((base, quote))
 }
 
-fn validate_symbol_lengths(base: &str, quote: Option<&str>) -> Result<(), ()> {
+fn validate_symbol_lengths(
+    base: &str,
+    quote: Option<&str>,
+    default_quote: Option<&str>,
+) -> Result<(), ()> {
     let projected_quote_len = match quote {
         Some(quote) => quote.len(),
-        None if base
-            .get(base.len().saturating_sub(DEFAULT_QUOTE.len())..)
-            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(DEFAULT_QUOTE)) =>
-        {
-            0
-        }
-        None => DEFAULT_QUOTE.len(),
+        None => match default_quote {
+            Some(default_quote)
+                if base
+                    .get(base.len().saturating_sub(default_quote.len())..)
+                    .is_some_and(|suffix| suffix.eq_ignore_ascii_case(default_quote)) =>
+            {
+                0
+            }
+            Some(default_quote) => default_quote.len(),
+            None => 0,
+        },
     };
 
     if base.len() > MAX_PROVIDER_SYMBOL_LEN

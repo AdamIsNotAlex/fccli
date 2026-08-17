@@ -1,6 +1,6 @@
 use clap::error::ErrorKind;
 use fccli::{
-    cli::{CanonicalizationError, Cli, Mode, canonicalize_binance, parse_market_target},
+    cli::{CanonicalizationError, Cli, Mode, canonicalize_instrument, parse_market_target},
     model::{InstrumentSpec, Market, ProviderId, Timeframe},
 };
 
@@ -39,7 +39,8 @@ fn valid_symbol_forms_canonicalize_to_locked_binance_spot_identifiers() {
         assert_eq!(cli.instrument().base(), spec_base, "{input}");
         assert_eq!(cli.instrument().quote(), spec_quote, "{input}");
 
-        let instrument = canonicalize_binance(cli.instrument()).expect("Binance canonicalization");
+        let instrument =
+            canonicalize_instrument(cli.instrument()).expect("Binance canonicalization");
         assert_eq!(instrument.provider().as_str(), "binance", "{input}");
         assert_eq!(instrument.market(), Market::Spot, "{input}");
         assert_eq!(instrument.base(), base, "{input}");
@@ -65,7 +66,7 @@ fn direct_instrument_specs_are_canonicalized_independently_of_cli_preprocessing(
     for (base, quote, expected_base, expected_quote, expected_symbol) in cases {
         let specification = InstrumentSpec::new(provider.clone(), base, quote)
             .expect("valid direct instrument specification");
-        let instrument = canonicalize_binance(&specification).expect("canonical instrument");
+        let instrument = canonicalize_instrument(&specification).expect("canonical instrument");
         assert_eq!(instrument.base(), expected_base, "{base:?}/{quote:?}");
         assert_eq!(instrument.quote(), expected_quote, "{base:?}/{quote:?}");
         assert_eq!(
@@ -83,7 +84,7 @@ fn direct_instrument_specs_are_canonicalized_independently_of_cli_preprocessing(
     let quote_only = InstrumentSpec::new(provider, "uSdT", None::<String>)
         .expect("valid provider-neutral quote token");
     assert_eq!(
-        canonicalize_binance(&quote_only),
+        canonicalize_instrument(&quote_only),
         Err(CanonicalizationError::QuoteOnly)
     );
 }
@@ -125,18 +126,38 @@ fn provider_defaults_to_binance_and_explicit_provider_is_preserved_until_canonic
     let explicit = parse("binance:btc", "1m");
     assert_eq!(explicit.instrument().provider().as_str(), "binance");
 
-    let unknown = parse("kraken:btc/usdt", "1m");
-    assert_eq!(unknown.instrument().provider().as_str(), "kraken");
+    for provider in ["binance", "okx", "bybit", "coinbase", "kraken", "hyperliquid"] {
+        let cli = parse(&format!("{provider}:btc"), "1m");
+        assert_eq!(cli.instrument().provider().as_str(), provider);
+        assert!(
+            canonicalize_instrument(cli.instrument()).is_ok(),
+            "{provider}"
+        );
+    }
+
+    let unknown = parse("gemini:btc/usdt", "1m");
+    assert_eq!(unknown.instrument().provider().as_str(), "gemini");
     assert_eq!(
-        canonicalize_binance(unknown.instrument()),
+        canonicalize_instrument(unknown.instrument()),
         Err(CanonicalizationError::UnsupportedProvider {
             provider: unknown.instrument().provider().clone(),
         })
     );
+    let rendered = CanonicalizationError::UnsupportedProvider {
+        provider: unknown.instrument().provider().clone(),
+    }
+    .to_string();
+    assert!(
+        rendered.contains("has no default-quote rule"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("binance"), "{rendered}");
+    assert!(rendered.contains("hyperliquid"), "{rendered}");
+    assert!(rendered.contains("lowercase"), "{rendered}");
 
     let wrong_case = parse("Binance:btc", "1m");
     assert!(matches!(
-        canonicalize_binance(wrong_case.instrument()),
+        canonicalize_instrument(wrong_case.instrument()),
         Err(CanonicalizationError::UnsupportedProvider { .. })
     ));
 }
@@ -293,7 +314,7 @@ fn provider_symbol_length_accepts_exact_limit_and_rejects_one_over() {
         .expect("exact-limit separator-free USDT-suffixed instrument specification");
     assert_eq!(cli.instrument().base(), expected_provider_symbol);
     assert_eq!(cli.instrument().quote(), None);
-    let instrument = canonicalize_binance(cli.instrument())
+    let instrument = canonicalize_instrument(cli.instrument())
         .expect("exact-limit separator-free USDT-suffixed canonicalization");
     assert_eq!(
         instrument.base().len(),
@@ -317,7 +338,7 @@ fn provider_symbol_length_accepts_exact_limit_and_rejects_one_over() {
     let provider = ProviderId::new("binance").expect("valid provider");
     let exact_specification = InstrumentSpec::new(provider.clone(), exact, None::<String>)
         .expect("exact-limit direct instrument specification");
-    let instrument = canonicalize_binance(&exact_specification)
+    let instrument = canonicalize_instrument(&exact_specification)
         .expect("exact-limit direct separator-free USDT-suffixed canonicalization");
     assert_eq!(
         instrument.base().len(),
@@ -330,21 +351,184 @@ fn provider_symbol_length_accepts_exact_limit_and_rejects_one_over() {
     let one_over_specification = InstrumentSpec::new(provider, one_over, None::<String>)
         .expect("one-over-limit direct instrument specification");
     assert_eq!(
-        canonicalize_binance(&one_over_specification),
+        canonicalize_instrument(&one_over_specification),
         Err(CanonicalizationError::InvalidInstrument)
     );
 }
 
 #[test]
 fn quote_only_tokens_fail_during_local_canonicalization() {
-    for value in ["USDT", "usdt", "binance:USDT"] {
+    for value in [
+        "USDT",
+        "usdt",
+        "binance:USDT",
+        "okx:USDT",
+        "bybit:USDT",
+        "coinbase:USD",
+        "kraken:USD",
+        "hyperliquid:USDC",
+    ] {
         let cli = parse(value, "1m");
         assert_eq!(
-            canonicalize_binance(cli.instrument()),
+            canonicalize_instrument(cli.instrument()),
             Err(CanonicalizationError::QuoteOnly),
             "{value}"
         );
     }
+
+    let coinbase_usdt = parse("coinbase:USDT", "1m");
+    let instrument = canonicalize_instrument(coinbase_usdt.instrument())
+        .expect("USDT is not Coinbase's default quote");
+    assert_eq!(instrument.base(), "USDT");
+    assert_eq!(instrument.quote(), "USD");
+    assert_eq!(instrument.provider_symbol(), "USDTUSD");
+}
+
+#[test]
+fn known_providers_apply_locked_default_quotes_and_suffixes() {
+    let cases = [
+        ("binance", "USDT"),
+        ("okx", "USDT"),
+        ("bybit", "USDT"),
+        ("coinbase", "USD"),
+        ("kraken", "USD"),
+        ("hyperliquid", "USDC"),
+    ];
+
+    for (provider, quote) in cases {
+        for input in [
+            format!("{provider}:btc"),
+            format!("{provider}:BTC{quote}"),
+        ] {
+            let cli = parse(&input, "1h");
+            assert_eq!(cli.instrument().provider().as_str(), provider, "{input}");
+            let instrument = canonicalize_instrument(cli.instrument())
+                .expect("known providers canonicalize locally");
+            assert_eq!(instrument.provider().as_str(), provider, "{input}");
+            assert_eq!(instrument.market(), Market::Spot, "{input}");
+            assert_eq!(instrument.base(), "BTC", "{input}");
+            assert_eq!(instrument.quote(), quote, "{input}");
+            assert_eq!(instrument.display_pair(), format!("BTC/{quote}"), "{input}");
+            assert_eq!(
+                instrument.provider_symbol(),
+                format!("BTC{quote}"),
+                "{input}"
+            );
+        }
+    }
+}
+
+#[test]
+fn suffix_split_is_scoped_to_selected_provider_default() {
+    let binance = canonicalize_instrument(parse("binance:BTCUSDC", "1h").instrument())
+        .expect("Binance keeps USDC as base when no USDT suffix");
+    assert_eq!(binance.base(), "BTCUSDC");
+    assert_eq!(binance.quote(), "USDT");
+    assert_eq!(binance.provider_symbol(), "BTCUSDCUSDT");
+
+    let coinbase = canonicalize_instrument(parse("coinbase:BTCUSDT", "1h").instrument())
+        .expect("Coinbase keeps USDT as base when no USD suffix");
+    assert_eq!(coinbase.base(), "BTCUSDT");
+    assert_eq!(coinbase.quote(), "USD");
+    assert_eq!(coinbase.provider_symbol(), "BTCUSDTUSD");
+
+    let explicit = canonicalize_instrument(parse("coinbase:btc/usdt", "1h").instrument())
+        .expect("explicit quote is preserved");
+    assert_eq!(explicit.base(), "BTC");
+    assert_eq!(explicit.quote(), "USDT");
+    assert_eq!(explicit.provider_symbol(), "BTCUSDT");
+}
+
+#[test]
+fn provider_symbol_length_projection_uses_selected_default_quote() {
+    const PROVIDER_SYMBOL_LIMIT: usize = 256;
+
+    for (provider, default_quote) in [("coinbase", "USD"), ("hyperliquid", "USDC")] {
+        let exact = format!(
+            "{}{}",
+            "a".repeat(PROVIDER_SYMBOL_LIMIT - default_quote.len()),
+            default_quote
+        );
+        assert_eq!(exact.len(), PROVIDER_SYMBOL_LIMIT, "{provider}");
+        let input = format!("{provider}:{exact}");
+        let cli = Cli::try_parse_from(["fccli", input.as_str(), "1m"])
+            .expect("exact-limit separator-free default-quote suffix");
+        assert_eq!(cli.instrument().quote(), None, "{provider}");
+        let instrument = canonicalize_instrument(cli.instrument())
+            .expect("exact-limit suffix projection uses the selected default");
+        assert_eq!(
+            instrument.base().len(),
+            PROVIDER_SYMBOL_LIMIT - default_quote.len(),
+            "{provider}"
+        );
+        assert_eq!(instrument.quote(), default_quote, "{provider}");
+        assert_eq!(
+            instrument.provider_symbol().len(),
+            PROVIDER_SYMBOL_LIMIT,
+            "{provider}"
+        );
+
+        let one_over = format!(
+            "{}{}",
+            "a".repeat(PROVIDER_SYMBOL_LIMIT - default_quote.len() + 1),
+            default_quote
+        );
+        let one_over_input = format!("{provider}:{one_over}");
+        let error = Cli::try_parse_from(["fccli", one_over_input.as_str(), "1m"])
+            .expect_err("one-over-limit separator-free default-quote suffix");
+        assert_eq!(error.kind(), ErrorKind::ValueValidation, "{provider}");
+        assert!(!error.to_string().contains(&one_over), "{provider}");
+
+        let unsuffixed = "a".repeat(PROVIDER_SYMBOL_LIMIT - default_quote.len());
+        let unsuffixed_input = format!("{provider}:{unsuffixed}");
+        let unsuffixed_cli = Cli::try_parse_from(["fccli", unsuffixed_input.as_str(), "1m"])
+            .expect("exact-limit unsuffixed projection appends the selected default");
+        let unsuffixed_instrument = canonicalize_instrument(unsuffixed_cli.instrument())
+            .expect("unsuffixed exact-limit projection");
+        assert_eq!(unsuffixed_instrument.base(), unsuffixed.to_ascii_uppercase());
+        assert_eq!(unsuffixed_instrument.quote(), default_quote, "{provider}");
+        assert_eq!(
+            unsuffixed_instrument.provider_symbol().len(),
+            PROVIDER_SYMBOL_LIMIT,
+            "{provider}"
+        );
+
+        let unsuffixed_one_over = "a".repeat(PROVIDER_SYMBOL_LIMIT - default_quote.len() + 1);
+        let unsuffixed_one_over_input = format!("{provider}:{unsuffixed_one_over}");
+        let unsuffixed_error =
+            Cli::try_parse_from(["fccli", unsuffixed_one_over_input.as_str(), "1m"])
+                .expect_err("one-over unsuffixed projection rejects at parse");
+        assert_eq!(
+            unsuffixed_error.kind(),
+            ErrorKind::ValueValidation,
+            "{provider}"
+        );
+    }
+}
+
+#[test]
+fn unknown_provider_without_quote_does_not_project_an_append() {
+    const PROVIDER_SYMBOL_LIMIT: usize = 256;
+    let exact = "a".repeat(PROVIDER_SYMBOL_LIMIT);
+    let input = format!("gemini:{exact}");
+    let cli = Cli::try_parse_from(["fccli", input.as_str(), "1m"])
+        .expect("unknown provider projects no default-quote append");
+    assert_eq!(cli.instrument().provider().as_str(), "gemini");
+    assert_eq!(cli.instrument().base().len(), PROVIDER_SYMBOL_LIMIT);
+    assert_eq!(cli.instrument().quote(), None);
+    assert_eq!(
+        canonicalize_instrument(cli.instrument()),
+        Err(CanonicalizationError::UnsupportedProvider {
+            provider: cli.instrument().provider().clone(),
+        })
+    );
+
+    let one_over = "a".repeat(PROVIDER_SYMBOL_LIMIT + 1);
+    let one_over_input = format!("gemini:{one_over}");
+    let error = Cli::try_parse_from(["fccli", one_over_input.as_str(), "1m"])
+        .expect_err("257-byte unknown-provider base still fails parser length validation");
+    assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    assert!(!error.to_string().contains(&one_over));
 }
 
 #[test]
@@ -471,14 +655,22 @@ fn parse_market_target_defaults_absent_provider_to_binance() {
 
 #[test]
 fn parse_market_target_preserves_unknown_provider_until_canonicalization() {
-    let target = parse_market_target("kraken:btc/usdt 1m").expect("unknown provider parses");
-    assert_eq!(target.instrument.provider().as_str(), "kraken");
+    let target = parse_market_target("gemini:btc/usdt 1m").expect("unknown provider parses");
+    assert_eq!(target.instrument.provider().as_str(), "gemini");
     assert_eq!(
-        canonicalize_binance(&target.instrument),
+        canonicalize_instrument(&target.instrument),
         Err(CanonicalizationError::UnsupportedProvider {
             provider: target.instrument.provider().clone(),
         })
     );
+
+    let known = parse_market_target("kraken:btc 1m").expect("known unimplemented provider parses");
+    assert_eq!(known.instrument.provider().as_str(), "kraken");
+    let instrument = canonicalize_instrument(&known.instrument)
+        .expect("known providers canonicalize before registry lookup");
+    assert_eq!(instrument.base(), "BTC");
+    assert_eq!(instrument.quote(), "USD");
+    assert_eq!(instrument.provider_symbol(), "BTCUSD");
 }
 
 #[test]

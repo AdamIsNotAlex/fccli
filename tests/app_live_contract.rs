@@ -21,7 +21,7 @@ use fccli::{
         TerminalInputPoll, run_with_dependencies,
     },
     chart::{ChartViewState, DisplayStatus, FooterPresentation, InteractiveChartState, PriceRange},
-    cli::canonicalize_binance,
+    cli::canonicalize_instrument,
     clock::{Clock, ManualClock},
     error::{AppError, ErrorContext, ErrorOperation, ProviderError, RenderError, TerminalError},
     model::{
@@ -724,7 +724,7 @@ impl MarketDataProvider for FakeProvider {
     }
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
         self.canonicalize_calls.fetch_add(1, Ordering::SeqCst);
-        canonicalize_binance(spec)
+        canonicalize_instrument(spec)
             .map_err(|_| ProviderError::Configuration("canonicalization failed"))
     }
     fn history<'a>(
@@ -1911,6 +1911,56 @@ fn binary_semantic_instrument_error_exits_before_valid_dispatch() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("instrument must include a base asset"));
     assert!(!stderr.contains("valid modes require direct injected dependencies"));
+}
+
+#[test]
+fn binary_known_provider_passes_main_semantic_gate() {
+    let output = Command::cargo_bin("fccli")
+        .unwrap()
+        .args(["okx:btc", "1m"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("valid modes require direct injected dependencies"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("has no default-quote rule"), "{stderr}");
+    assert!(!stderr.contains("use lowercase `binance`"), "{stderr}");
+}
+
+#[tokio::test]
+async fn direct_dispatch_known_unregistered_provider_fails_at_registry() {
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+    let provider = Arc::new(FakeProvider::new(
+        Vec::new(),
+        Vec::new(),
+        Arc::clone(&clock),
+    ));
+    let terminal = Arc::new(TerminalLog::default());
+    let mut deps = dependencies(
+        provider.clone(),
+        Box::new(ScriptedTerminalInput::new([])),
+        terminal.clone(),
+        SharedWriter::default(),
+        Arc::clone(&clock),
+    );
+    deps.stdin_is_tty = true;
+    deps.stdout_is_tty = true;
+
+    let error = run_with_dependencies(["fccli", "okx:btc", "1m"], deps)
+        .await
+        .expect_err("known unimplemented providers fail at registry");
+
+    assert!(
+        error.to_string().contains("unsupported market-data provider"),
+        "{error}"
+    );
+    assert_eq!(provider.canonicalize_calls.load(Ordering::SeqCst), 0);
+    assert!(provider.requests.acquire().is_empty());
+    assert!(terminal.actions().is_empty());
 }
 
 #[tokio::test]
@@ -3756,7 +3806,7 @@ async fn empty_interactive_target_resolves_to_default_market_and_timeframe() {
 }
 
 #[tokio::test]
-async fn invalid_command_shows_footer_error_and_preserves_old_chart() {
+async fn known_unregistered_switch_shows_registry_error_and_preserves_old_chart() {
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
     let provider = Arc::new(FakeProvider::new(
         vec![candle(0, 59_999)],
@@ -3772,7 +3822,7 @@ async fn invalid_command_shows_footer_error_and_preserves_old_chart() {
 
     let observations = observations.acquire();
     assert!(observations.iter().any(|observation| {
-        matches!(&observation.snapshot.footer, FooterPresentation::Error { message } if message.contains("unsupported"))
+        matches!(&observation.snapshot.footer, FooterPresentation::Error { message } if message.contains("unsupported market-data provider"))
     }));
     assert_eq!(
         provider.open_live_calls.load(Ordering::SeqCst),

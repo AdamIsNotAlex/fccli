@@ -452,6 +452,22 @@ async fn registry_trait_object_uses_shared_history_live_and_rate_gate_state() {
         .canonicalize(&specification)
         .expect("trait canonicalization");
     assert_eq!(canonical.provider_symbol(), "BTCUSDT");
+    let foreign = InstrumentSpec::new(
+        ProviderId::new("okx").expect("provider id"),
+        "btc",
+        None::<String>,
+    )
+    .expect("foreign instrument specification");
+    let error = selected
+        .canonicalize(&foreign)
+        .expect_err("Binance provider rejects foreign known-provider specs");
+    assert!(
+        error
+            .to_string()
+            .contains("instrument is not valid for Binance Spot"),
+        "{error}"
+    );
+
     let history = selected
         .history(
             &canonical,

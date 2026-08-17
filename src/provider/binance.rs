@@ -33,7 +33,7 @@ use tokio_tungstenite::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    cli::canonicalize_binance,
+    cli::canonicalize_instrument,
     clock::{Clock, checked_deadline},
     error::{
         ErrorContext, ErrorOperation, PayloadError, ProviderError, SanitizedCause,
@@ -1997,7 +1997,12 @@ impl BinanceProvider {
     }
 
     pub fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
-        canonicalize_binance(spec)
+        if spec.provider().as_str() != "binance" {
+            return Err(ProviderError::Configuration(
+                "instrument is not valid for Binance Spot",
+            ));
+        }
+        canonicalize_instrument(spec)
             .map_err(|_| ProviderError::Configuration("instrument is not valid for Binance Spot"))
     }
 

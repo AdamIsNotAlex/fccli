@@ -32,7 +32,7 @@ fccli binance:btc/usdc 1h
 fccli BTCUSDT M --interactive
 ```
 
-An instrument may be an asset (`btc`, quoted in USDT), pair (`btc/usdc` or `btc-usdt`), Binance symbol (`BTCUSDT`), or provider-prefixed pair (`binance:btc/usdc`). For example, `fccli h` selects the instrument `h` at the default `1h`; a single positional is never interpreted as a timeframe.
+An instrument may be an asset (`btc`, quoted in the selected provider's default), pair (`btc/usdc` or `btc-usdt`), concatenated symbol (`BTCUSDT`), or provider-prefixed pair (`binance:btc/usdc`). Bare assets default to `USDT` on Binance, OKX, and Bybit; `USD` on Coinbase and Kraken; and `USDC` on Hyperliquid. The startup provider remains Binance. For example, `fccli h` selects the instrument `h` at the default `1h`; a single positional is never interpreted as a timeframe.
 
 Supported canonical timeframes: `1s`, `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, `1M`. The unit-only aliases `s`, `m`, `h`, `d`, `w`, and `M` mean one unit. Timeframes are case-sensitive: `m` is one minute and `M` is one month.
 
