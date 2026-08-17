@@ -41,8 +41,9 @@ impl std::fmt::Display for TargetParseError {
             Self::MissingInstrument => {
                 formatter.write_str("missing instrument after provider prefix; try `binance:btc`")
             }
-            Self::InvalidInstrument => formatter
-                .write_str("invalid instrument; use `btc`, `BTCUSDT`, or `binance:btc/usdt`"),
+            Self::InvalidInstrument => formatter.write_str(
+                "invalid instrument; use `btc`, `BTCUSDT`, `btc.p`, or `binance:btc/usdt`",
+            ),
         }
     }
 }
@@ -87,11 +88,11 @@ pub struct Cli {
 #[command(
     name = "fccli",
     version,
-    about = "Render Binance Spot candlestick charts",
-    after_help = "Examples:\n  fccli\n  fccli eth\n  fccli btc h\n  fccli binance:btc/usdc 1h\n  fccli BTCUSDT M --interactive"
+    about = "Render Binance Spot and USD-M Perpetual candlestick charts",
+    after_help = "Examples:\n  fccli\n  fccli eth\n  fccli btc h\n  fccli btc.p\n  fccli binance:btc/usdc 1h\n  fccli BTCUSDT.p M --interactive"
 )]
 struct RawCli {
-    /// Instrument as ASSET, BASE/QUOTE, BASE-QUOTE, or PROVIDER:INSTRUMENT (default: binance:btc)
+    /// Instrument as ASSET, BASE/QUOTE, BASE-QUOTE, or PROVIDER:INSTRUMENT; trailing .p selects USD-M perpetual (default: binance:btc)
     #[arg(value_name = "INSTRUMENT")]
     instrument: Option<String>,
 
@@ -190,7 +191,7 @@ fn default_quote_for(provider: &ProviderId) -> Option<&'static str> {
     }
 }
 
-/// Resolve a provider-neutral specification to Spot identifiers without I/O.
+/// Resolve a provider-neutral specification to locked identifiers without I/O.
 pub fn canonicalize_instrument(
     specification: &InstrumentSpec,
 ) -> Result<Instrument, CanonicalizationError> {
@@ -224,7 +225,7 @@ pub fn canonicalize_instrument(
     let provider_symbol = format!("{base}{quote}");
     Instrument::new(
         specification.provider().clone(),
-        Market::Spot,
+        specification.market(),
         base,
         quote,
         provider_symbol,
@@ -249,16 +250,38 @@ fn parse_timeframe(value: &str) -> Result<Timeframe, TargetParseError> {
 
 fn parse_instrument_spec(value: &str) -> Result<InstrumentSpec, TargetParseError> {
     let (provider, pair) = split_provider(value)?;
+    let (pair, market) = strip_perpetual_suffix(pair)?;
     let (base, quote) = split_pair(pair)?;
     validate_symbol_lengths(base, quote, default_quote_for(&provider))
         .map_err(|()| TargetParseError::InvalidInstrument)?;
 
-    InstrumentSpec::new(
+    InstrumentSpec::new_with_market(
         provider,
+        market,
         base.to_ascii_uppercase(),
         quote.map(str::to_ascii_uppercase),
     )
     .map_err(|_| TargetParseError::InvalidInstrument)
+}
+
+fn strip_perpetual_suffix(value: &str) -> Result<(&str, Market), TargetParseError> {
+    if let Some(stripped) = value
+        .strip_suffix(".p")
+        .or_else(|| value.strip_suffix(".P"))
+    {
+        if stripped.is_empty()
+            || stripped.ends_with(".p")
+            || stripped.ends_with(".P")
+            || stripped.ends_with('.')
+        {
+            return Err(TargetParseError::InvalidInstrument);
+        }
+        return Ok((stripped, Market::Perpetual));
+    }
+    if value.ends_with('.') {
+        return Err(TargetParseError::InvalidInstrument);
+    }
+    Ok((value, Market::Spot))
 }
 
 fn split_provider(value: &str) -> Result<(ProviderId, &str), TargetParseError> {

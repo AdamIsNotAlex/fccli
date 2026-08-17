@@ -1955,7 +1955,9 @@ async fn direct_dispatch_known_unregistered_provider_fails_at_registry() {
         .expect_err("known unimplemented providers fail at registry");
 
     assert!(
-        error.to_string().contains("unsupported market-data provider"),
+        error
+            .to_string()
+            .contains("unsupported market-data provider"),
         "{error}"
     );
     assert_eq!(provider.canonicalize_calls.load(Ordering::SeqCst), 0);

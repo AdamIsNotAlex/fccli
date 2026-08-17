@@ -189,6 +189,40 @@ fn maximum_length_identity_at_minimum_width_preserves_styled_status() {
 }
 
 #[test]
+fn perpetual_header_uses_perp_label() {
+    let area = Rect::new(0, 0, 60, 19);
+    let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, LayoutMode::Interactive)
+    else {
+        panic!("minimum interactive area must be adequate");
+    };
+    let series = series();
+    let state = ChartViewState::interactive(&series, usize::from(layout.main_plot.width));
+    let mut snapshot = snapshot(&series, state, RenderMode::Interactive);
+    snapshot.instrument = Instrument::new(
+        ProviderId::new("binance").expect("provider"),
+        Market::Perpetual,
+        "BTC",
+        "USDT",
+        "BTCUSDT",
+    )
+    .expect("perpetual instrument");
+    let mut buffer = Buffer::empty(area);
+
+    ChartWidget::new(
+        &snapshot,
+        &ChartLayoutResult::Ready { layout },
+        RenderPolicy::StyleFree,
+    )
+    .render(area, &mut buffer);
+
+    let header: String = (layout.header.x..layout.header.right())
+        .map(|x| symbol(&buffer, x, layout.header.y))
+        .collect();
+    assert!(header.starts_with("binance Perp BTC/USDT 1m"), "{header:?}");
+    assert!(!header.contains("Spot"), "{header:?}");
+}
+
+#[test]
 fn unbounded_provider_identity_is_capped_and_preserves_live_status() {
     let area = Rect::new(0, 0, 60, 19);
     let ChartLayoutResult::Ready { layout } = calculate_chart_layout(area, LayoutMode::Interactive)

@@ -55,6 +55,41 @@ fn valid_symbol_forms_canonicalize_to_locked_binance_spot_identifiers() {
 }
 
 #[test]
+fn trailing_p_suffix_selects_binance_perpetual_without_changing_identifiers() {
+    let cases = [
+        ("btc.p", "BTC", None, "BTC", "USDT", "BTCUSDT"),
+        ("BTC.P", "BTC", None, "BTC", "USDT", "BTCUSDT"),
+        ("binance:btc.p", "BTC", None, "BTC", "USDT", "BTCUSDT"),
+        ("btc/usdt.p", "BTC", Some("USDT"), "BTC", "USDT", "BTCUSDT"),
+        ("btc-usdt.p", "BTC", Some("USDT"), "BTC", "USDT", "BTCUSDT"),
+        ("BTCUSDT.p", "BTCUSDT", None, "BTC", "USDT", "BTCUSDT"),
+        ("btc/usdc.p", "BTC", Some("USDC"), "BTC", "USDC", "BTCUSDC"),
+        ("btc-usd.p", "BTC", Some("USD"), "BTC", "USD", "BTCUSD"),
+    ];
+
+    for (input, spec_base, spec_quote, base, quote, provider_symbol) in cases {
+        let cli = parse(input, "1h");
+        assert_eq!(cli.instrument().provider().as_str(), "binance", "{input}");
+        assert_eq!(cli.instrument().market(), Market::Perpetual, "{input}");
+        assert_eq!(cli.instrument().base(), spec_base, "{input}");
+        assert_eq!(cli.instrument().quote(), spec_quote, "{input}");
+
+        let instrument =
+            canonicalize_instrument(cli.instrument()).expect("Binance perpetual canonicalization");
+        assert_eq!(instrument.provider().as_str(), "binance", "{input}");
+        assert_eq!(instrument.market(), Market::Perpetual, "{input}");
+        assert_eq!(instrument.base(), base, "{input}");
+        assert_eq!(instrument.quote(), quote, "{input}");
+        assert_eq!(
+            instrument.display_pair(),
+            format!("{base}/{quote}"),
+            "{input}"
+        );
+        assert_eq!(instrument.provider_symbol(), provider_symbol, "{input}");
+    }
+}
+
+#[test]
 fn direct_instrument_specs_are_canonicalized_independently_of_cli_preprocessing() {
     let provider = ProviderId::new("binance").expect("valid provider");
     let cases = [
@@ -126,7 +161,14 @@ fn provider_defaults_to_binance_and_explicit_provider_is_preserved_until_canonic
     let explicit = parse("binance:btc", "1m");
     assert_eq!(explicit.instrument().provider().as_str(), "binance");
 
-    for provider in ["binance", "okx", "bybit", "coinbase", "kraken", "hyperliquid"] {
+    for provider in [
+        "binance",
+        "okx",
+        "bybit",
+        "coinbase",
+        "kraken",
+        "hyperliquid",
+    ] {
         let cli = parse(&format!("{provider}:btc"), "1m");
         assert_eq!(cli.instrument().provider().as_str(), provider);
         assert!(
@@ -147,10 +189,7 @@ fn provider_defaults_to_binance_and_explicit_provider_is_preserved_until_canonic
         provider: unknown.instrument().provider().clone(),
     }
     .to_string();
-    assert!(
-        rendered.contains("has no default-quote rule"),
-        "{rendered}"
-    );
+    assert!(rendered.contains("has no default-quote rule"), "{rendered}");
     assert!(rendered.contains("binance"), "{rendered}");
     assert!(rendered.contains("hyperliquid"), "{rendered}");
     assert!(rendered.contains("lowercase"), "{rendered}");
@@ -237,6 +276,12 @@ fn whitespace_non_ascii_empty_and_malformed_components_are_rejected() {
         "binance:btc:usdt",
         "binance::btc",
         "binance:btc/usdt:extra",
+        ".p",
+        "btc.p.p",
+        "btc.",
+        "btc.perp",
+        "btc.p/",
+        "btc/.p",
     ];
 
     for value in invalid {
@@ -396,10 +441,7 @@ fn known_providers_apply_locked_default_quotes_and_suffixes() {
     ];
 
     for (provider, quote) in cases {
-        for input in [
-            format!("{provider}:btc"),
-            format!("{provider}:BTC{quote}"),
-        ] {
+        for input in [format!("{provider}:btc"), format!("{provider}:BTC{quote}")] {
             let cli = parse(&input, "1h");
             assert_eq!(cli.instrument().provider().as_str(), provider, "{input}");
             let instrument = canonicalize_instrument(cli.instrument())
@@ -485,7 +527,10 @@ fn provider_symbol_length_projection_uses_selected_default_quote() {
             .expect("exact-limit unsuffixed projection appends the selected default");
         let unsuffixed_instrument = canonicalize_instrument(unsuffixed_cli.instrument())
             .expect("unsuffixed exact-limit projection");
-        assert_eq!(unsuffixed_instrument.base(), unsuffixed.to_ascii_uppercase());
+        assert_eq!(
+            unsuffixed_instrument.base(),
+            unsuffixed.to_ascii_uppercase()
+        );
         assert_eq!(unsuffixed_instrument.quote(), default_quote, "{provider}");
         assert_eq!(
             unsuffixed_instrument.provider_symbol().len(),
@@ -568,12 +613,13 @@ fn help_version_and_command_rendering_are_library_only_and_stable() {
     assert_eq!(help.kind(), ErrorKind::DisplayHelp);
     let help = help.to_string();
     for expected in [
-        "Render Binance Spot candlestick charts",
+        "Render Binance Spot and USD-M Perpetual candlestick charts",
         "Usage: fccli [OPTIONS] [INSTRUMENT] [TIMEFRAME]",
         "-i, --interactive",
         "default: binance:btc",
         "unit-only s/m/h/d/w/M means 1",
         "fccli binance:btc/usdc 1h",
+        "fccli btc.p",
     ] {
         assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
     }

@@ -7,7 +7,7 @@ use fccli::{
     chart::{ChartLayoutResult, RenderPolicy},
     error::{AppError, ProviderError, RenderError},
     model::{
-        Candle, HistoryRequest, HistoryRequestKind, Instrument, InstrumentSpec, Market, ProviderId,
+        Candle, HistoryRequest, HistoryRequestKind, Instrument, InstrumentSpec, ProviderId,
         RateGateState, Timeframe,
     },
     provider::{
@@ -50,7 +50,7 @@ impl MarketDataProvider for FakeProvider {
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
         Instrument::new(
             spec.provider().clone(),
-            Market::Spot,
+            spec.market(),
             spec.base(),
             spec.quote().unwrap_or("USDT"),
             format!("{}{}", spec.base(), spec.quote().unwrap_or("USDT")),

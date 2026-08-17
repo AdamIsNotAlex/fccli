@@ -464,7 +464,7 @@ async fn registry_trait_object_uses_shared_history_live_and_rate_gate_state() {
     assert!(
         error
             .to_string()
-            .contains("instrument is not valid for Binance Spot"),
+            .contains("instrument is not valid for Binance"),
         "{error}"
     );
 

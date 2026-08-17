@@ -62,7 +62,7 @@ impl MarketDataProvider for FakeProvider {
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
         Instrument::new(
             spec.provider().clone(),
-            Market::Spot,
+            spec.market(),
             spec.base(),
             spec.quote().unwrap_or("USDT"),
             format!("{}{}", spec.base(), spec.quote().unwrap_or("USDT")),

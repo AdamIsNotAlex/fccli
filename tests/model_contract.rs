@@ -113,6 +113,26 @@ fn validated_instrument_values_expose_only_immutable_derived_views() {
 }
 
 #[test]
+fn market_labels_and_specs_preserve_perpetual_selection() {
+    assert_eq!(Market::Spot.display_label(), "Spot");
+    assert_eq!(Market::Perpetual.display_label(), "Perp");
+
+    let provider = ProviderId::new("binance").expect("valid provider");
+    let spec =
+        InstrumentSpec::new_with_market(provider.clone(), Market::Perpetual, "BTC", Some("USDT"))
+            .expect("valid perpetual specification");
+    assert_eq!(spec.market(), Market::Perpetual);
+    assert_eq!(spec.base(), "BTC");
+    assert_eq!(spec.quote(), Some("USDT"));
+
+    let instrument = Instrument::new(provider, Market::Perpetual, "BTC", "USDT", "BTCUSDT")
+        .expect("valid perpetual instrument");
+    assert_eq!(instrument.market(), Market::Perpetual);
+    assert_eq!(instrument.display_pair(), "BTC/USDT");
+    assert_eq!(instrument.provider_symbol(), "BTCUSDT");
+}
+
+#[test]
 fn candle_accepts_formatter_and_chart_safe_boundaries() {
     for open_time in [MIN_TIMESTAMP_MS, MAX_TIMESTAMP_MS - 1] {
         let value = Candle::from_rest(

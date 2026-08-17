@@ -1,4 +1,4 @@
-//! Binance Spot REST history and raw WebSocket transport.
+//! Binance Spot and USD-M Perpetual REST history and raw WebSocket transport.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -41,8 +41,8 @@ use crate::{
     },
     model::{
         Candle, ConnectionStatus, FinalityAuthority, GapGeneration, HistoryRequest, Instrument,
-        InstrumentSpec, MarketEvent, MonoInstant, ProcessBlocker, ProviderId, RateGateState,
-        ReplayRevision, Timeframe,
+        InstrumentSpec, Market, MarketEvent, MonoInstant, ProcessBlocker, ProviderId,
+        RateGateState, ReplayRevision, Timeframe,
     },
     provider::{
         LiveFeed, LiveRequest, MarketDataProvider, ProviderFuture, RateGateSender,
@@ -51,16 +51,21 @@ use crate::{
     },
 };
 
-const KLINES_PATH: &str = "/api/v3/klines";
+const SPOT_KLINES_PATH: &str = "/api/v3/klines";
+const PERPETUAL_KLINES_PATH: &str = "/fapi/v1/klines";
 pub const REST_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REST_BODY_LIMIT: usize = 2 * 1024 * 1024;
 pub const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(30);
 
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-const PRODUCTION_REST_BASE: &str = "https://data-api.binance.vision";
+const PRODUCTION_SPOT_REST_BASE: &str = "https://data-api.binance.vision";
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+const PRODUCTION_PERPETUAL_REST_BASE: &str = "https://fapi.binance.com";
 
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-const PRODUCTION_WS_BASE: &str = "wss://data-stream.binance.vision";
+const PRODUCTION_SPOT_WS_BASE: &str = "wss://data-stream.binance.vision";
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+const PRODUCTION_PERPETUAL_WS_BASE: &str = "wss://fstream.binance.com";
 const WS_BYTE_LIMIT_MAX: usize = 16 * 1024 * 1024;
 pub const WS_READ_BUFFER_SIZE: usize = 128 * 1024;
 pub const WS_MESSAGE_SIZE: usize = 1024 * 1024;
@@ -288,10 +293,16 @@ struct WsKline {
     #[serde(rename = "x")]
     closed: bool,
 }
+
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
 pub fn websocket_url(instrument: &Instrument, timeframe: Timeframe) -> Result<Url, ProviderError> {
-    websocket_url_from_base(PRODUCTION_WS_BASE, instrument, timeframe, false)
-        .map_err(|error| contextualize_websocket_configuration(error, instrument, timeframe))
+    websocket_url_from_base(
+        production_ws_base(instrument.market()),
+        instrument,
+        timeframe,
+        false,
+    )
+    .map_err(|error| contextualize_websocket_configuration(error, instrument, timeframe))
 }
 
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -302,6 +313,29 @@ pub fn test_websocket_url(
 ) -> Result<Url, ProviderError> {
     websocket_url_from_base(base_url, instrument, timeframe, true)
         .map_err(|error| contextualize_websocket_configuration(error, instrument, timeframe))
+}
+
+fn klines_path(market: Market) -> &'static str {
+    match market {
+        Market::Spot => SPOT_KLINES_PATH,
+        Market::Perpetual => PERPETUAL_KLINES_PATH,
+    }
+}
+
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+fn production_rest_base(market: Market) -> &'static str {
+    match market {
+        Market::Spot => PRODUCTION_SPOT_REST_BASE,
+        Market::Perpetual => PRODUCTION_PERPETUAL_REST_BASE,
+    }
+}
+
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+fn production_ws_base(market: Market) -> &'static str {
+    match market {
+        Market::Spot => PRODUCTION_SPOT_WS_BASE,
+        Market::Perpetual => PRODUCTION_PERPETUAL_WS_BASE,
+    }
 }
 fn websocket_url_from_base(
     base_url: &str,
@@ -899,6 +933,7 @@ fn contextualize_websocket_configuration(
 #[derive(Clone)]
 pub struct BinanceProvider {
     client: Client,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     base_url: Url,
     clock: Arc<dyn Clock>,
     gate_sender: RateGateSender,
@@ -953,8 +988,6 @@ impl BinanceProvider {
     #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
     pub fn new(clock: Arc<dyn Clock>) -> Result<Self, ProviderError> {
         Self::build(
-            Url::parse(PRODUCTION_REST_BASE)
-                .map_err(|_| ProviderError::Configuration("invalid production REST base URL"))?,
             clock,
             REST_REQUEST_TIMEOUT,
             REST_BODY_LIMIT,
@@ -1007,6 +1040,7 @@ impl BinanceProvider {
     }
 
     fn build(
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         base_url: Url,
         clock: Arc<dyn Clock>,
         request_timeout: Duration,
@@ -1035,6 +1069,7 @@ impl BinanceProvider {
         let (gate_sender, gate_snapshot) = rate_gate_channel(RateGateState::Open);
         Ok(Self {
             client,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             base_url,
             clock,
             gate_sender,
@@ -1058,63 +1093,78 @@ impl BinanceProvider {
             ErrorContext::operation(ErrorOperation::History).with_market(instrument, timeframe);
         self.await_gate(&cancellation, &context).await?;
 
-        let mut url = self.base_url.clone();
-        url.set_path(KLINES_PATH);
-        url.set_query(None);
-        let limit = request.limit().to_string();
-        let mut query = vec![
-            ("symbol", instrument.provider_symbol().to_owned()),
-            ("interval", timeframe.as_str().to_owned()),
-            ("limit", limit),
-        ];
-        if let Some(start_time) = request.start_time() {
-            query.push(("startTime", start_time.to_string()));
-        }
-        if let Some(end_time) = request.end_time() {
-            query.push(("endTime", end_time.to_string()));
-        }
+        #[cfg(any(
+            all(feature = "production-transport", not(feature = "test-transport")),
+            all(feature = "test-transport", not(feature = "production-transport"))
+        ))]
+        {
+            #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+            let mut url = Url::parse(production_rest_base(instrument.market()))
+                .map_err(|_| ProviderError::Configuration("invalid production REST base URL"))?;
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            let mut url = self.base_url.clone();
+            url.set_path(klines_path(instrument.market()));
+            url.set_query(None);
+            let limit = request.limit().to_string();
+            let mut query = vec![
+                ("symbol", instrument.provider_symbol().to_owned()),
+                ("interval", timeframe.as_str().to_owned()),
+                ("limit", limit),
+            ];
+            if let Some(start_time) = request.start_time() {
+                query.push(("startTime", start_time.to_string()));
+            }
+            if let Some(end_time) = request.end_time() {
+                query.push(("endTime", end_time.to_string()));
+            }
 
-        let response = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(cancelled(context.clone())),
-            result = self.client.get(url).query(&query).send() => result.map_err(|error| {
-                if error.is_timeout() {
-                    ProviderError::Timeout { context: context.clone(), kind: TimeoutKind::Request }
-                } else {
-                    ProviderError::Transport { context: context.clone(), cause: SanitizedCause::Connection }
-                }
-            })?,
-        };
-
-        let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::IM_A_TEAPOT {
-            return self.handle_rate_limit(&response, context);
-        }
-        if status.is_server_error() {
-            return Err(ProviderError::ServerStatus {
-                context,
-                status: status.as_u16(),
-            });
-        }
-        if status.is_redirection() {
-            return Err(ProviderError::ClientStatus {
-                context,
-                status: status.as_u16(),
-                code: None,
-                message: None,
-            });
-        }
-        if status.is_client_error() {
-            let bytes = match read_capped(response, self.body_limit, &cancellation, &context).await
-            {
-                Ok(bytes) => bytes,
-                Err(error) if is_cancelled(&error) => return Err(error),
-                Err(_) => Vec::new(),
+            let response = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(cancelled(context.clone())),
+                result = self.client.get(url).query(&query).send() => result.map_err(|error| {
+                    if error.is_timeout() {
+                        ProviderError::Timeout { context: context.clone(), kind: TimeoutKind::Request }
+                    } else {
+                        ProviderError::Transport { context: context.clone(), cause: SanitizedCause::Connection }
+                    }
+                })?,
             };
-            return Err(map_http_error(status, &bytes, context));
+
+            let status = response.status();
+            if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::IM_A_TEAPOT {
+                return self.handle_rate_limit(&response, context);
+            }
+            if status.is_server_error() {
+                return Err(ProviderError::ServerStatus {
+                    context,
+                    status: status.as_u16(),
+                });
+            }
+            if status.is_redirection() {
+                return Err(ProviderError::ClientStatus {
+                    context,
+                    status: status.as_u16(),
+                    code: None,
+                    message: None,
+                });
+            }
+            if status.is_client_error() {
+                let bytes =
+                    match read_capped(response, self.body_limit, &cancellation, &context).await {
+                        Ok(bytes) => bytes,
+                        Err(error) if is_cancelled(&error) => return Err(error),
+                        Err(_) => Vec::new(),
+                    };
+                return Err(map_http_error(status, &bytes, context));
+            }
+            let bytes = read_capped(response, self.body_limit, &cancellation, &context).await?;
+            decode_klines(&bytes, request.limit(), context)
         }
-        let bytes = read_capped(response, self.body_limit, &cancellation, &context).await?;
-        decode_klines(&bytes, request.limit(), context)
+        #[cfg(all(feature = "production-transport", feature = "test-transport"))]
+        {
+            let _ = request;
+            unreachable!("mutually exclusive transport features are rejected by src/lib.rs")
+        }
     }
 
     async fn await_gate(
@@ -1999,11 +2049,11 @@ impl BinanceProvider {
     pub fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
         if spec.provider().as_str() != "binance" {
             return Err(ProviderError::Configuration(
-                "instrument is not valid for Binance Spot",
+                "instrument is not valid for Binance",
             ));
         }
         canonicalize_instrument(spec)
-            .map_err(|_| ProviderError::Configuration("instrument is not valid for Binance Spot"))
+            .map_err(|_| ProviderError::Configuration("instrument is not valid for Binance"))
     }
 
     #[must_use]

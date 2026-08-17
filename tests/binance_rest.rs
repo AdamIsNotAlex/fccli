@@ -439,6 +439,53 @@ async fn latest_query_uses_exact_endpoint_utc_defaults_user_agent_and_no_extra_p
 }
 
 #[tokio::test]
+async fn perpetual_history_uses_fapi_path_on_the_injected_loopback_host() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fapi/v1/klines"))
+        .and(query_param("symbol", "BTCUSDT"))
+        .and(query_param("interval", "1m"))
+        .and(query_param("limit", "500"))
+        .and(header(
+            "user-agent",
+            concat!("fccli/", env!("CARGO_PKG_VERSION")),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(VALID, "application/json"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let perpetual = Instrument::new(
+        ProviderId::new("binance").expect("provider"),
+        Market::Perpetual,
+        "BTC",
+        "USDT",
+        "BTCUSDT",
+    )
+    .expect("perpetual instrument");
+    let candles = provider(&server, clock())
+        .history(
+            &perpetual,
+            Timeframe::Minute1,
+            HistoryRequest::latest(500).expect("latest"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("valid perpetual klines");
+    assert_eq!(candles.len(), 2);
+
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/fapi/v1/klines");
+    let query: Vec<_> = requests[0].url.query_pairs().collect();
+    assert_eq!(
+        query.len(),
+        3,
+        "perpetual latest must omit startTime, endTime, and timeZone"
+    );
+}
+
+#[tokio::test]
 async fn older_and_gap_queries_use_checked_exact_cursors_limits_and_no_timezone() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

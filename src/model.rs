@@ -45,11 +45,22 @@ impl FromStr for ProviderId {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Market {
     Spot,
+    Perpetual,
+}
+
+impl Market {
+    pub const fn display_label(self) -> &'static str {
+        match self {
+            Self::Spot => "Spot",
+            Self::Perpetual => "Perp",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstrumentSpec {
     provider: ProviderId,
+    market: Market,
     base: String,
     quote: Option<String>,
 }
@@ -60,12 +71,22 @@ impl InstrumentSpec {
         base: impl Into<String>,
         quote: Option<impl Into<String>>,
     ) -> Result<Self, ModelError> {
+        Self::new_with_market(provider, Market::Spot, base, quote)
+    }
+
+    pub fn new_with_market(
+        provider: ProviderId,
+        market: Market,
+        base: impl Into<String>,
+        quote: Option<impl Into<String>>,
+    ) -> Result<Self, ModelError> {
         let base = validate_component(base.into(), "base")?;
         let quote = quote
             .map(|value| validate_component(value.into(), "quote"))
             .transpose()?;
         Ok(Self {
             provider,
+            market,
             base,
             quote,
         })
@@ -73,6 +94,10 @@ impl InstrumentSpec {
 
     pub const fn provider(&self) -> &ProviderId {
         &self.provider
+    }
+
+    pub const fn market(&self) -> Market {
+        self.market
     }
 
     pub fn base(&self) -> &str {

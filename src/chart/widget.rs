@@ -275,9 +275,7 @@ fn render_header(
     let identity_budget = width
         .saturating_sub(status_token_width)
         .saturating_sub(identity_gap);
-    let market = match snapshot.instrument.market() {
-        crate::model::Market::Spot => "Spot",
-    };
+    let market = snapshot.instrument.market().display_label();
     let identity = header_identity(
         snapshot.instrument.provider().as_str(),
         market,

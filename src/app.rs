@@ -284,7 +284,9 @@ where
         }
     };
     canonicalize_instrument(cli.instrument()).map_err(|_| {
-        ProviderError::Configuration("instrument is not valid for the selected market-data provider")
+        ProviderError::Configuration(
+            "instrument is not valid for the selected market-data provider",
+        )
     })?;
 
     let provider = dependencies
