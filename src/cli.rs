@@ -6,6 +6,7 @@ use clap::{CommandFactory, Parser, error::ErrorKind};
 
 use crate::model::{
     Instrument, InstrumentSpec, MAX_PROVIDER_SYMBOL_LEN, Market, ProviderId, Timeframe,
+    is_spot_index_token,
 };
 
 const DEFAULT_PROVIDER: &str = "binance";
@@ -28,6 +29,7 @@ enum TargetParseError {
     InvalidProvider,
     MissingInstrument,
     InvalidInstrument,
+    Hip3RequiresPerpetual,
 }
 
 impl std::fmt::Display for TargetParseError {
@@ -42,7 +44,10 @@ impl std::fmt::Display for TargetParseError {
                 formatter.write_str("missing instrument after provider prefix; try `binance:btc`")
             }
             Self::InvalidInstrument => formatter.write_str(
-                "invalid instrument; use `btc`, `BTCUSDT`, `btc.p`, or `binance:btc/usdt`",
+                "invalid instrument; use `btc`, `BTCUSDT`, `btc.p`, `binance:btc/usdt`, or `hyperliquid:btc.p`",
+            ),
+            Self::Hip3RequiresPerpetual => formatter.write_str(
+                "HIP-3 builder DEX markets are perpetual-only; use `hyperliquid:<dex>:<coin>.p`",
             ),
         }
     }
@@ -88,11 +93,11 @@ pub struct Cli {
 #[command(
     name = "fccli",
     version,
-    about = "Render Binance Spot and USD-M Perpetual candlestick charts",
-    after_help = "Examples:\n  fccli\n  fccli eth\n  fccli btc h\n  fccli btc.p\n  fccli binance:btc/usdc 1h\n  fccli BTCUSDT.p M --interactive"
+    about = "Render Binance and Hyperliquid Spot and Perpetual candlestick charts",
+    after_help = "Examples:\n  fccli\n  fccli eth\n  fccli btc h\n  fccli btc.p\n  fccli binance:btc/usdc 1h\n  fccli hyperliquid:btc.p 1h\n  fccli BTCUSDT.p M --interactive"
 )]
 struct RawCli {
-    /// Instrument as ASSET, BASE/QUOTE, BASE-QUOTE, or PROVIDER:INSTRUMENT; trailing .p selects USD-M perpetual (default: binance:btc)
+    /// Instrument as ASSET, BASE/QUOTE, BASE-QUOTE, PROVIDER:INSTRUMENT, or hyperliquid:<dex>:<coin>.p; trailing .p selects perpetual (default: binance:btc)
     #[arg(value_name = "INSTRUMENT")]
     instrument: Option<String>,
 
@@ -251,6 +256,39 @@ fn parse_timeframe(value: &str) -> Result<Timeframe, TargetParseError> {
 fn parse_instrument_spec(value: &str) -> Result<InstrumentSpec, TargetParseError> {
     let (provider, pair) = split_provider(value)?;
     let (pair, market) = strip_perpetual_suffix(pair)?;
+    if provider.as_str() == "hyperliquid" {
+        if let Some((dex, coin)) = pair.split_once(':') {
+            if market != Market::Perpetual {
+                return Err(TargetParseError::Hip3RequiresPerpetual);
+            }
+            if dex.is_empty()
+                || coin.is_empty()
+                || !dex.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                || !coin.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            {
+                return Err(TargetParseError::InvalidInstrument);
+            }
+            validate_symbol_lengths(coin, None, default_quote_for(&provider))
+                .map_err(|()| TargetParseError::InvalidInstrument)?;
+            return InstrumentSpec::new_with_market_and_venue(
+                provider,
+                market,
+                coin.to_ascii_uppercase(),
+                None::<String>,
+                Some(dex.to_ascii_lowercase()),
+            )
+            .map_err(|_| TargetParseError::InvalidInstrument);
+        }
+        if is_spot_index_token(pair) {
+            if market != Market::Spot {
+                return Err(TargetParseError::InvalidInstrument);
+            }
+            validate_symbol_lengths(pair, None, default_quote_for(&provider))
+                .map_err(|()| TargetParseError::InvalidInstrument)?;
+            return InstrumentSpec::new_with_market(provider, market, pair, None::<String>)
+                .map_err(|_| TargetParseError::InvalidInstrument);
+        }
+    }
     let (base, quote) = split_pair(pair)?;
     validate_symbol_lengths(base, quote, default_quote_for(&provider))
         .map_err(|()| TargetParseError::InvalidInstrument)?;
@@ -285,29 +323,29 @@ fn strip_perpetual_suffix(value: &str) -> Result<(&str, Market), TargetParseErro
 }
 
 fn split_provider(value: &str) -> Result<(ProviderId, &str), TargetParseError> {
-    let mut parts = value.split(':');
-    let first = parts.next().unwrap_or_default();
-    let second = parts.next();
-    if parts.next().is_some() {
+    let Some((first, rest)) = value.split_once(':') else {
+        return Ok((
+            ProviderId::new(DEFAULT_PROVIDER).expect("locked default provider is valid"),
+            value,
+        ));
+    };
+    if first.len() > MAX_PROVIDER_SYMBOL_LEN {
         return Err(TargetParseError::InvalidProvider);
     }
-
-    match second {
-        Some(pair) => {
-            if first.len() > MAX_PROVIDER_SYMBOL_LEN {
-                return Err(TargetParseError::InvalidProvider);
-            }
-            let provider = ProviderId::new(first).map_err(|_| TargetParseError::InvalidProvider)?;
-            if pair.is_empty() {
-                return Err(TargetParseError::MissingInstrument);
-            }
-            Ok((provider, pair))
-        }
-        None => Ok((
-            ProviderId::new(DEFAULT_PROVIDER).expect("locked default provider is valid"),
-            first,
-        )),
+    let provider = ProviderId::new(first).map_err(|_| TargetParseError::InvalidProvider)?;
+    if rest.is_empty() {
+        return Err(TargetParseError::MissingInstrument);
     }
+    if first == "hyperliquid" {
+        if rest.bytes().filter(|byte| *byte == b':').count() > 1 {
+            return Err(TargetParseError::InvalidInstrument);
+        }
+        return Ok((provider, rest));
+    }
+    if rest.contains(':') {
+        return Err(TargetParseError::InvalidProvider);
+    }
+    Ok((provider, rest))
 }
 
 fn split_pair(value: &str) -> Result<(&str, Option<&str>), TargetParseError> {

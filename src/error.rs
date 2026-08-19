@@ -118,7 +118,10 @@ impl SanitizedMessage {
             .take(256)
             .flat_map(char::to_lowercase)
             .collect();
-        if lower.contains("invalid symbol") {
+        if lower.contains("invalid symbol")
+            || lower.contains("unknown coin")
+            || lower.contains("unknown spot pair")
+        {
             Self::InvalidSymbol
         } else if lower.contains("too many requests") {
             Self::TooManyRequests
