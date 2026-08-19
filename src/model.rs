@@ -63,6 +63,7 @@ pub struct InstrumentSpec {
     market: Market,
     base: String,
     quote: Option<String>,
+    venue: Option<String>,
 }
 
 impl InstrumentSpec {
@@ -80,15 +81,29 @@ impl InstrumentSpec {
         base: impl Into<String>,
         quote: Option<impl Into<String>>,
     ) -> Result<Self, ModelError> {
+        Self::new_with_market_and_venue(provider, market, base, quote, None::<String>)
+    }
+
+    pub fn new_with_market_and_venue(
+        provider: ProviderId,
+        market: Market,
+        base: impl Into<String>,
+        quote: Option<impl Into<String>>,
+        venue: Option<impl Into<String>>,
+    ) -> Result<Self, ModelError> {
         let base = validate_component(base.into(), "base")?;
         let quote = quote
             .map(|value| validate_component(value.into(), "quote"))
+            .transpose()?;
+        let venue = venue
+            .map(|value| validate_component(value.into(), "venue"))
             .transpose()?;
         Ok(Self {
             provider,
             market,
             base,
             quote,
+            venue,
         })
     }
 
@@ -106,6 +121,10 @@ impl InstrumentSpec {
 
     pub fn quote(&self) -> Option<&str> {
         self.quote.as_deref()
+    }
+
+    pub fn venue(&self) -> Option<&str> {
+        self.venue.as_deref()
     }
 }
 
@@ -172,8 +191,19 @@ impl Instrument {
     }
 }
 
+pub(crate) fn is_spot_index_token(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars.next() == Some('@')
+        && chars.next().is_some_and(|byte| byte.is_ascii_digit())
+        && chars.all(|byte| byte.is_ascii_digit())
+}
+
 fn validate_component(value: String, component: &'static str) -> Result<String, ModelError> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+    let valid = match component {
+        "base" if is_spot_index_token(&value) => true,
+        _ => !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+    };
+    if !valid {
         return Err(ModelError::InvalidComponent { component });
     }
     Ok(value)

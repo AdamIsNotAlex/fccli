@@ -613,7 +613,7 @@ fn help_version_and_command_rendering_are_library_only_and_stable() {
     assert_eq!(help.kind(), ErrorKind::DisplayHelp);
     let help = help.to_string();
     for expected in [
-        "Render Binance Spot and USD-M Perpetual candlestick charts",
+        "Render Binance and Hyperliquid Spot and Perpetual candlestick charts",
         "Usage: fccli [OPTIONS] [INSTRUMENT] [TIMEFRAME]",
         "-i, --interactive",
         "default: binance:btc",
@@ -750,4 +750,39 @@ fn market_target_is_clone_debug_eq() {
     let cloned = target.clone();
     assert_eq!(target, cloned);
     assert!(format!("{target:?}").contains("MarketTarget"));
+}
+
+#[test]
+fn hyperliquid_spot_index_and_hip3_parse_without_changing_local_canonicalize() {
+    let index = parse("hyperliquid:@107", "1h");
+    assert_eq!(index.instrument().provider().as_str(), "hyperliquid");
+    assert_eq!(index.instrument().market(), Market::Spot);
+    assert_eq!(index.instrument().base(), "@107");
+    assert_eq!(index.instrument().quote(), None);
+    assert_eq!(index.instrument().venue(), None);
+    let local = canonicalize_instrument(index.instrument()).expect("local canonicalize");
+    assert_eq!(local.base(), "@107");
+    assert_eq!(local.quote(), "USDC");
+    assert_eq!(local.provider_symbol(), "@107USDC");
+
+    let hip3 = parse("hyperliquid:xyz:XYZ100.p", "1h");
+    assert_eq!(hip3.instrument().provider().as_str(), "hyperliquid");
+    assert_eq!(hip3.instrument().market(), Market::Perpetual);
+    assert_eq!(hip3.instrument().base(), "XYZ100");
+    assert_eq!(hip3.instrument().venue(), Some("xyz"));
+    let local = canonicalize_instrument(hip3.instrument()).expect("HIP-3 local canonicalize");
+    assert_eq!(local.base(), "XYZ100");
+    assert_eq!(local.quote(), "USDC");
+    assert_eq!(local.provider_symbol(), "XYZ100USDC");
+}
+
+#[test]
+fn hyperliquid_hip3_without_perp_suffix_is_rejected() {
+    let error = Cli::try_parse_from(["fccli", "hyperliquid:xyz:XYZ100", "1h"])
+        .expect_err("HIP-3 requires .p");
+    assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    let rendered = error.to_string();
+    assert!(rendered.contains("perpetual-only"), "{rendered}");
+    assert!(rendered.contains("hyperliquid:<dex>:<coin>.p"), "{rendered}");
+    assert!(!rendered.contains("XYZ100"), "{rendered}");
 }

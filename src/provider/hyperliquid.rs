@@ -1,4 +1,4 @@
-//! Binance Spot and USD-M Perpetual REST history and raw WebSocket transport.
+//! Hyperliquid Spot and Perpetual REST history and raw WebSocket transport.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -13,10 +13,7 @@ use std::{
 
 use futures_util::{FutureExt, Sink, Stream, stream};
 use reqwest::{Client, StatusCode, Url, header::RETRY_AFTER};
-use serde::{
-    Deserialize,
-    de::{IgnoredAny, SeqAccess, Visitor},
-};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
     net::TcpStream,
@@ -40,9 +37,9 @@ use crate::{
         SanitizedMessage, TimeoutKind,
     },
     model::{
-        Candle, ConnectionStatus, FinalityAuthority, GapGeneration, HistoryRequest, Instrument,
-        InstrumentSpec, Market, MarketEvent, MonoInstant, ProcessBlocker, ProviderId,
-        RateGateState, ReplayRevision, Timeframe,
+        Candle, ConnectionStatus, FinalityAuthority, GapGeneration, HistoryRequest,
+        HistoryRequestKind, Instrument, InstrumentSpec, Market, MarketEvent, MonoInstant,
+        ProcessBlocker, ProviderId, RateGateState, ReplayRevision, Timeframe, is_spot_index_token,
     },
     provider::{
         LiveFeed, LiveRequest, MarketDataProvider, ProviderFuture, RateGateSender,
@@ -51,21 +48,21 @@ use crate::{
     },
 };
 
-const SPOT_KLINES_PATH: &str = "/api/v3/klines";
-const PERPETUAL_KLINES_PATH: &str = "/fapi/v1/klines";
+const INFO_PATH: &str = "/info";
 pub const REST_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REST_BODY_LIMIT: usize = 2 * 1024 * 1024;
 pub const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(30);
+const UNSUPPORTED_TIMEFRAME: &str =
+    "Hyperliquid does not support the 1s or 6h timeframes; use 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 8h, 12h, 1d, 3d, 1w, or 1M";
+/// Locked mainnet `spotMeta` universe index for UBTC/USDC (UI-mapped BTC spot).
+const SPOT_UBTC_INDEX: &str = "@142";
+/// Locked mainnet `spotMeta` universe index for HYPE/USDC.
+const SPOT_HYPE_INDEX: &str = "@107";
 
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-const PRODUCTION_SPOT_REST_BASE: &str = "https://data-api.binance.vision";
+const PRODUCTION_REST_BASE: &str = "https://api.hyperliquid.xyz";
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-const PRODUCTION_PERPETUAL_REST_BASE: &str = "https://fapi.binance.com";
-
-#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-const PRODUCTION_SPOT_WS_BASE: &str = "wss://data-stream.binance.vision";
-#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-const PRODUCTION_PERPETUAL_WS_BASE: &str = "wss://fstream.binance.com";
+const PRODUCTION_WS_BASE: &str = "wss://api.hyperliquid.xyz/ws";
 const WS_BYTE_LIMIT_MAX: usize = 16 * 1024 * 1024;
 pub const WS_READ_BUFFER_SIZE: usize = 128 * 1024;
 pub const WS_MESSAGE_SIZE: usize = 1024 * 1024;
@@ -257,21 +254,7 @@ pub enum DecodedFrame {
 }
 
 #[derive(Deserialize)]
-struct WsEnvelope {
-    #[serde(rename = "e")]
-    event: Option<String>,
-    #[serde(rename = "s")]
-    symbol: Option<String>,
-    #[serde(default)]
-    code: Option<i64>,
-    #[serde(default)]
-    msg: Option<String>,
-    #[serde(default)]
-    k: Option<WsKline>,
-}
-
-#[derive(Deserialize)]
-struct WsKline {
+struct HlCandle {
     #[serde(rename = "t")]
     open_time: i64,
     #[serde(rename = "T")]
@@ -281,23 +264,21 @@ struct WsKline {
     #[serde(rename = "i")]
     interval: String,
     #[serde(rename = "o")]
-    open: String,
+    open: Value,
     #[serde(rename = "c")]
-    close: String,
+    close: Value,
     #[serde(rename = "h")]
-    high: String,
+    high: Value,
     #[serde(rename = "l")]
-    low: String,
+    low: Value,
     #[serde(rename = "v")]
-    volume: String,
-    #[serde(rename = "x")]
-    closed: bool,
+    volume: Value,
 }
 
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
 pub fn websocket_url(instrument: &Instrument, timeframe: Timeframe) -> Result<Url, ProviderError> {
     websocket_url_from_base(
-        production_ws_base(instrument.market()),
+        production_ws_base(),
         instrument,
         timeframe,
         false,
@@ -315,27 +296,14 @@ pub fn test_websocket_url(
         .map_err(|error| contextualize_websocket_configuration(error, instrument, timeframe))
 }
 
-fn klines_path(market: Market) -> &'static str {
-    match market {
-        Market::Spot => SPOT_KLINES_PATH,
-        Market::Perpetual => PERPETUAL_KLINES_PATH,
-    }
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+fn production_rest_base() -> &'static str {
+    PRODUCTION_REST_BASE
 }
 
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-fn production_rest_base(market: Market) -> &'static str {
-    match market {
-        Market::Spot => PRODUCTION_SPOT_REST_BASE,
-        Market::Perpetual => PRODUCTION_PERPETUAL_REST_BASE,
-    }
-}
-
-#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-fn production_ws_base(market: Market) -> &'static str {
-    match market {
-        Market::Spot => PRODUCTION_SPOT_WS_BASE,
-        Market::Perpetual => PRODUCTION_PERPETUAL_WS_BASE,
-    }
+fn production_ws_base() -> &'static str {
+    PRODUCTION_WS_BASE
 }
 fn websocket_url_from_base(
     base_url: &str,
@@ -343,7 +311,7 @@ fn websocket_url_from_base(
     timeframe: Timeframe,
     loopback_only: bool,
 ) -> Result<Url, ProviderError> {
-    let mut url = Url::parse(base_url)
+    let url = Url::parse(base_url)
         .map_err(|_| ProviderError::Configuration("invalid WebSocket base URL"))?;
     let valid_scheme = if loopback_only {
         url.scheme() == "ws"
@@ -374,12 +342,10 @@ fn websocket_url_from_base(
             ));
         }
     }
-    let stream = format!(
-        "{}@kline_{}",
-        instrument.provider_symbol().to_ascii_lowercase(),
-        timeframe.as_str()
-    );
-    url.set_path(&format!("/ws/{stream}"));
+    let _ = (instrument, timeframe);
+    if url.path() != "/" && !url.path().is_empty() && url.path() != "/ws" {
+        return Err(ProviderError::Configuration("invalid WebSocket base URL"));
+    }
     Ok(url)
 }
 
@@ -416,67 +382,34 @@ fn decode_ws_payload(
             },
         ));
     }
-    let envelope: WsEnvelope = match serde_json::from_slice(bytes) {
+    let value: Value = match serde_json::from_slice(bytes) {
         Ok(value) => value,
         Err(_) => {
             return DecodedFrame::ProviderError(payload(&context, PayloadError::MalformedProtocol));
         }
     };
-    if envelope.event.as_deref() == Some("serverShutdown") {
-        return DecodedFrame::ServerShutdown;
-    }
-    if envelope.code == Some(-1121) {
-        return DecodedFrame::ProviderError(ProviderError::InvalidSymbol {
-            context,
-            code: -1121,
-            message: envelope
-                .msg
-                .as_deref()
-                .map(SanitizedMessage::new)
-                .unwrap_or(SanitizedMessage::InvalidSymbol),
-        });
-    }
-    if envelope.code.is_some() || envelope.msg.is_some() {
-        return DecodedFrame::ProviderError(ProviderError::Protocol {
-            context,
-            detail: "provider reported a WebSocket error",
-        });
-    }
-    if envelope.event.as_deref() != Some("kline") {
+    let channel = value.get("channel").and_then(Value::as_str);
+    if channel != Some("candle") {
         return DecodedFrame::Ignored;
     }
-    let Some(kline) = envelope.k else {
+    let Some(data) = value.get("data") else {
         return DecodedFrame::ProviderError(payload(&context, PayloadError::MalformedProtocol));
     };
-    if envelope.symbol.as_deref() != Some(instrument.provider_symbol())
-        || kline.symbol != instrument.provider_symbol()
-        || kline.interval != timeframe.as_str()
+    let kline: HlCandle = match serde_json::from_value(data.clone()) {
+        Ok(kline) => kline,
+        Err(_) => {
+            return DecodedFrame::ProviderError(payload(&context, PayloadError::MalformedProtocol));
+        }
+    };
+    if let Err(error) = candle_market_matches(&kline, instrument, timeframe, &context, "WebSocket")
     {
-        return DecodedFrame::ProviderError(ProviderError::Protocol {
-            context,
-            detail: "WebSocket kline market does not match subscription",
-        });
+        return DecodedFrame::ProviderError(error);
     }
-    let parse = |value: &str| {
-        value
-            .parse::<f64>()
-            .ok()
-            .filter(|number| number.is_finite())
+    let (open, high, low, close, volume) = match candle_ohlcv(&kline, &context) {
+        Ok(ohlcv) => ohlcv,
+        Err(error) => return DecodedFrame::ProviderError(error),
     };
-    let Some((open, high, low, close, volume)) = parse(&kline.open)
-        .zip(parse(&kline.high))
-        .zip(parse(&kline.low))
-        .zip(parse(&kline.close))
-        .zip(parse(&kline.volume))
-        .map(|((((open, high), low), close), volume)| (open, high, low, close, volume))
-    else {
-        return DecodedFrame::ProviderError(payload(
-            &context,
-            PayloadError::InvalidField {
-                field: "kline numeric field",
-            },
-        ));
-    };
+    let closed = kline.close_time < unix_now_ms().unwrap_or(kline.close_time);
     match Candle::from_ws(
         kline.open_time,
         kline.close_time,
@@ -485,7 +418,7 @@ fn decode_ws_payload(
         low,
         close,
         volume,
-        kline.closed,
+        closed,
     ) {
         Ok(candle) => DecodedFrame::Candle(candle),
         Err(source) => DecodedFrame::ProviderError(ProviderError::Domain { context, source }),
@@ -931,7 +864,7 @@ fn contextualize_websocket_configuration(
 }
 
 #[derive(Clone)]
-pub struct BinanceProvider {
+pub struct HyperliquidProvider {
     client: Client,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     base_url: Url,
@@ -943,19 +876,22 @@ pub struct BinanceProvider {
     live: LiveSupervisorConfig,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     ws_base_url: Option<String>,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    now_ms: Option<i64>,
 }
 
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[derive(Clone, Debug)]
-pub struct BinanceTestConfig {
+pub struct HyperliquidTestConfig {
     pub base_url: String,
     pub request_timeout: Duration,
     pub body_limit: usize,
     pub rate_limit_fallback: Duration,
+    pub now_ms: Option<i64>,
 }
 
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-impl BinanceTestConfig {
+impl HyperliquidTestConfig {
     #[must_use]
     pub fn loopback(base_url: impl Into<String>) -> Self {
         Self {
@@ -963,12 +899,13 @@ impl BinanceTestConfig {
             request_timeout: REST_REQUEST_TIMEOUT,
             body_limit: REST_BODY_LIMIT,
             rate_limit_fallback: RATE_LIMIT_FALLBACK,
+            now_ms: None,
         }
     }
 
     #[must_use]
-    pub fn with_websocket_base(self, base_url: impl Into<String>) -> BinanceLiveTestConfig {
-        BinanceLiveTestConfig {
+    pub fn with_websocket_base(self, base_url: impl Into<String>) -> HyperliquidLiveTestConfig {
+        HyperliquidLiveTestConfig {
             rest: self,
             ws_base_url: base_url.into(),
             live: LiveSupervisorConfig::default(),
@@ -978,13 +915,13 @@ impl BinanceTestConfig {
 
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[derive(Clone, Debug)]
-pub struct BinanceLiveTestConfig {
-    pub rest: BinanceTestConfig,
+pub struct HyperliquidLiveTestConfig {
+    pub rest: HyperliquidTestConfig,
     pub ws_base_url: String,
     pub live: LiveSupervisorConfig,
 }
 
-impl BinanceProvider {
+impl HyperliquidProvider {
     #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
     pub fn new(clock: Arc<dyn Clock>) -> Result<Self, ProviderError> {
         Self::build(
@@ -1001,12 +938,12 @@ impl BinanceProvider {
         base_url: impl AsRef<str>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, ProviderError> {
-        Self::new_test_with_config_and_clock(BinanceTestConfig::loopback(base_url.as_ref()), clock)
+        Self::new_test_with_config_and_clock(HyperliquidTestConfig::loopback(base_url.as_ref()), clock)
     }
 
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub fn new_test_with_config_and_clock(
-        config: BinanceTestConfig,
+        config: HyperliquidTestConfig,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, ProviderError> {
         let base_url = validate_loopback_base(&config.base_url)?;
@@ -1018,12 +955,13 @@ impl BinanceProvider {
             config.rate_limit_fallback,
             LiveSupervisorConfig::default(),
             None,
+            config.now_ms,
         )
     }
 
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub fn new_test_live(
-        config: BinanceLiveTestConfig,
+        config: HyperliquidLiveTestConfig,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, ProviderError> {
         let base_url = validate_loopback_base(&config.rest.base_url)?;
@@ -1036,6 +974,7 @@ impl BinanceProvider {
             config.rest.rate_limit_fallback,
             config.live,
             Some(config.ws_base_url),
+            config.rest.now_ms,
         )
     }
 
@@ -1052,6 +991,11 @@ impl BinanceProvider {
             not(feature = "production-transport")
         ))]
         ws_base_url: Option<String>,
+        #[cfg(all(
+            feature = "test-transport",
+            not(feature = "production-transport")
+        ))]
+        now_ms: Option<i64>,
     ) -> Result<Self, ProviderError> {
         if request_timeout.is_zero() || body_limit == 0 || rate_limit_fallback.is_zero() {
             return Err(ProviderError::Configuration(
@@ -1079,6 +1023,8 @@ impl BinanceProvider {
             live,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             ws_base_url,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            now_ms,
         })
     }
 
@@ -1089,6 +1035,7 @@ impl BinanceProvider {
         request: HistoryRequest,
         cancellation: CancellationToken,
     ) -> Result<Vec<Candle>, ProviderError> {
+        reject_unsupported_timeframe(timeframe)?;
         let context =
             ErrorContext::operation(ErrorOperation::History).with_market(instrument, timeframe);
         self.await_gate(&cancellation, &context).await?;
@@ -1099,29 +1046,27 @@ impl BinanceProvider {
         ))]
         {
             #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-            let mut url = Url::parse(production_rest_base(instrument.market()))
+            let mut url = Url::parse(production_rest_base())
                 .map_err(|_| ProviderError::Configuration("invalid production REST base URL"))?;
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             let mut url = self.base_url.clone();
-            url.set_path(klines_path(instrument.market()));
+            url.set_path(INFO_PATH);
             url.set_query(None);
-            let limit = request.limit().to_string();
-            let mut query = vec![
-                ("symbol", instrument.provider_symbol().to_owned()),
-                ("interval", timeframe.as_str().to_owned()),
-                ("limit", limit),
-            ];
-            if let Some(start_time) = request.start_time() {
-                query.push(("startTime", start_time.to_string()));
-            }
-            if let Some(end_time) = request.end_time() {
-                query.push(("endTime", end_time.to_string()));
-            }
+            let (start_time, end_time) = self.candle_window(timeframe, request)?;
+            let body = serde_json::json!({
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": instrument.provider_symbol(),
+                    "interval": timeframe.as_str(),
+                    "startTime": start_time,
+                    "endTime": end_time,
+                }
+            });
 
             let response = tokio::select! {
                 biased;
                 () = cancellation.cancelled() => return Err(cancelled(context.clone())),
-                result = self.client.get(url).query(&query).send() => result.map_err(|error| {
+                result = self.client.post(url).json(&body).send() => result.map_err(|error| {
                     if error.is_timeout() {
                         ProviderError::Timeout { context: context.clone(), kind: TimeoutKind::Request }
                     } else {
@@ -1131,7 +1076,7 @@ impl BinanceProvider {
             };
 
             let status = response.status();
-            if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::IM_A_TEAPOT {
+            if status == StatusCode::TOO_MANY_REQUESTS {
                 return self.handle_rate_limit(&response, context);
             }
             if status.is_server_error() {
@@ -1158,7 +1103,14 @@ impl BinanceProvider {
                 return Err(map_http_error(status, &bytes, context));
             }
             let bytes = read_capped(response, self.body_limit, &cancellation, &context).await?;
-            decode_klines(&bytes, request.limit(), context)
+            decode_candles(
+                &bytes,
+                request.kind(),
+                request.limit(),
+                instrument,
+                timeframe,
+                context,
+            )
         }
         #[cfg(all(feature = "production-transport", feature = "test-transport"))]
         {
@@ -1463,6 +1415,12 @@ impl BinanceProvider {
                     result = socket.send(payload.clone()) => result?,
                 }
             }
+        }
+        let subscribe = subscribe_message(&request.instrument, request.timeframe);
+        tokio::select! {
+            biased;
+            () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
+            result = socket.send(Message::Text(subscribe.into())) => result?,
         }
         let mut gate = self.gate_snapshot.clone();
         let first_deadline = checked_deadline(self.clock.now(), self.live.first_kline_timeout)
@@ -2047,13 +2005,57 @@ impl BinanceProvider {
     }
 
     pub fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
-        if spec.provider().as_str() != "binance" || spec.venue().is_some() {
+        if spec.provider().as_str() != "hyperliquid" {
             return Err(ProviderError::Configuration(
-                "instrument is not valid for Binance",
+                "instrument is not valid for Hyperliquid",
             ));
         }
-        canonicalize_instrument(spec)
-            .map_err(|_| ProviderError::Configuration("instrument is not valid for Binance"))
+        if spec.venue().is_some() && spec.market() != Market::Perpetual {
+            return Err(ProviderError::Configuration(
+                "HIP-3 builder DEX markets are perpetual-only; use `hyperliquid:<dex>:<coin>.p`",
+            ));
+        }
+        remap_instrument(spec)
+    }
+
+    fn candle_window(
+        &self,
+        timeframe: Timeframe,
+        request: HistoryRequest,
+    ) -> Result<(i64, i64), ProviderError> {
+        let interval = interval_ms(timeframe)?;
+        let span = i64::from(request.limit()).saturating_mul(interval);
+        match request.kind() {
+            HistoryRequestKind::Latest => {
+                let end = self.unix_now_ms()?;
+                let start = end.saturating_sub(span).saturating_add(1);
+                Ok((start, end))
+            }
+            HistoryRequestKind::Older => {
+                let end = request.end_time().ok_or(ProviderError::Invariant(
+                    "older history request is missing endTime",
+                ))?;
+                Ok((end.saturating_sub(span).saturating_add(1), end))
+            }
+            HistoryRequestKind::Gap => {
+                let start = request.start_time().ok_or(ProviderError::Invariant(
+                    "gap history request is missing startTime",
+                ))?;
+                let end = request.end_time().ok_or(ProviderError::Invariant(
+                    "gap history request is missing endTime",
+                ))?;
+                let page_end = start.saturating_add(span).saturating_sub(1);
+                Ok((start, end.min(page_end)))
+            }
+        }
+    }
+
+    fn unix_now_ms(&self) -> Result<i64, ProviderError> {
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        if let Some(now_ms) = self.now_ms {
+            return Ok(now_ms);
+        }
+        unix_now_ms()
     }
 
     #[must_use]
@@ -2604,12 +2606,12 @@ fn is_terminal_live_error(error: &ProviderError) -> bool {
     )
 }
 
-impl MarketDataProvider for BinanceProvider {
+impl MarketDataProvider for HyperliquidProvider {
     fn id(&self) -> ProviderId {
-        ProviderId::new("binance").expect("static provider id")
+        ProviderId::new("hyperliquid").expect("static provider id")
     }
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
-        BinanceProvider::canonicalize(self, spec)
+        HyperliquidProvider::canonicalize(self, spec)
     }
     fn history<'a>(
         &'a self,
@@ -2618,7 +2620,7 @@ impl MarketDataProvider for BinanceProvider {
         request: HistoryRequest,
         cancellation: CancellationToken,
     ) -> ProviderFuture<'a, Vec<Candle>> {
-        Box::pin(BinanceProvider::history(
+        Box::pin(HyperliquidProvider::history(
             self,
             instrument,
             timeframe,
@@ -2628,6 +2630,7 @@ impl MarketDataProvider for BinanceProvider {
     }
     fn open_live<'a>(&'a self, request: LiveRequest) -> ProviderFuture<'a, LiveFeed> {
         Box::pin(async move {
+            reject_unsupported_timeframe(request.timeframe)?;
             self.live.validate()?;
             let physical_capacity = self
                 .live
@@ -2689,7 +2692,7 @@ impl MarketDataProvider for BinanceProvider {
         })
     }
     fn rate_gate(&self) -> RateGateSnapshot {
-        BinanceProvider::rate_gate(self)
+        HyperliquidProvider::rate_gate(self)
     }
 }
 
@@ -2744,203 +2747,122 @@ async fn read_capped(
     Ok(body)
 }
 
-struct RawKline(
-    Value,
-    Value,
-    Value,
-    Value,
-    Value,
-    Value,
-    Value,
-    Value,
-    Value,
-    Value,
-    Value,
-    Value,
-);
-struct BoundedRowsVisitor {
-    limit: usize,
-}
-
-impl<'de> Visitor<'de> for BoundedRowsVisitor {
-    type Value = Vec<Value>;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a bounded array of Binance kline rows")
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut rows = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(self.limit));
-        while rows.len() < self.limit {
-            let Some(row) = sequence.next_element::<Value>()? else {
-                return Ok(rows);
-            };
-            rows.push(row);
-        }
-        if sequence.next_element::<IgnoredAny>()?.is_some() {
-            return Err(serde::de::Error::custom("kline row limit exceeded"));
-        }
-        Ok(rows)
-    }
-}
-fn decode_klines(
+fn decode_candles(
     bytes: &[u8],
+    kind: HistoryRequestKind,
     requested_limit: u16,
+    instrument: &Instrument,
+    timeframe: Timeframe,
     context: ErrorContext,
 ) -> Result<Vec<Candle>, ProviderError> {
-    if bytes
-        .iter()
-        .copied()
-        .find(|byte| !byte.is_ascii_whitespace())
-        != Some(b'[')
-    {
-        return if serde_json::from_slice::<Value>(bytes).is_ok() {
-            Err(payload(&context, PayloadError::ExpectedArray))
-        } else {
-            Err(payload(&context, PayloadError::MalformedJson))
-        };
-    }
-    let limit = usize::from(requested_limit).min(1000);
-    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let rows =
-        serde::de::Deserializer::deserialize_seq(&mut deserializer, BoundedRowsVisitor { limit })
-            .map_err(|_| payload(&context, PayloadError::MalformedJson))?;
-    deserializer
-        .end()
+    let value: Value = serde_json::from_slice(bytes)
         .map_err(|_| payload(&context, PayloadError::MalformedJson))?;
-    let mut candles = Vec::with_capacity(rows.len());
+    if let Some(error) = info_error_text(&value) {
+        return Err(invalid_hyperliquid_symbol(context, error));
+    }
+    let Some(rows) = value.as_array() else {
+        return Err(payload(&context, PayloadError::ExpectedArray));
+    };
+    let limit = usize::from(requested_limit).min(1000);
+    let mut candles = Vec::with_capacity(rows.len().min(limit));
     for row in rows {
-        let fields = match row {
-            Value::Array(fields) => fields,
-            _ => {
-                return Err(payload(
-                    &context,
-                    PayloadError::WrongArity {
-                        expected: 12,
-                        actual: 0,
-                    },
-                ));
-            }
-        };
-        let actual = fields.len();
-        let [f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11]: [Value; 12] =
-            fields.try_into().map_err(|_| {
-                payload(
-                    &context,
-                    PayloadError::WrongArity {
-                        expected: 12,
-                        actual,
-                    },
-                )
-            })?;
-        let raw = RawKline(f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11);
-        let open_time = integer_field(&raw.0, "open_time", &context)?;
-        let open = decimal_field(&raw.1, "open", &context)?;
-        let high = decimal_field(&raw.2, "high", &context)?;
-        let low = decimal_field(&raw.3, "low", &context)?;
-        let close = decimal_field(&raw.4, "close", &context)?;
-        let volume = decimal_field(&raw.5, "base_volume", &context)?;
-        let close_time = integer_field(&raw.6, "close_time", &context)?;
-        validate_ignored_fields(&raw, &context)?;
+        let candle: HlCandle = serde_json::from_value(row.clone())
+            .map_err(|_| payload(&context, PayloadError::MalformedProtocol))?;
+        candle_market_matches(&candle, instrument, timeframe, &context, "REST")?;
+        let (open, high, low, close, volume) = candle_ohlcv(&candle, &context)?;
         candles.push(
-            Candle::from_rest(open_time, close_time, open, high, low, close, volume).map_err(
-                |source| ProviderError::Domain {
-                    context: context.clone(),
-                    source,
-                },
-            )?,
+            Candle::from_rest(
+                candle.open_time,
+                candle.close_time,
+                open,
+                high,
+                low,
+                close,
+                volume,
+            )
+            .map_err(|source| ProviderError::Domain {
+                context: context.clone(),
+                source,
+            })?,
         );
+    }
+    if candles.len() > limit {
+        match kind {
+            HistoryRequestKind::Latest | HistoryRequestKind::Older => {
+                let drop = candles.len() - limit;
+                candles.drain(..drop);
+            }
+            HistoryRequestKind::Gap => candles.truncate(limit),
+        }
     }
     Ok(candles)
 }
 
-fn validate_ignored_fields(raw: &RawKline, context: &ErrorContext) -> Result<(), ProviderError> {
-    nonnegative_decimal_field(&raw.7, "quote_volume", context)?;
-    nonnegative_integer_field(&raw.8, "trade_count", context)?;
-    nonnegative_decimal_field(&raw.9, "taker_buy_base_volume", context)?;
-    nonnegative_decimal_field(&raw.10, "taker_buy_quote_volume", context)?;
-    if !raw.11.is_string() {
-        return Err(payload(
-            context,
-            PayloadError::InvalidField { field: "ignore" },
-        ));
+fn candle_market_matches(
+    candle: &HlCandle,
+    instrument: &Instrument,
+    timeframe: Timeframe,
+    context: &ErrorContext,
+    transport: &'static str,
+) -> Result<(), ProviderError> {
+    if candle.symbol != instrument.provider_symbol() || candle.interval != timeframe.as_str() {
+        return Err(ProviderError::Protocol {
+            context: context.clone(),
+            detail: match transport {
+                "REST" => "REST candle market does not match request",
+                _ => "WebSocket candle market does not match subscription",
+            },
+        });
     }
     Ok(())
 }
 
-fn integer_field(
-    value: &Value,
-    field: &'static str,
+fn candle_ohlcv(
+    candle: &HlCandle,
     context: &ErrorContext,
-) -> Result<i64, ProviderError> {
+) -> Result<(f64, f64, f64, f64, f64), ProviderError> {
+    json_decimal(&candle.open)
+        .zip(json_decimal(&candle.high))
+        .zip(json_decimal(&candle.low))
+        .zip(json_decimal(&candle.close))
+        .zip(json_decimal(&candle.volume))
+        .map(|((((open, high), low), close), volume)| (open, high, low, close, volume))
+        .ok_or_else(|| {
+            payload(
+                context,
+                PayloadError::InvalidField {
+                    field: "candle numeric field",
+                },
+            )
+        })
+}
+
+fn info_error_text(value: &Value) -> Option<&str> {
     value
-        .as_i64()
-        .ok_or_else(|| payload(context, PayloadError::InvalidField { field }))
+        .get("error")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("msg").and_then(Value::as_str))
 }
 
-fn decimal_field(
-    value: &Value,
-    field: &'static str,
-    context: &ErrorContext,
-) -> Result<f64, ProviderError> {
-    value
-        .as_str()
-        .and_then(|text| text.parse::<f64>().ok())
-        .filter(|number| number.is_finite())
-        .ok_or_else(|| payload(context, PayloadError::InvalidField { field }))
-}
-
-fn nonnegative_decimal_field(
-    value: &Value,
-    field: &'static str,
-    context: &ErrorContext,
-) -> Result<f64, ProviderError> {
-    decimal_field(value, field, context).and_then(|number| {
-        (number >= 0.0)
-            .then_some(number)
-            .ok_or_else(|| payload(context, PayloadError::InvalidField { field }))
-    })
-}
-
-fn nonnegative_integer_field(
-    value: &Value,
-    field: &'static str,
-    context: &ErrorContext,
-) -> Result<i64, ProviderError> {
-    integer_field(value, field, context).and_then(|number| {
-        (number >= 0)
-            .then_some(number)
-            .ok_or_else(|| payload(context, PayloadError::InvalidField { field }))
-    })
+fn invalid_hyperliquid_symbol(context: ErrorContext, message: &str) -> ProviderError {
+    ProviderError::InvalidSymbol {
+        context,
+        code: 0,
+        message: SanitizedMessage::new(message),
+    }
 }
 
 fn map_http_error(status: StatusCode, bytes: &[u8], context: ErrorContext) -> ProviderError {
     let provider_error = serde_json::from_slice::<Value>(bytes).ok();
-    let code = provider_error
-        .as_ref()
-        .and_then(|value| value.get("code"))
-        .and_then(Value::as_i64);
-    let message = provider_error
-        .as_ref()
-        .and_then(|value| value.get("msg"))
-        .and_then(Value::as_str)
-        .map(SanitizedMessage::new);
-    if status == StatusCode::BAD_REQUEST && code == Some(-1121) {
-        return ProviderError::InvalidSymbol {
-            context,
-            code: -1121,
-            message: message.unwrap_or(SanitizedMessage::InvalidSymbol),
-        };
+    if let Some(message) = provider_error.as_ref().and_then(info_error_text) {
+        return invalid_hyperliquid_symbol(context, message);
     }
     if status.is_client_error() {
         ProviderError::ClientStatus {
             context,
             status: status.as_u16(),
-            code,
-            message,
+            code: None,
+            message: None,
         }
     } else {
         ProviderError::ServerStatus {
@@ -3020,4 +2942,112 @@ fn validate_loopback_ws_base(value: &str) -> Result<Url, ProviderError> {
         ));
     }
     Ok(url)
+}
+
+fn reject_unsupported_timeframe(timeframe: Timeframe) -> Result<(), ProviderError> {
+    if matches!(timeframe, Timeframe::Second1 | Timeframe::Hour6) {
+        return Err(ProviderError::Configuration(UNSUPPORTED_TIMEFRAME));
+    }
+    Ok(())
+}
+
+fn interval_ms(timeframe: Timeframe) -> Result<i64, ProviderError> {
+    reject_unsupported_timeframe(timeframe)?;
+    Ok(match timeframe {
+        Timeframe::Minute1 => 60_000,
+        Timeframe::Minute3 => 180_000,
+        Timeframe::Minute5 => 300_000,
+        Timeframe::Minute15 => 900_000,
+        Timeframe::Minute30 => 1_800_000,
+        Timeframe::Hour1 => 3_600_000,
+        Timeframe::Hour2 => 7_200_000,
+        Timeframe::Hour4 => 14_400_000,
+        Timeframe::Hour8 => 28_800_000,
+        Timeframe::Hour12 => 43_200_000,
+        Timeframe::Day1 => 86_400_000,
+        Timeframe::Day3 => 259_200_000,
+        Timeframe::Week1 => 604_800_000,
+        Timeframe::Month1 => 31 * 86_400_000,
+        Timeframe::Second1 | Timeframe::Hour6 => {
+            return Err(ProviderError::Configuration(UNSUPPORTED_TIMEFRAME));
+        }
+    })
+}
+
+fn subscribe_message(instrument: &Instrument, timeframe: Timeframe) -> String {
+    serde_json::json!({
+        "method": "subscribe",
+        "subscription": {
+            "type": "candle",
+            "coin": instrument.provider_symbol(),
+            "interval": timeframe.as_str(),
+        }
+    })
+    .to_string()
+}
+
+fn unix_now_ms() -> Result<i64, ProviderError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(ProviderError::Invariant("unix epoch clock is unavailable"))
+}
+
+fn json_decimal(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64().filter(|value| value.is_finite()),
+        Value::String(text) => text.parse::<f64>().ok().filter(|value| value.is_finite()),
+        _ => None,
+    }
+}
+
+fn remap_instrument(spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
+    let local = canonicalize_instrument(spec).map_err(|_| {
+        ProviderError::Configuration("instrument is not valid for Hyperliquid")
+    })?;
+    if let Some(dex) = spec.venue() {
+        return Instrument::new(
+            spec.provider().clone(),
+            Market::Perpetual,
+            local.base(),
+            local.quote(),
+            format!("{dex}:{}", local.base()),
+        )
+        .map_err(|_| ProviderError::Configuration("instrument is not valid for Hyperliquid"));
+    }
+    if spec.market() == Market::Perpetual {
+        return Instrument::new(
+            spec.provider().clone(),
+            Market::Perpetual,
+            local.base(),
+            local.quote(),
+            local.base(),
+        )
+        .map_err(|_| ProviderError::Configuration("instrument is not valid for Hyperliquid"));
+    }
+    if is_spot_index_token(local.base()) {
+        return Instrument::new(
+            spec.provider().clone(),
+            Market::Spot,
+            local.base(),
+            local.quote(),
+            local.base(),
+        )
+        .map_err(|_| ProviderError::Configuration("instrument is not valid for Hyperliquid"));
+    }
+    let (display_base, wire) = match (local.base(), local.quote()) {
+        ("BTC" | "UBTC", "USDC") => ("UBTC", SPOT_UBTC_INDEX.to_owned()),
+        ("HYPE", "USDC") => ("HYPE", SPOT_HYPE_INDEX.to_owned()),
+        ("PURR", "USDC") => ("PURR", "PURR/USDC".to_owned()),
+        (base, quote) => (base, format!("{base}/{quote}")),
+    };
+    Instrument::new(
+        spec.provider().clone(),
+        Market::Spot,
+        display_base,
+        local.quote(),
+        wire,
+    )
+    .map_err(|_| ProviderError::Configuration("instrument is not valid for Hyperliquid"))
 }

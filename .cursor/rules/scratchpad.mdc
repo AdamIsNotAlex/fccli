@@ -1,0 +1,24 @@
+---
+description: Working scratchpad for the current task
+alwaysApply: true
+---
+
+# Scratchpad
+
+## Task
+
+Fix Hyperliquid review items: history-window bug and leftover Binance decode code.
+
+## Plan
+
+- [X] Cap Latest/Older/Gap windows so they cannot request more than `limit` opens
+- [X] Shared `HlCandle` decode; drop `WsEnvelope` / Binance 12-tuple leftovers
+- [X] Truncate extra REST rows instead of MalformedJson
+- [X] Map HTTP 200 `{"error":...}` and 4xx error text to InvalidSymbol
+- [X] Tests for window, truncate, and error object
+- [X] Phase 6 wrap-up / Phase 7 summary
+
+## Lessons
+
+- Hyperliquid `candleSnapshot` has no server `limit`; a Binance-style "extra row is malformed" decoder will fail Latest(500) and long gap-sync.
+- WS decode must inspect `channel` on a generic JSON value before requiring candle fields.

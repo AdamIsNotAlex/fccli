@@ -1,6 +1,7 @@
 //! Provider-neutral market-data interfaces and ownership primitives.
 
 pub mod binance;
+pub mod hyperliquid;
 
 use futures_util::Stream;
 use std::{
@@ -43,6 +44,7 @@ pub trait MarketDataProvider: Send + Sync {
 #[derive(Clone)]
 pub struct ProviderRegistry {
     binance: Arc<binance::BinanceProvider>,
+    hyperliquid: Option<Arc<hyperliquid::HyperliquidProvider>>,
     #[cfg(feature = "test-transport")]
     injected: Option<Arc<dyn MarketDataProvider>>,
 }
@@ -52,9 +54,16 @@ impl ProviderRegistry {
     pub fn new(binance: Arc<binance::BinanceProvider>) -> Self {
         Self {
             binance,
+            hyperliquid: None,
             #[cfg(feature = "test-transport")]
             injected: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_hyperliquid(mut self, provider: Arc<hyperliquid::HyperliquidProvider>) -> Self {
+        self.hyperliquid = Some(provider);
+        self
     }
 
     #[cfg(feature = "test-transport")]
@@ -65,6 +74,7 @@ impl ProviderRegistry {
     ) -> Self {
         Self {
             binance,
+            hyperliquid: None,
             injected: Some(provider),
         }
     }
@@ -78,6 +88,9 @@ impl ProviderRegistry {
         }
         match id.as_str() {
             "binance" => Ok(self.binance.clone()),
+            "hyperliquid" => self.hyperliquid.clone().map(|provider| provider as _).ok_or(
+                ProviderError::Configuration("unsupported market-data provider"),
+            ),
             _ => Err(ProviderError::Configuration(
                 "unsupported market-data provider",
             )),

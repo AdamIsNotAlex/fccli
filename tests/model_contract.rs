@@ -95,6 +95,7 @@ fn validated_instrument_values_expose_only_immutable_derived_views() {
     assert_eq!(spec.provider(), &provider);
     assert_eq!(spec.base(), "BTC");
     assert_eq!(spec.quote(), Some("USDT"));
+    assert_eq!(spec.venue(), None);
 
     let instrument = Instrument::new(
         provider.clone(),
