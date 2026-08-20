@@ -20,6 +20,30 @@ use crate::{
 };
 
 pub const SNAPSHOT_HISTORY_LIMIT: u16 = 500;
+
+fn history_request_limit(
+    provider: &dyn MarketDataProvider,
+    market: crate::model::Market,
+    timeframe: Timeframe,
+) -> Result<u16, crate::error::ProviderError> {
+    let capabilities = provider.capabilities();
+    if !capabilities.markets.contains(&market) {
+        return Err(crate::error::ProviderError::Configuration(
+            "provider does not support market",
+        ));
+    }
+    if !capabilities.timeframes.contains(&timeframe) {
+        return Err(crate::error::ProviderError::Configuration(
+            "provider does not support timeframe",
+        ));
+    }
+    if capabilities.history_page_limit == 0 {
+        return Err(crate::error::ProviderError::Configuration(
+            "provider history page limit must be non-zero",
+        ));
+    }
+    Ok(SNAPSHOT_HISTORY_LIMIT.min(capabilities.history_page_limit))
+}
 pub const NON_TTY_SNAPSHOT_SIZE: Size = Size::new(120, 36);
 
 /// Output capability metadata supplied by the caller after its own capability detection.
@@ -65,6 +89,7 @@ pub async fn run_snapshot(
     if output_target == SnapshotOutputTarget::NonTty && render_policy != RenderPolicy::StyleFree {
         return Err(RenderError::Invariant("non-TTY snapshot output must be style-free").into());
     }
+    let history_limit = history_request_limit(provider, instrument_spec.market(), timeframe)?;
 
     let effective_size = output_target.effective_size();
     let frame = Rect::new(0, 0, effective_size.width, effective_size.height);
@@ -81,7 +106,7 @@ pub async fn run_snapshot(
         return Err(RenderError::InsufficientSpace.into());
     }
     let instrument = provider.canonicalize(instrument_spec)?;
-    let request = HistoryRequest::latest(SNAPSHOT_HISTORY_LIMIT)?;
+    let request = HistoryRequest::latest(history_limit)?;
     let candles = provider
         .history(&instrument, timeframe, request, cancellation)
         .await?;

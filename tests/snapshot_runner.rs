@@ -1,6 +1,9 @@
 use std::{
     io::{self, Write},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use fccli::{
@@ -11,8 +14,8 @@ use fccli::{
         RateGateState, Timeframe,
     },
     provider::{
-        LiveFeed, LiveRequest, MarketDataProvider, ProviderFuture, RateGateSender,
-        RateGateSnapshot, rate_gate_channel,
+        LiveFeed, LiveRequest, MarketDataProvider, ProviderCapabilities, ProviderFuture,
+        RateGateSender, RateGateSnapshot, rate_gate_channel,
     },
     snapshot::{NON_TTY_SNAPSHOT_SIZE, SnapshotOutputTarget, run_snapshot},
 };
@@ -26,6 +29,8 @@ struct FakeProvider {
     wait_for_cancellation: bool,
     _gate_sender: RateGateSender,
     gate: RateGateSnapshot,
+    capabilities: ProviderCapabilities,
+    canonicalize_calls: AtomicUsize,
 }
 
 impl FakeProvider {
@@ -38,7 +43,18 @@ impl FakeProvider {
             wait_for_cancellation: false,
             _gate_sender: gate_sender,
             gate,
+            capabilities: ProviderCapabilities {
+                markets: &[fccli::model::Market::Spot, fccli::model::Market::Perpetual],
+                timeframes: &Timeframe::ALL,
+                history_page_limit: 1000,
+            },
+            canonicalize_calls: AtomicUsize::new(0),
         }
+    }
+
+    fn with_capabilities(mut self, capabilities: ProviderCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 }
 
@@ -46,8 +62,12 @@ impl MarketDataProvider for FakeProvider {
     fn id(&self) -> ProviderId {
         ProviderId::new("fake").expect("valid provider")
     }
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.capabilities
+    }
 
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
+        self.canonicalize_calls.fetch_add(1, Ordering::SeqCst);
         Instrument::new(
             spec.provider().clone(),
             spec.market(),
@@ -91,6 +111,79 @@ impl MarketDataProvider for FakeProvider {
 
     fn rate_gate(&self) -> RateGateSnapshot {
         self.gate.clone()
+    }
+}
+
+#[tokio::test]
+async fn snapshot_caps_desired_500_to_provider_maximum() {
+    for (maximum, expected) in [(1_000, 500), (7, 7)] {
+        let provider = FakeProvider::new(candles(1)).with_capabilities(ProviderCapabilities {
+            markets: &[fccli::model::Market::Spot],
+            timeframes: &[Timeframe::Minute1],
+            history_page_limit: maximum,
+        });
+        let mut output = Vec::new();
+        run_snapshot(
+            &provider,
+            &spec(),
+            Timeframe::Minute1,
+            SnapshotOutputTarget::NonTty,
+            RenderPolicy::StyleFree,
+            CancellationToken::new(),
+            &mut output,
+        )
+        .await
+        .expect("supported snapshot");
+        assert_eq!(provider.requests.lock().unwrap()[0].limit(), expected);
+    }
+}
+
+#[tokio::test]
+async fn snapshot_rejects_capabilities_before_layout_output_or_provider_io() {
+    for capabilities in [
+        ProviderCapabilities {
+            markets: &[fccli::model::Market::Perpetual],
+            timeframes: &[Timeframe::Minute1],
+            history_page_limit: 500,
+        },
+        ProviderCapabilities {
+            markets: &[fccli::model::Market::Spot],
+            timeframes: &[Timeframe::Hour1],
+            history_page_limit: 500,
+        },
+        ProviderCapabilities {
+            markets: &[fccli::model::Market::Spot],
+            timeframes: &[Timeframe::Minute1],
+            history_page_limit: 0,
+        },
+    ] {
+        let provider = FakeProvider::new(candles(1)).with_capabilities(capabilities);
+        for output_target in [
+            SnapshotOutputTarget::NonTty,
+            SnapshotOutputTarget::Tty {
+                physical_size: Size::new(1, 1),
+            },
+        ] {
+            let mut output = Vec::new();
+            let error = run_snapshot(
+                &provider,
+                &spec(),
+                Timeframe::Minute1,
+                output_target,
+                RenderPolicy::StyleFree,
+                CancellationToken::new(),
+                &mut output,
+            )
+            .await
+            .expect_err("unsupported capability must fail");
+            assert!(matches!(
+                error,
+                AppError::Provider(ProviderError::Configuration(_))
+            ));
+            assert!(output.is_empty());
+        }
+        assert!(provider.requests.lock().unwrap().is_empty());
+        assert_eq!(provider.canonicalize_calls.load(Ordering::SeqCst), 0);
     }
 }
 

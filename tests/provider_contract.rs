@@ -7,6 +7,7 @@ use std::{
 };
 
 use fccli::{
+    cli::canonicalize_instrument,
     clock::{Clock, ManualClock, SleepOutcome, checked_deadline, sleep_until_or_cancelled},
     error::ProviderError,
     model::{
@@ -15,10 +16,11 @@ use fccli::{
     },
     provider::{
         AcceptedWatermarkUpdateError, ExpectationUpdate, LiveFeed, LiveRequest, MarketDataProvider,
-        MarketEventStream, ProcessBlocker, ProducerCompletion, ProviderFuture, RateGateSnapshot,
-        RateGateState, ReconcileAck, ReconcileAckPublishError, ReconcileAckUpdate,
-        ReconcileExpectation, ReconcileExpectationError, WatermarkUpdate,
-        accepted_watermark_channel, reconcile_ack_channel,
+        MarketEventStream, ProcessBlocker, ProducerCompletion, ProviderCapabilities,
+        ProviderFuture, ProviderRegistry, RateGateSnapshot, RateGateState, ReconcileAck,
+        ReconcileAckPublishError, ReconcileAckUpdate, ReconcileExpectation,
+        ReconcileExpectationError, WatermarkUpdate, accepted_watermark_channel,
+        binance::BinanceProvider, hyperliquid::HyperliquidProvider, reconcile_ack_channel,
     },
 };
 use futures_util::{StreamExt, stream};
@@ -49,6 +51,26 @@ fn candle(open_time: i64, closed: bool) -> Candle {
     .expect("valid candle")
 }
 
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+fn binance_provider(clock: Arc<dyn Clock>) -> Result<BinanceProvider, ProviderError> {
+    BinanceProvider::new(clock)
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+fn binance_provider(clock: Arc<dyn Clock>) -> Result<BinanceProvider, ProviderError> {
+    BinanceProvider::new_test("http://127.0.0.1:1", clock)
+}
+
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+fn hyperliquid_provider(clock: Arc<dyn Clock>) -> Result<HyperliquidProvider, ProviderError> {
+    HyperliquidProvider::new(clock)
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+fn hyperliquid_provider(clock: Arc<dyn Clock>) -> Result<HyperliquidProvider, ProviderError> {
+    HyperliquidProvider::new_test("http://127.0.0.1:1", clock)
+}
+
 #[derive(Clone)]
 struct FakeProvider {
     gate: RateGateSnapshot,
@@ -57,6 +79,13 @@ struct FakeProvider {
 impl MarketDataProvider for FakeProvider {
     fn id(&self) -> ProviderId {
         ProviderId::new("fake").expect("valid provider")
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            markets: &[Market::Spot],
+            timeframes: &[Timeframe::Minute1],
+            history_page_limit: 1000,
+        }
     }
 
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
@@ -122,6 +151,124 @@ impl MarketDataProvider for FakeProvider {
 }
 
 fn assert_object_safe(_: Arc<dyn MarketDataProvider>) {}
+
+#[test]
+fn capabilities_are_public_data_support_and_nonzero_history_maximum_only() {
+    let (gate_tx, gate) = fccli::provider::rate_gate_channel(RateGateState::Open);
+    let provider = FakeProvider { gate };
+    let ProviderCapabilities {
+        markets,
+        timeframes,
+        history_page_limit,
+    } = provider.capabilities();
+    assert_eq!(markets, &[Market::Spot]);
+    assert_eq!(timeframes, &[Timeframe::Minute1]);
+    assert_ne!(history_page_limit, 0);
+    drop(gate_tx);
+}
+
+#[test]
+fn real_provider_capabilities_match_public_support_contract() {
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+    let binance = binance_provider(Arc::clone(&clock)).expect("Binance provider");
+    let binance = binance.capabilities();
+    assert_eq!(binance.timeframes, &Timeframe::ALL);
+    assert!(!binance.markets.is_empty());
+    assert_ne!(binance.history_page_limit, 0);
+
+    let hyperliquid = hyperliquid_provider(clock).expect("Hyperliquid provider");
+    let hyperliquid = hyperliquid.capabilities();
+    assert!(!hyperliquid.markets.is_empty());
+    assert_ne!(hyperliquid.history_page_limit, 0);
+    assert!(!hyperliquid.timeframes.contains(&Timeframe::Second1));
+    assert!(!hyperliquid.timeframes.contains(&Timeframe::Hour6));
+    for supported in [
+        Timeframe::Minute1,
+        Timeframe::Hour1,
+        Timeframe::Day1,
+        Timeframe::Month1,
+    ] {
+        assert!(hyperliquid.timeframes.contains(&supported));
+    }
+}
+
+#[test]
+fn registry_registers_two_providers_and_supports_borrowed_lookup() {
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+    let binance: Arc<dyn MarketDataProvider> =
+        Arc::new(binance_provider(Arc::clone(&clock)).expect("Binance provider"));
+    let hyperliquid: Arc<dyn MarketDataProvider> =
+        Arc::new(hyperliquid_provider(clock).expect("Hyperliquid provider"));
+    let registry = ProviderRegistry::new([Arc::clone(&binance), Arc::clone(&hyperliquid)])
+        .expect("unique providers");
+
+    let binance_id = ProviderId::new("binance").expect("provider id");
+    let selected = registry.get(&binance_id).expect("registered Binance");
+    assert!(Arc::ptr_eq(&selected, &binance));
+    let hyperliquid_id = ProviderId::new("hyperliquid").expect("provider id");
+    assert!(Arc::ptr_eq(
+        &registry
+            .get(&hyperliquid_id)
+            .expect("registered Hyperliquid"),
+        &hyperliquid,
+    ));
+}
+
+#[test]
+fn registry_rejects_duplicate_ids_and_accepts_an_ordinary_test_provider() {
+    let (first_gate_tx, first_gate) = fccli::provider::rate_gate_channel(RateGateState::Open);
+    let (duplicate_gate_tx, duplicate_gate) =
+        fccli::provider::rate_gate_channel(RateGateState::Open);
+    let first: Arc<dyn MarketDataProvider> = Arc::new(FakeProvider { gate: first_gate });
+    let duplicate: Arc<dyn MarketDataProvider> = Arc::new(FakeProvider {
+        gate: duplicate_gate,
+    });
+
+    assert!(matches!(
+        ProviderRegistry::new([Arc::clone(&first), Arc::clone(&duplicate)]),
+        Err(ProviderError::Configuration(
+            "duplicate market-data provider"
+        ))
+    ));
+
+    let mut registry = ProviderRegistry::new([Arc::clone(&first)]).expect("unique fake provider");
+    assert!(matches!(
+        registry.register(duplicate),
+        Err(ProviderError::Configuration(
+            "duplicate market-data provider"
+        ))
+    ));
+    let fake_id = ProviderId::new("fake").expect("provider id");
+    assert!(Arc::ptr_eq(
+        &registry.get(&fake_id).expect("registered fake provider"),
+        &first,
+    ));
+    drop((first_gate_tx, duplicate_gate_tx));
+}
+
+#[test]
+fn canonicalization_metadata_does_not_register_a_transport() {
+    let registry = ProviderRegistry::new(std::iter::empty::<Arc<dyn MarketDataProvider>>())
+        .expect("empty registry");
+    let okx_id = ProviderId::new("okx").expect("provider id");
+    let specification = InstrumentSpec::new(okx_id.clone(), "btc", None::<String>)
+        .expect("known provider specification");
+    let instrument = canonicalize_instrument(&specification).expect("metadata canonicalization");
+    assert_eq!(instrument.quote(), "USDT");
+    assert!(matches!(
+        registry.get(&okx_id),
+        Err(ProviderError::Configuration(
+            "unsupported market-data provider"
+        ))
+    ));
+    let unknown_id = ProviderId::new("unknown").expect("provider id");
+    assert!(matches!(
+        registry.get(&unknown_id),
+        Err(ProviderError::Configuration(
+            "unsupported market-data provider"
+        ))
+    ));
+}
 
 #[tokio::test]
 async fn fake_provider_is_object_safe_and_constructs_exact_event_payloads() {

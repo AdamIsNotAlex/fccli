@@ -26,13 +26,13 @@ use fccli::{
     error::{AppError, ErrorContext, ErrorOperation, ProviderError, RenderError, TerminalError},
     model::{
         Candle, ConnectionStatus, GapGeneration, HistoryRequest, HistoryRequestKind, Instrument,
-        InstrumentSpec, MarketEvent, MonoInstant, ProcessBlocker, ProviderId, RateGateState,
-        ReplayRevision, Timeframe,
+        InstrumentSpec, Market, MarketEvent, MonoInstant, ProcessBlocker, ProviderId,
+        RateGateState, ReplayRevision, Timeframe,
     },
     provider::{
         CancellationToken, LiveFeed, LiveRequest, MarketDataProvider, MarketEventStream,
         ProviderFuture, ProviderRegistry, RateGateSender, RateGateSnapshot, ReconcileAck,
-        binance::BinanceProvider, rate_gate_channel,
+        rate_gate_channel,
     },
     terminal::TerminalDriver,
 };
@@ -339,6 +339,38 @@ fn switch_then_quit_input(targets: &[&str]) -> Box<dyn TerminalInput> {
     Box::new(ScriptedTerminalInput::with_delays(events))
 }
 
+struct SupersedingSwitchInput {
+    events: VecDeque<Event>,
+    second_switch_offset: usize,
+    emitted: usize,
+    requests: Arc<Mutex<Vec<HistoryRequest>>>,
+    observations: Arc<Mutex<Vec<EpochObservation>>>,
+}
+
+impl TerminalInput for SupersedingSwitchInput {
+    fn poll(&mut self, _timeout: Duration) -> std::io::Result<TerminalInputPoll> {
+        if self.emitted == self.second_switch_offset && self.requests.acquire().len() < 2 {
+            return Ok(TerminalInputPoll::Idle);
+        }
+        if let Some(event) = self.events.pop_front() {
+            self.emitted += 1;
+            return Ok(TerminalInputPoll::Event(event));
+        }
+        if self.observations.acquire().iter().any(|observation| {
+            matches!(
+                observation.snapshot.footer,
+                FooterPresentation::Error { .. }
+            )
+        }) {
+            return Ok(TerminalInputPoll::Event(key(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+            )));
+        }
+        Ok(TerminalInputPoll::Idle)
+    }
+}
+
 fn run_with_observations(
     provider: Arc<FakeProvider>,
     input: Box<dyn TerminalInput>,
@@ -595,6 +627,7 @@ struct FakeProvider {
     history_pages: Mutex<VecDeque<Result<Vec<Candle>, ProviderError>>>,
     events: Mutex<Option<Vec<Result<MarketEvent, ProviderError>>>>,
     requests: Arc<Mutex<Vec<HistoryRequest>>>,
+    history_calls: Arc<Mutex<Vec<(String, Timeframe, HistoryRequest)>>>,
     acknowledgements: Arc<Mutex<Vec<ReconcileAck>>>,
     clock: Arc<dyn Clock>,
     gate_tx: Mutex<Option<RateGateSender>>,
@@ -614,6 +647,9 @@ struct FakeProvider {
     hung: bool,
     close_stream: bool,
     complete_producer: bool,
+    capabilities: fccli::provider::ProviderCapabilities,
+    switch_capabilities: Option<fccli::provider::ProviderCapabilities>,
+    hold_switch_history: bool,
 }
 
 impl FakeProvider {
@@ -627,6 +663,7 @@ impl FakeProvider {
             history_pages: Mutex::new(VecDeque::from([Ok(initial)])),
             events: Mutex::new(Some(events)),
             requests: Arc::new(Mutex::new(Vec::new())),
+            history_calls: Arc::new(Mutex::new(Vec::new())),
             acknowledgements: Arc::new(Mutex::new(Vec::new())),
             clock,
             gate_tx: Mutex::new(Some(gate_tx)),
@@ -646,9 +683,31 @@ impl FakeProvider {
             hung: false,
             close_stream: false,
             complete_producer: false,
+            capabilities: fccli::provider::ProviderCapabilities {
+                markets: &[Market::Spot, Market::Perpetual],
+                timeframes: &Timeframe::ALL,
+                history_page_limit: 1000,
+            },
+            switch_capabilities: None,
+            hold_switch_history: false,
         }
     }
 
+    fn with_capabilities(mut self, capabilities: fccli::provider::ProviderCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+    fn with_switch_capabilities(
+        mut self,
+        capabilities: fccli::provider::ProviderCapabilities,
+    ) -> Self {
+        self.switch_capabilities = Some(capabilities);
+        self
+    }
+    fn holding_switch_history(mut self) -> Self {
+        self.hold_switch_history = true;
+        self
+    }
     fn hung(mut self) -> Self {
         self.hung = true;
         self
@@ -722,6 +781,14 @@ impl MarketDataProvider for FakeProvider {
     fn id(&self) -> ProviderId {
         ProviderId::new("binance").unwrap()
     }
+    fn capabilities(&self) -> fccli::provider::ProviderCapabilities {
+        if self.requests.acquire().is_empty() {
+            self.capabilities
+        } else {
+            self.switch_capabilities.unwrap_or(self.capabilities)
+        }
+    }
+
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
         self.canonicalize_calls.fetch_add(1, Ordering::SeqCst);
         canonicalize_instrument(spec)
@@ -729,11 +796,14 @@ impl MarketDataProvider for FakeProvider {
     }
     fn history<'a>(
         &'a self,
-        _instrument: &'a Instrument,
-        _timeframe: Timeframe,
+        instrument: &'a Instrument,
+        timeframe: Timeframe,
         request: HistoryRequest,
-        _cancellation: CancellationToken,
+        cancellation: CancellationToken,
     ) -> ProviderFuture<'a, Vec<Candle>> {
+        let hold_switch_history = self.hold_switch_history
+            && request.kind() == HistoryRequestKind::Latest
+            && !self.requests.acquire().is_empty();
         let delay = (request.kind() == HistoryRequestKind::Older)
             .then_some(self.older_history_delay)
             .flatten();
@@ -750,6 +820,11 @@ impl MarketDataProvider for FakeProvider {
         let cleanup_trace = release
             .as_ref()
             .map(|_| HistoryCleanupTrace(Arc::clone(&self.trace)));
+        self.history_calls.acquire().push((
+            instrument.provider_symbol().to_owned(),
+            timeframe,
+            request,
+        ));
         self.requests.acquire().push(request);
         self.trace.acquire().push("history");
         let result = self
@@ -759,6 +834,15 @@ impl MarketDataProvider for FakeProvider {
             .unwrap_or_else(|| Ok(Vec::new()));
         Box::pin(async move {
             let _cleanup_trace = cleanup_trace;
+            if hold_switch_history {
+                cancellation.cancelled().await;
+                return Err(ProviderError::Transport {
+                    context: fccli::error::ErrorContext::operation(
+                        fccli::error::ErrorOperation::History,
+                    ),
+                    cause: fccli::error::SanitizedCause::Cancelled,
+                });
+            }
             if panic_older {
                 panic!("injected older-history task panic must be sanitized");
             }
@@ -968,12 +1052,12 @@ fn dependencies(
     output: SharedWriter,
     clock: Arc<dyn Clock>,
 ) -> RunDependencies {
-    let concrete =
-        Arc::new(BinanceProvider::new_test("http://127.0.0.1:1", Arc::clone(&clock)).unwrap());
+    let provider: Arc<dyn MarketDataProvider> = provider;
     RunDependencies {
-        providers: ProviderRegistry::with_test_provider(concrete, provider),
+        providers: ProviderRegistry::new([provider]).expect("unique fake provider"),
         clock,
         terminal,
+
         input,
         stdout: Box::new(output),
         stderr: Box::new(SharedWriter::default()),
@@ -982,6 +1066,264 @@ fn dependencies(
         render_policy: fccli::chart::RenderPolicy::StyleFree,
         epoch_observer: None,
     }
+}
+#[tokio::test]
+async fn initial_app_caps_desired_500_and_rejects_before_network_io() {
+    for (maximum, expected) in [(1_000, 500), (7, 7)] {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+        let provider = Arc::new(
+            FakeProvider::new(vec![candle(0, 59_999)], vec![], Arc::clone(&clock))
+                .with_capabilities(fccli::provider::ProviderCapabilities {
+                    markets: &[Market::Spot, Market::Perpetual],
+                    timeframes: &Timeframe::ALL,
+                    history_page_limit: maximum,
+                }),
+        );
+        let terminal = Arc::new(TerminalLog::default());
+        let result = run_with_dependencies(
+            ["fccli", "btc", "1m", "--interactive"],
+            dependencies(
+                Arc::clone(&provider),
+                delayed_key(Duration::from_millis(10), 'q'),
+                terminal,
+                SharedWriter::default(),
+                clock,
+            ),
+        )
+        .await;
+        assert_eq!(result, Ok(ExitCode::SUCCESS));
+        assert_eq!(provider.requests.acquire()[0].limit(), expected);
+    }
+
+    for (arguments, capabilities) in [
+        (
+            ["fccli", "btc.p", "1m", "--interactive"],
+            fccli::provider::ProviderCapabilities {
+                markets: &[Market::Spot],
+                timeframes: &Timeframe::ALL,
+                history_page_limit: 500,
+            },
+        ),
+        (
+            ["fccli", "btc", "1s", "--interactive"],
+            fccli::provider::ProviderCapabilities {
+                markets: &[Market::Spot, Market::Perpetual],
+                timeframes: &[Timeframe::Minute1],
+                history_page_limit: 500,
+            },
+        ),
+        (
+            ["fccli", "btc", "6h", "--interactive"],
+            fccli::provider::ProviderCapabilities {
+                markets: &[Market::Spot, Market::Perpetual],
+                timeframes: &[Timeframe::Minute1],
+                history_page_limit: 500,
+            },
+        ),
+        (
+            ["fccli", "btc", "1m", "--interactive"],
+            fccli::provider::ProviderCapabilities {
+                markets: &[Market::Spot, Market::Perpetual],
+                timeframes: &Timeframe::ALL,
+                history_page_limit: 0,
+            },
+        ),
+    ] {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+        let provider = Arc::new(
+            FakeProvider::new(vec![candle(0, 59_999)], vec![], Arc::clone(&clock))
+                .with_capabilities(capabilities),
+        );
+        let error = run_with_dependencies(
+            arguments,
+            dependencies(
+                Arc::clone(&provider),
+                Box::new(ScriptedTerminalInput::new([])),
+                Arc::new(TerminalLog::default()),
+                SharedWriter::default(),
+                clock,
+            ),
+        )
+        .await
+        .expect_err("unsupported capability must fail initial startup");
+        assert!(error.to_string().contains("provider"));
+        assert!(provider.requests.acquire().is_empty());
+        assert_eq!(provider.canonicalize_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn switch_caps_desired_limit_and_rejects_capabilities_before_provider_io() {
+    for (maximum, expected) in [(1_000, 500), (7, 7)] {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+        let initial = (0..100)
+            .map(|index| candle(index * 60_000, index * 60_000 + 59_999))
+            .collect::<Vec<_>>();
+        let switched = (0..100)
+            .map(|index| candle(index * 3_600_000, index * 3_600_000 + 3_599_999))
+            .collect::<Vec<_>>();
+        let provider = Arc::new(
+            FakeProvider::new(initial.clone(), vec![], Arc::clone(&clock))
+                .with_history_pages([Ok(initial), Ok(switched)])
+                .with_switch_capabilities(fccli::provider::ProviderCapabilities {
+                    markets: &[Market::Spot, Market::Perpetual],
+                    timeframes: &Timeframe::ALL,
+                    history_page_limit: maximum,
+                }),
+        );
+        let result = run_with_observations(
+            Arc::clone(&provider),
+            switch_then_quit_input(&["eth 1h"]),
+            clock,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+        assert_eq!(result, Ok(ExitCode::SUCCESS));
+        let calls = provider.history_calls.acquire();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            (
+                "BTCUSDT".to_owned(),
+                Timeframe::Minute1,
+                HistoryRequest::latest(500).unwrap()
+            )
+        );
+        assert_eq!(
+            calls[1],
+            (
+                "ETHUSDT".to_owned(),
+                Timeframe::Hour1,
+                HistoryRequest::latest(expected).unwrap()
+            )
+        );
+        assert_eq!(provider.open_live_calls.load(Ordering::SeqCst), 2);
+    }
+
+    for (target, capabilities, expected_message) in [
+        (
+            "eth.p 1m",
+            fccli::provider::ProviderCapabilities {
+                markets: &[Market::Spot],
+                timeframes: &Timeframe::ALL,
+                history_page_limit: 500,
+            },
+            "provider does not support market",
+        ),
+        (
+            "eth 1h",
+            fccli::provider::ProviderCapabilities {
+                markets: &[Market::Spot, Market::Perpetual],
+                timeframes: &[Timeframe::Minute1],
+                history_page_limit: 500,
+            },
+            "provider does not support timeframe",
+        ),
+        (
+            "eth 1m",
+            fccli::provider::ProviderCapabilities {
+                markets: &[Market::Spot, Market::Perpetual],
+                timeframes: &Timeframe::ALL,
+                history_page_limit: 0,
+            },
+            "history page limit must be non-zero",
+        ),
+    ] {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+        let initial = (0..100)
+            .map(|index| candle(index * 60_000, index * 60_000 + 59_999))
+            .collect::<Vec<_>>();
+        let provider = Arc::new(
+            FakeProvider::new(initial, vec![], Arc::clone(&clock))
+                .with_switch_capabilities(capabilities),
+        );
+        let observations = Arc::new(Mutex::new(Vec::<EpochObservation>::new()));
+        let result = run_with_observations(
+            Arc::clone(&provider),
+            switch_then_quit_input(&[target]),
+            clock,
+            Arc::clone(&observations),
+        )
+        .await;
+        assert_eq!(result, Ok(ExitCode::SUCCESS));
+        assert_eq!(
+            provider.history_calls.acquire().as_slice(),
+            &[(
+                "BTCUSDT".to_owned(),
+                Timeframe::Minute1,
+                HistoryRequest::latest(500).unwrap(),
+            )],
+            "rejected switch must not perform history I/O",
+        );
+        assert_eq!(provider.open_live_calls.load(Ordering::SeqCst), 1);
+        assert!(observations.acquire().iter().any(|observation| {
+            matches!(&observation.snapshot.footer, FooterPresentation::Error { message } if message.contains(expected_message))
+        }));
+    }
+}
+
+#[tokio::test]
+async fn rejected_switch_supersedes_pending_preparation_before_preflight() {
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+    let initial = (0..100)
+        .map(|index| candle(index * 60_000, index * 60_000 + 59_999))
+        .collect::<Vec<_>>();
+    let provider = Arc::new(
+        FakeProvider::new(initial, vec![], Arc::clone(&clock))
+            .with_switch_capabilities(fccli::provider::ProviderCapabilities {
+                markets: &[Market::Spot, Market::Perpetual],
+                timeframes: &[Timeframe::Minute1],
+                history_page_limit: 500,
+            })
+            .holding_switch_history(),
+    );
+    let observations = Arc::new(Mutex::new(Vec::<EpochObservation>::new()));
+    let first = switch_events("eth 1m");
+    let second_switch_offset = first.len();
+    let mut events = VecDeque::from(first);
+    events.extend(switch_events("sol 1h"));
+    let input = Box::new(SupersedingSwitchInput {
+        events,
+        second_switch_offset,
+        emitted: 0,
+        requests: Arc::clone(&provider.requests),
+        observations: Arc::clone(&observations),
+    });
+
+    let result = run_with_observations(
+        Arc::clone(&provider),
+        input,
+        clock,
+        Arc::clone(&observations),
+    )
+    .await;
+    assert_eq!(result, Ok(ExitCode::SUCCESS));
+    assert_eq!(
+        provider.history_calls.acquire().as_slice(),
+        &[
+            (
+                "BTCUSDT".to_owned(),
+                Timeframe::Minute1,
+                HistoryRequest::latest(500).unwrap(),
+            ),
+            (
+                "ETHUSDT".to_owned(),
+                Timeframe::Minute1,
+                HistoryRequest::latest(500).unwrap(),
+            ),
+        ],
+        "A may start and be cancelled, while rejected B performs no history I/O",
+    );
+    assert_eq!(provider.open_live_calls.load(Ordering::SeqCst), 1);
+    let observations = observations.acquire();
+    assert!(observations.iter().any(|observation| {
+        matches!(&observation.snapshot.footer, FooterPresentation::Error { message } if message.contains("provider does not support timeframe"))
+    }));
+    assert!(
+        observations
+            .iter()
+            .all(|observation| { observation.snapshot.instrument.provider_symbol() == "BTCUSDT" })
+    );
 }
 
 #[tokio::test]

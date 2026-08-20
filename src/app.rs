@@ -30,7 +30,7 @@ use crate::{
     history::{HistoryApplyResult, HistoryCoordinator, HistoryJoinError, HistoryProgress},
     model::{
         CandleSeries, ConnectionStatus, GapGeneration, MarketEvent, MonoInstant, MutationSummary,
-        RateGateState, ReplayRevision,
+        RateGateState, ReplayRevision, Timeframe,
     },
     provider::{
         AcceptedWatermarkSender, CancellationToken, LiveFeed, LiveFeedJoinError, LiveRequest,
@@ -46,6 +46,30 @@ pub const PRODUCER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const HISTORY_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const INPUT_POLL_TIMEOUT: Duration = Duration::from_millis(10);
 const INITIAL_HISTORY_LIMIT: u16 = 500;
+const INVALID_CAPABILITY_LIMIT: &str = "provider history page limit must be non-zero";
+
+fn history_request_limit(
+    provider: &dyn MarketDataProvider,
+    market: crate::model::Market,
+    timeframe: Timeframe,
+    desired_limit: u16,
+) -> Result<u16, ProviderError> {
+    let capabilities = provider.capabilities();
+    if !capabilities.markets.contains(&market) {
+        return Err(ProviderError::Configuration(
+            "provider does not support market",
+        ));
+    }
+    if !capabilities.timeframes.contains(&timeframe) {
+        return Err(ProviderError::Configuration(
+            "provider does not support timeframe",
+        ));
+    }
+    if capabilities.history_page_limit == 0 {
+        return Err(ProviderError::Configuration(INVALID_CAPABILITY_LIMIT));
+    }
+    Ok(desired_limit.min(capabilities.history_page_limit))
+}
 const MAX_COMMAND_BYTES: usize = 512;
 
 #[derive(Default)]
@@ -289,9 +313,7 @@ where
         )
     })?;
 
-    let provider = dependencies
-        .providers
-        .get(cli.instrument().provider().clone())?;
+    let provider = dependencies.providers.get(cli.instrument().provider())?;
     match cli.mode() {
         Mode::Snapshot => {
             let render_policy = if dependencies.stdout_is_tty {
@@ -594,6 +616,7 @@ impl App {
         }
     }
     fn begin_switch(&mut self, target: MarketTarget, root: &CancellationToken) {
+        self.switch_generation = self.switch_generation.wrapping_add(1);
         if let Some(pending) = self.switch.take() {
             pending.cancellation.cancel();
             pending.task.abort();
@@ -612,8 +635,23 @@ impl App {
                 }
             }));
         }
-        let provider = match self.providers.get(target.instrument.provider().clone()) {
+        let provider = match self.providers.get(target.instrument.provider()) {
             Ok(provider) => provider,
+            Err(error) => {
+                self.footer = FooterPresentation::Error {
+                    message: error.to_string(),
+                };
+                self.dirty = true;
+                return;
+            }
+        };
+        let history_limit = match history_request_limit(
+            provider.as_ref(),
+            target.instrument.market(),
+            target.timeframe,
+            INITIAL_HISTORY_LIMIT,
+        ) {
+            Ok(limit) => limit,
             Err(error) => {
                 self.footer = FooterPresentation::Error {
                     message: error.to_string(),
@@ -637,7 +675,6 @@ impl App {
             self.dirty = true;
             return;
         }
-        self.switch_generation = self.switch_generation.wrapping_add(1);
         let generation = self.switch_generation;
         let cancellation = root.child_token();
         let task_cancellation = cancellation.clone();
@@ -650,7 +687,7 @@ impl App {
                 .history(
                     &instrument,
                     target.timeframe,
-                    crate::model::HistoryRequest::latest(INITIAL_HISTORY_LIMIT)?,
+                    crate::model::HistoryRequest::latest(history_limit)?,
                     task_cancellation.child_token(),
                 )
                 .await?;
@@ -1162,12 +1199,18 @@ async fn run_interactive(
     mut dependencies: RunDependencies,
 ) -> Result<(), AppError> {
     let cancellation = CancellationToken::new();
+    let history_limit = history_request_limit(
+        provider.as_ref(),
+        cli.instrument().market(),
+        cli.timeframe(),
+        INITIAL_HISTORY_LIMIT,
+    )?;
     let instrument = provider.canonicalize(cli.instrument())?;
     let initial = provider
         .history(
             &instrument,
             cli.timeframe(),
-            crate::model::HistoryRequest::latest(INITIAL_HISTORY_LIMIT)?,
+            crate::model::HistoryRequest::latest(history_limit)?,
             cancellation.child_token(),
         )
         .await?;

@@ -1,53 +1,56 @@
 //! Binance Spot and USD-M Perpetual REST history and raw WebSocket transport.
 
-use std::{
-    collections::{BTreeMap, VecDeque},
-    pin::Pin,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
-    },
-    task::{Context, Poll},
-    time::Duration,
-};
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
+use std::collections::VecDeque;
+use std::{sync::Arc, time::Duration};
 
-use futures_util::{FutureExt, Sink, Stream, stream};
-use reqwest::{Client, StatusCode, Url, header::RETRY_AFTER};
+use reqwest::{StatusCode, Url, header::RETRY_AFTER};
 use serde::{
     Deserialize,
     de::{IgnoredAny, SeqAccess, Visitor},
 };
 use serde_json::Value;
-use tokio::{
-    net::TcpStream,
-    sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc},
-};
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async_with_config,
-    tungstenite::{
-        Error as WebSocketError, Message,
-        error::CapacityError,
-        protocol::{WebSocketConfig, frame::coding::CloseCode},
-    },
-};
+use time::{Date, Month, OffsetDateTime};
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
+use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     cli::canonicalize_instrument,
     clock::{Clock, checked_deadline},
-    error::{
-        ErrorContext, ErrorOperation, PayloadError, ProviderError, SanitizedCause,
-        SanitizedMessage, TimeoutKind,
-    },
+    error::{ErrorContext, ErrorOperation, PayloadError, ProviderError, SanitizedMessage},
     model::{
-        Candle, ConnectionStatus, FinalityAuthority, GapGeneration, HistoryRequest, Instrument,
-        InstrumentSpec, Market, MarketEvent, MonoInstant, ProcessBlocker, ProviderId,
-        RateGateState, ReplayRevision, Timeframe,
+        Candle, HistoryRequest, Instrument, InstrumentSpec, Market, ProcessBlocker, ProviderId,
+        Timeframe,
     },
     provider::{
-        LiveFeed, LiveRequest, MarketDataProvider, ProviderFuture, RateGateSender,
-        RateGateSnapshot, ReconcileAck, ReconcileExpectation, ReconcileExpectationError,
-        rate_gate_channel,
+        LiveFeed, LiveRequest, MarketDataProvider, ProviderCapabilities, ProviderFuture,
+        RateGateSnapshot,
+        runtime::{
+            http::{HttpRuntime, RateLimitDecision},
+            live::LiveSupervisorConfig,
+        },
+    },
+};
+
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
+use crate::provider::runtime::{
+    live::{
+        ConnectionRotation, LiveAdapter, LiveConfig, LiveRateGate, LiveSocket, LiveSocketEvent,
+        ProcessBlockPolicy, ReconciliationLimits,
+    },
+    websocket::{
+        DecodedFrame, WsCodec, WsConfig, connect_websocket_url,
+        contextualize_websocket_configuration, validate_websocket_base,
     },
 };
 
@@ -66,195 +69,11 @@ const PRODUCTION_PERPETUAL_REST_BASE: &str = "https://fapi.binance.com";
 const PRODUCTION_SPOT_WS_BASE: &str = "wss://data-stream.binance.vision";
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
 const PRODUCTION_PERPETUAL_WS_BASE: &str = "wss://fstream.binance.com";
-const WS_BYTE_LIMIT_MAX: usize = 16 * 1024 * 1024;
-pub const WS_READ_BUFFER_SIZE: usize = 128 * 1024;
-pub const WS_MESSAGE_SIZE: usize = 1024 * 1024;
-pub const WS_FRAME_SIZE: usize = 256 * 1024;
-pub const WS_WRITE_BUFFER_SIZE: usize = 64 * 1024;
-pub const WS_MAX_WRITE_BUFFER_SIZE: usize = 1024 * 1024;
-pub const WS_STALLED_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-pub const WS_MESSAGE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub const KEYED_CANDLE_CAPACITY: usize = 1024;
-pub const CONTROL_CAPACITY: usize = 64;
-pub const EMERGENCY_CONTROL_CAPACITY: usize = 2;
-pub const MARKET_EVENT_CHANNEL_CAPACITY: usize = 256;
-pub const FIRST_KLINE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-pub const RECONCILE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_CONNECTION_AGE: Duration = Duration::from_secs(24 * 60 * 60);
-const MAX_SUPERVISOR_CAPACITY: usize = 65_536;
-const GAP_PAGE_LIMIT: u16 = 1000;
-
-#[derive(Clone, Debug)]
-pub struct LiveSupervisorConfig {
-    pub keyed_candle_capacity: usize,
-    pub control_capacity: usize,
-    pub market_event_capacity: usize,
-    pub first_kline_timeout: Duration,
-    pub reconcile_ack_timeout: Duration,
-    pub max_connection_age: Duration,
-    pub ws_config: WsConfig,
-    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-    pub stalled_write_probe_frames: usize,
-}
-
-impl Default for LiveSupervisorConfig {
-    fn default() -> Self {
-        Self {
-            keyed_candle_capacity: KEYED_CANDLE_CAPACITY,
-            control_capacity: CONTROL_CAPACITY,
-            market_event_capacity: MARKET_EVENT_CHANNEL_CAPACITY,
-            first_kline_timeout: FIRST_KLINE_HANDSHAKE_TIMEOUT,
-            reconcile_ack_timeout: RECONCILE_ACK_TIMEOUT,
-            max_connection_age: MAX_CONNECTION_AGE,
-            ws_config: WsConfig::default(),
-            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            stalled_write_probe_frames: 0,
-        }
-    }
-}
-
-impl LiveSupervisorConfig {
-    pub fn validate(&self) -> Result<(), ProviderError> {
-        for capacity in [
-            self.keyed_candle_capacity,
-            self.control_capacity,
-            self.market_event_capacity,
-        ] {
-            if !(1..=MAX_SUPERVISOR_CAPACITY).contains(&capacity) {
-                return Err(ProviderError::Configuration(
-                    "live supervisor capacity is outside 1..=65536",
-                ));
-            }
-        }
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        if self.stalled_write_probe_frames > MAX_SUPERVISOR_CAPACITY {
-            return Err(ProviderError::Configuration(
-                "live supervisor stalled-write probe is outside 0..=65536",
-            ));
-        }
-        for timeout in [self.first_kline_timeout, self.reconcile_ack_timeout] {
-            if !(Duration::from_millis(1)..=Duration::from_secs(60)).contains(&timeout) {
-                return Err(ProviderError::Configuration(
-                    "live supervisor timeout is outside 1ms..=60s",
-                ));
-            }
-        }
-        if self.max_connection_age.is_zero() {
-            return Err(ProviderError::Configuration(
-                "live connection max age must be positive",
-            ));
-        }
-        self.ws_config.validate()?;
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WsConfig {
-    pub read_buffer_size: usize,
-    pub max_message_size: usize,
-    pub max_frame_size: usize,
-    pub write_buffer_size: usize,
-    pub max_write_buffer_size: usize,
-    pub stalled_write_timeout: Duration,
-    pub message_inactivity_timeout: Duration,
-}
-
-impl WsConfig {
-    #[must_use]
-    pub const fn production() -> Self {
-        Self {
-            read_buffer_size: WS_READ_BUFFER_SIZE,
-            max_message_size: WS_MESSAGE_SIZE,
-            max_frame_size: WS_FRAME_SIZE,
-            write_buffer_size: WS_WRITE_BUFFER_SIZE,
-            max_write_buffer_size: WS_MAX_WRITE_BUFFER_SIZE,
-            stalled_write_timeout: WS_STALLED_WRITE_TIMEOUT,
-            message_inactivity_timeout: WS_MESSAGE_INACTIVITY_TIMEOUT,
-        }
-    }
-
-    pub fn validate(self) -> Result<Self, ProviderError> {
-        let byte_sizes = [
-            self.read_buffer_size,
-            self.max_message_size,
-            self.max_frame_size,
-            self.write_buffer_size,
-            self.max_write_buffer_size,
-        ];
-        if byte_sizes
-            .into_iter()
-            .any(|size| !(1..=WS_BYTE_LIMIT_MAX).contains(&size))
-        {
-            return Err(ProviderError::Configuration(
-                "WebSocket byte limits must be within 1..=16 MiB",
-            ));
-        }
-        if self.max_frame_size > self.max_message_size {
-            return Err(ProviderError::Configuration(
-                "WebSocket frame limit must not exceed message limit",
-            ));
-        }
-        if self.write_buffer_size >= self.max_write_buffer_size {
-            return Err(ProviderError::Configuration(
-                "WebSocket write buffer must be smaller than max write buffer",
-            ));
-        }
-        let largest_control_payload = self.max_frame_size.min(125);
-        let required_control_headroom = self
-            .write_buffer_size
-            .checked_add(largest_control_payload + 6)
-            .ok_or(ProviderError::Configuration(
-                "WebSocket control-frame headroom overflowed",
-            ))?;
-        if self.max_write_buffer_size < required_control_headroom {
-            return Err(ProviderError::Configuration(
-                "WebSocket max write buffer lacks automatic control-frame headroom",
-            ));
-        }
-        if !(Duration::from_millis(1)..=Duration::from_secs(60))
-            .contains(&self.stalled_write_timeout)
-        {
-            return Err(ProviderError::Configuration(
-                "WebSocket stalled-write timeout must be within 1 ms..=60 s",
-            ));
-        }
-        if !(Duration::from_millis(1)..=Duration::from_secs(120))
-            .contains(&self.message_inactivity_timeout)
-        {
-            return Err(ProviderError::Configuration(
-                "WebSocket message-inactivity timeout must be within 1 ms..=120 s",
-            ));
-        }
-        Ok(self)
-    }
-
-    fn tungstenite(self) -> Result<WebSocketConfig, ProviderError> {
-        let validated = self.validate()?;
-        Ok(WebSocketConfig::default()
-            .read_buffer_size(validated.read_buffer_size)
-            .write_buffer_size(validated.write_buffer_size)
-            .max_write_buffer_size(validated.max_write_buffer_size)
-            .max_message_size(Some(validated.max_message_size))
-            .max_frame_size(Some(validated.max_frame_size)))
-    }
-}
-
-impl Default for WsConfig {
-    fn default() -> Self {
-        Self::production()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum DecodedFrame {
-    Candle(Candle),
-    Ignored,
-    ProviderError(ProviderError),
-    ServerShutdown,
-    Close(Option<CloseCode>),
-}
+const MAX_FUTURE_CANDLE_SKEW: Duration = Duration::from_secs(5 * 60);
+const MAX_GAP_RECONCILIATION_CANDLES: usize = 64_000;
+const MAX_GAP_RECONCILIATION_PAGES: usize = 64;
 
 #[derive(Deserialize)]
 struct WsEnvelope {
@@ -337,43 +156,17 @@ fn production_ws_base(market: Market) -> &'static str {
         Market::Perpetual => PRODUCTION_PERPETUAL_WS_BASE,
     }
 }
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 fn websocket_url_from_base(
     base_url: &str,
     instrument: &Instrument,
     timeframe: Timeframe,
     loopback_only: bool,
 ) -> Result<Url, ProviderError> {
-    let mut url = Url::parse(base_url)
-        .map_err(|_| ProviderError::Configuration("invalid WebSocket base URL"))?;
-    let valid_scheme = if loopback_only {
-        url.scheme() == "ws"
-    } else {
-        url.scheme() == "wss"
-    };
-    if !valid_scheme || url.query().is_some() || url.fragment().is_some() {
-        return Err(ProviderError::Configuration("invalid WebSocket base URL"));
-    }
-    if loopback_only {
-        let host = url.host_str().ok_or(ProviderError::Configuration(
-            "WebSocket test URL requires a host",
-        ))?;
-        let ip_literal = host
-            .strip_prefix('[')
-            .and_then(|host| host.strip_suffix(']'))
-            .unwrap_or(host);
-        let ip = ip_literal.parse::<std::net::IpAddr>().map_err(|_| {
-            ProviderError::Configuration("WebSocket test URL must use a literal loopback host")
-        })?;
-        if !ip.is_loopback()
-            || url.port().is_none_or(|port| port == 0)
-            || !url.username().is_empty()
-            || url.password().is_some()
-        {
-            return Err(ProviderError::Configuration(
-                "WebSocket test URL must be plain WS on a literal loopback host with an explicit nonzero port",
-            ));
-        }
-    }
+    let mut url = validate_websocket_base(base_url, loopback_only)?;
     let stream = format!(
         "{}@kline_{}",
         instrument.provider_symbol().to_ascii_lowercase(),
@@ -383,12 +176,48 @@ fn websocket_url_from_base(
     Ok(url)
 }
 
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+#[derive(Clone, Debug, PartialEq)]
+pub enum BinanceDecoded {
+    Candle(Candle),
+}
+
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum BinanceDecoded {
+    Candle(Candle),
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 pub fn decode_ws_frame(
     message: Message,
     instrument: &Instrument,
     timeframe: Timeframe,
     config: &WsConfig,
-) -> DecodedFrame {
+) -> DecodedFrame<BinanceDecoded> {
+    decode_ws_frame_impl(message, instrument, timeframe, config)
+}
+
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+fn decode_ws_frame(
+    message: Message,
+    instrument: &Instrument,
+    timeframe: Timeframe,
+    config: &WsConfig,
+) -> DecodedFrame<BinanceDecoded> {
+    decode_ws_frame_impl(message, instrument, timeframe, config)
+}
+
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
+fn decode_ws_frame_impl(
+    message: Message,
+    instrument: &Instrument,
+    timeframe: Timeframe,
+    config: &WsConfig,
+) -> DecodedFrame<BinanceDecoded> {
     if let Err(error) = config.validate() {
         return DecodedFrame::ProviderError(error);
     }
@@ -400,12 +229,49 @@ pub fn decode_ws_frame(
     }
 }
 
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BinanceWsCodec;
+
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BinanceWsCodec;
+
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
+impl WsCodec for BinanceWsCodec {
+    type Outcome = BinanceDecoded;
+
+    fn decode(
+        &mut self,
+        message: Message,
+        instrument: &Instrument,
+        timeframe: Timeframe,
+        config: &WsConfig,
+        output: &mut VecDeque<DecodedFrame<Self::Outcome>>,
+    ) {
+        output.push_back(decode_ws_frame(message, instrument, timeframe, config));
+    }
+
+    fn readiness_priority(outcome: &Self::Outcome) -> u8 {
+        match outcome {
+            BinanceDecoded::Candle(_) => 1,
+        }
+    }
+}
+
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 fn decode_ws_payload(
     bytes: &[u8],
     instrument: &Instrument,
     timeframe: Timeframe,
     config: &WsConfig,
-) -> DecodedFrame {
+) -> DecodedFrame<BinanceDecoded> {
     let context =
         ErrorContext::operation(ErrorOperation::WebSocket).with_market(instrument, timeframe);
     if bytes.len() > config.max_message_size {
@@ -423,7 +289,7 @@ fn decode_ws_payload(
         }
     };
     if envelope.event.as_deref() == Some("serverShutdown") {
-        return DecodedFrame::ServerShutdown;
+        return DecodedFrame::ReconnectRequested;
     }
     if envelope.code == Some(-1121) {
         return DecodedFrame::ProviderError(ProviderError::InvalidSymbol {
@@ -457,6 +323,9 @@ fn decode_ws_payload(
             detail: "WebSocket kline market does not match subscription",
         });
     }
+    if let Err(error) = validate_live_candle_time_window(&kline, timeframe, &context) {
+        return DecodedFrame::ProviderError(error);
+    }
     let parse = |value: &str| {
         value
             .parse::<f64>()
@@ -487,321 +356,95 @@ fn decode_ws_payload(
         volume,
         kline.closed,
     ) {
-        Ok(candle) => DecodedFrame::Candle(candle),
+        Ok(candle) => DecodedFrame::Provider(BinanceDecoded::Candle(candle)),
         Err(source) => DecodedFrame::ProviderError(ProviderError::Domain { context, source }),
     }
 }
-const MAX_RETAINED_DECODED_OUTCOMES: usize = 64;
-
-pub struct RawWebSocket {
-    stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    config: WsConfig,
-    context: ErrorContext,
-    instrument: Instrument,
+fn validate_live_candle_time_window(
+    candle: &WsKline,
     timeframe: Timeframe,
-    decoded: VecDeque<Result<DecodedFrame, ProviderError>>,
-    outbound: VecDeque<Message>,
-    flush_pending: bool,
-    write_stall_deadline: Option<tokio::time::Instant>,
-    last_data_message: tokio::time::Instant,
-    terminal_io: bool,
-    pending_terminal_error: Option<ProviderError>,
-    stalled_write_error: Option<ProviderError>,
-    peer_close_outcome: Option<DecodedFrame>,
+    context: &ErrorContext,
+) -> Result<(), ProviderError> {
+    let expected_close = timeframe_successor_open(timeframe, candle.open_time)
+        .and_then(|successor| successor.checked_sub(1));
+    let future_ceiling = unix_now_ms().ok().and_then(|now| {
+        i64::try_from(MAX_FUTURE_CANDLE_SKEW.as_millis())
+            .ok()
+            .and_then(|skew| now.checked_add(skew))
+    });
+    if expected_close != Some(candle.close_time)
+        || future_ceiling.is_none_or(|ceiling| candle.open_time > ceiling)
+    {
+        return Err(payload(context, PayloadError::MalformedProtocol));
+    }
+    Ok(())
 }
 
-impl RawWebSocket {
-    #[must_use]
-    pub const fn config(&self) -> &WsConfig {
-        &self.config
+fn timeframe_successor_open(timeframe: Timeframe, open_time: i64) -> Option<i64> {
+    let fixed_milliseconds = match timeframe {
+        Timeframe::Second1 => Some(1_000),
+        Timeframe::Minute1 => Some(60_000),
+        Timeframe::Minute3 => Some(180_000),
+        Timeframe::Minute5 => Some(300_000),
+        Timeframe::Minute15 => Some(900_000),
+        Timeframe::Minute30 => Some(1_800_000),
+        Timeframe::Hour1 => Some(3_600_000),
+        Timeframe::Hour2 => Some(7_200_000),
+        Timeframe::Hour4 => Some(14_400_000),
+        Timeframe::Hour6 => Some(21_600_000),
+        Timeframe::Hour8 => Some(28_800_000),
+        Timeframe::Hour12 => Some(43_200_000),
+        Timeframe::Day1 => Some(86_400_000),
+        Timeframe::Day3 => Some(259_200_000),
+        Timeframe::Week1 => Some(604_800_000),
+        Timeframe::Month1 => None,
+    };
+    if let Some(milliseconds) = fixed_milliseconds {
+        if open_time.rem_euclid(milliseconds) != 0 {
+            return None;
+        }
+        return open_time.checked_add(milliseconds);
     }
-
-    pub async fn read(&mut self) -> Result<DecodedFrame, ProviderError> {
-        loop {
-            if self.stalled_write_error.is_some() {
-                if let Some(outcome) = self.decoded.pop_front() {
-                    return outcome;
-                }
-            } else if !self.flush_pending
-                && self.outbound.is_empty()
-                && let Some(outcome) = self.decoded.pop_front()
-            {
-                return outcome;
-            }
-            if let Some(error) = self.pending_terminal_error.take() {
-                return Err(error);
-            }
-            self.pump(false).await?;
-        }
+    let nanos = i128::from(open_time).checked_mul(1_000_000)?;
+    let date = OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .ok()?
+        .date();
+    if date.day() != 1 || open_time.rem_euclid(86_400_000) != 0 {
+        return None;
     }
-
-    pub async fn send(&mut self, message: Message) -> Result<(), ProviderError> {
-        self.reject_terminal_write()?;
-        self.outbound.push_back(message);
-        self.ensure_write_stall_deadline();
-        while !self.outbound.is_empty() || self.flush_pending {
-            self.pump(true).await?;
-        }
-        Ok(())
-    }
-
-    pub async fn flush(&mut self) -> Result<(), ProviderError> {
-        self.reject_terminal_write()?;
-        if self.flush_pending || !self.outbound.is_empty() {
-            self.ensure_write_stall_deadline();
-        }
-        while !self.outbound.is_empty() || self.flush_pending {
-            self.pump(true).await?;
-        }
-        Ok(())
-    }
-
-    fn reject_terminal_write(&self) -> Result<(), ProviderError> {
-        if let Some(error) = &self.stalled_write_error {
-            return Err(error.clone());
-        }
-        if !self.terminal_io {
-            return Ok(());
-        }
-        Err(self
-            .pending_terminal_error
-            .clone()
-            .unwrap_or_else(|| ProviderError::Transport {
-                context: self.context.clone(),
-                cause: SanitizedCause::Closed,
-            }))
-    }
-
-    fn enter_stalled_write_drain(&mut self, error: ProviderError) {
-        self.outbound.clear();
-        self.flush_pending = false;
-        self.write_stall_deadline = None;
-        if self.stalled_write_error.is_none() {
-            self.stalled_write_error = Some(error);
-        }
-    }
-
-    fn ensure_write_stall_deadline(&mut self) {
-        if self.write_stall_deadline.is_none() {
-            self.write_stall_deadline = Some(
-                tokio::time::Instant::now()
-                    .checked_add(self.config.stalled_write_timeout)
-                    .unwrap_or(tokio::time::Instant::now()),
-            );
-        }
-    }
-
-    fn finish_terminal_io(&mut self) {
-        self.terminal_io = true;
-        self.outbound.clear();
-        self.flush_pending = false;
-        self.write_stall_deadline = None;
-    }
-
-    fn finish_or_defer_terminal_error(
-        &mut self,
-        error: ProviderError,
-        report_to_writer: bool,
-    ) -> Result<(), ProviderError> {
-        let error = self.stalled_write_error.clone().unwrap_or(error);
-        if let Some(close) = self.peer_close_outcome.take() {
-            self.decoded.push_back(Ok(close));
-        }
-        self.finish_terminal_io();
-        if !self.decoded.is_empty() {
-            if self.pending_terminal_error.is_none() {
-                self.pending_terminal_error = Some(error.clone());
-            }
-            if report_to_writer {
-                return Err(error);
-            }
-            Ok(())
-        } else {
-            Err(error)
-        }
-    }
-
-    fn fail_write_and_drain(&mut self, error: ProviderError) -> Result<(), ProviderError> {
-        self.enter_stalled_write_drain(error.clone());
-        Err(error)
-    }
-
-    async fn pump(&mut self, writing: bool) -> Result<(), ProviderError> {
-        if self.terminal_io {
-            if writing {
-                return self.reject_terminal_write();
-            }
-            if !self.decoded.is_empty() {
-                return Ok(());
-            }
-            if let Some(error) = self.pending_terminal_error.take() {
-                return Err(error);
-            }
-            return Err(ProviderError::Transport {
-                context: self.context.clone(),
-                cause: SanitizedCause::Closed,
-            });
-        }
-        if self.stalled_write_error.is_none()
-            && (writing || self.flush_pending || !self.outbound.is_empty())
-        {
-            self.ensure_write_stall_deadline();
-        }
-        let inactivity_deadline = self.last_data_message + self.config.message_inactivity_timeout;
-        let write_stall_deadline = self.write_stall_deadline;
-        if write_stall_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            let error = ProviderError::Timeout {
-                context: self.context.clone(),
-                kind: TimeoutKind::StalledWrite,
-            };
-            return self.fail_write_and_drain(error);
-        }
-        let stall_sleep_deadline = write_stall_deadline.unwrap_or(inactivity_deadline);
-        let inactivity_context = self.context.clone();
-        let stalled_write_context = self.context.clone();
-        tokio::select! {
-            biased;
-            result = futures_util::future::poll_fn(|cx| self.poll_io(cx, inactivity_deadline, writing)) => result,
-            () = tokio::time::sleep_until(inactivity_deadline) => {
-                let error = ProviderError::Timeout {
-                    context: inactivity_context,
-                    kind: TimeoutKind::WebSocketInactivity,
-                };
-                self.finish_or_defer_terminal_error(error, writing)
-            },
-            () = tokio::time::sleep_until(stall_sleep_deadline), if write_stall_deadline.is_some() => {
-                let error = ProviderError::Timeout {
-                    context: stalled_write_context,
-                    kind: TimeoutKind::StalledWrite,
-                };
-                self.fail_write_and_drain(error)
-            },
-        }
-    }
-
-    fn poll_io(
-        &mut self,
-        cx: &mut Context<'_>,
-        inactivity_deadline: tokio::time::Instant,
-        writing: bool,
-    ) -> Poll<Result<(), ProviderError>> {
-        if self
-            .write_stall_deadline
-            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-        {
-            let error = ProviderError::Timeout {
-                context: self.context.clone(),
-                kind: TimeoutKind::StalledWrite,
-            };
-            return Poll::Ready(self.fail_write_and_drain(error));
-        }
-        let mut made_progress = false;
-        if self.decoded.len() < MAX_RETAINED_DECODED_OUTCOMES {
-            match Stream::poll_next(Pin::new(&mut self.stream), cx) {
-                Poll::Ready(Some(Ok(message))) => {
-                    let is_data = matches!(message, Message::Text(_) | Message::Binary(_));
-                    if is_data {
-                        self.last_data_message = tokio::time::Instant::now();
-                    } else if tokio::time::Instant::now() >= inactivity_deadline {
-                        let error = ProviderError::Timeout {
-                            context: self.context.clone(),
-                            kind: TimeoutKind::WebSocketInactivity,
-                        };
-                        return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
-                    }
-                    self.flush_pending = true;
-                    if self.stalled_write_error.is_none() {
-                        self.ensure_write_stall_deadline();
-                    }
-                    let decoded =
-                        decode_ws_frame(message, &self.instrument, self.timeframe, &self.config);
-                    if matches!(&decoded, DecodedFrame::Close(_)) {
-                        self.outbound.clear();
-                        self.peer_close_outcome = Some(decoded);
-                    } else {
-                        self.decoded.push_back(Ok(decoded));
-                    }
-                    made_progress = true;
-                }
-                Poll::Ready(Some(Err(error))) => {
-                    let error = map_websocket_error(error, &self.context);
-                    return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
-                }
-                Poll::Ready(None) => {
-                    let error = ProviderError::Transport {
-                        context: self.context.clone(),
-                        cause: SanitizedCause::Closed,
-                    };
-                    return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
-                }
-                Poll::Pending => {}
-            }
-        }
-        if self.stalled_write_error.is_none()
-            && self.peer_close_outcome.is_none()
-            && let Some(message) = self.outbound.pop_front()
-        {
-            let mut stream = Pin::new(&mut self.stream);
-            match Sink::<Message>::poll_ready(stream.as_mut(), cx) {
-                Poll::Ready(Ok(())) => match Sink::<Message>::start_send(stream, message) {
-                    Ok(()) => {
-                        self.flush_pending = true;
-                        if self.stalled_write_error.is_none() {
-                            self.ensure_write_stall_deadline();
-                        }
-                        made_progress = true;
-                    }
-                    Err(error) => {
-                        let error = map_websocket_error(error, &self.context);
-                        return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
-                    }
-                },
-                Poll::Ready(Err(error)) => {
-                    let error = map_websocket_error(error, &self.context);
-                    return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
-                }
-                Poll::Pending => self.outbound.push_front(message),
-            }
-        }
-
-        match Sink::<Message>::poll_flush(Pin::new(&mut self.stream), cx) {
-            Poll::Ready(Ok(())) => {
-                self.flush_pending = false;
-                if let Some(close) = self.peer_close_outcome.take() {
-                    self.decoded.push_back(Ok(close));
-                    let error = ProviderError::Transport {
-                        context: self.context.clone(),
-                        cause: SanitizedCause::Closed,
-                    };
-                    return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
-                }
-                if self.outbound.is_empty() {
-                    self.write_stall_deadline = None;
-                }
-                if made_progress || !self.decoded.is_empty() {
-                    Poll::Ready(Ok(()))
-                } else {
-                    Poll::Pending
-                }
-            }
-            Poll::Ready(Err(error)) => {
-                let error = map_websocket_error(error, &self.context);
-                Poll::Ready(self.finish_or_defer_terminal_error(error, writing))
-            }
-            Poll::Pending if made_progress => Poll::Ready(Ok(())),
-            Poll::Pending => Poll::Pending,
-        }
-    }
+    let (year, month) = if date.month() == Month::December {
+        (date.year().checked_add(1)?, Month::January)
+    } else {
+        (date.year(), date.month().next())
+    };
+    let next = Date::from_calendar_date(year, month, 1).ok()?;
+    i64::try_from(next.midnight().assume_utc().unix_timestamp_nanos() / 1_000_000).ok()
 }
+
+fn unix_now_ms() -> Result<i64, ProviderError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(ProviderError::Invariant(
+            "system time is outside millisecond range",
+        ))
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+pub type RawWebSocket = crate::provider::runtime::websocket::RawWebSocket<BinanceWsCodec>;
 
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-pub async fn connect_websocket(
+pub(crate) type RawWebSocket = crate::provider::runtime::websocket::RawWebSocket<BinanceWsCodec>;
+
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+pub(crate) async fn connect_websocket(
     instrument: &Instrument,
     timeframe: Timeframe,
     config: WsConfig,
 ) -> Result<RawWebSocket, ProviderError> {
     let url = websocket_url(instrument, timeframe)?;
-    connect_websocket_url(&url, instrument, timeframe, config).await
+    connect_websocket_url(&url, instrument, timeframe, config, BinanceWsCodec, None).await
 }
 
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -812,140 +455,45 @@ pub async fn connect_test_websocket(
     config: WsConfig,
 ) -> Result<RawWebSocket, ProviderError> {
     let url = test_websocket_url(base_url, instrument, timeframe)?;
-    connect_websocket_url(&url, instrument, timeframe, config).await
-}
-
-async fn connect_websocket_url(
-    url: &Url,
-    instrument: &Instrument,
-    timeframe: Timeframe,
-    config: WsConfig,
-) -> Result<RawWebSocket, ProviderError> {
-    let context =
-        ErrorContext::operation(ErrorOperation::WebSocket).with_market(instrument, timeframe);
-    let config = config
-        .validate()
-        .map_err(|error| contextualize_websocket_configuration(error, instrument, timeframe))?;
-    let tungstenite = config
-        .tungstenite()
-        .map_err(|error| contextualize_websocket_configuration(error, instrument, timeframe))?;
-    let stream = connect_async_with_config(url.as_str(), Some(tungstenite), false)
-        .await
-        .map(|(socket, _)| socket)
-        .map_err(|error| map_websocket_error(error, &context))?;
-    Ok(RawWebSocket {
-        stream,
-        config,
-        context,
-        instrument: instrument.clone(),
-        timeframe,
-        decoded: VecDeque::new(),
-        outbound: VecDeque::new(),
-        flush_pending: false,
-        write_stall_deadline: None,
-        last_data_message: tokio::time::Instant::now(),
-        terminal_io: false,
-        pending_terminal_error: None,
-        stalled_write_error: None,
-        peer_close_outcome: None,
-    })
-}
-
-pub async fn read_raw_websocket(socket: &mut RawWebSocket) -> Result<DecodedFrame, ProviderError> {
-    socket.read().await
-}
-
-pub async fn send_raw_websocket(
-    socket: &mut RawWebSocket,
-    message: Message,
-) -> Result<(), ProviderError> {
-    socket.send(message).await
-}
-
-pub async fn flush_raw_websocket(socket: &mut RawWebSocket) -> Result<(), ProviderError> {
-    socket.flush().await
-}
-
-fn map_websocket_error(error: WebSocketError, context: &ErrorContext) -> ProviderError {
-    match error {
-        WebSocketError::Capacity(CapacityError::MessageTooLong { max_size, .. }) => payload(
-            context,
-            PayloadError::OverBudget {
-                limit_bytes: max_size,
-            },
-        ),
-        WebSocketError::Protocol(_) => ProviderError::Protocol {
-            context: context.clone(),
-            detail: "invalid WebSocket framing",
-        },
-        WebSocketError::Utf8(_) => ProviderError::Protocol {
-            context: context.clone(),
-            detail: "invalid WebSocket UTF-8",
-        },
-        WebSocketError::AttackAttempt => ProviderError::Protocol {
-            context: context.clone(),
-            detail: "WebSocket attack attempt rejected",
-        },
-        WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed => {
-            ProviderError::Transport {
-                context: context.clone(),
-                cause: SanitizedCause::Closed,
-            }
-        }
-        WebSocketError::Tls(_) => ProviderError::Transport {
-            context: context.clone(),
-            cause: SanitizedCause::Tls,
-        },
-        WebSocketError::Io(_) => ProviderError::Transport {
-            context: context.clone(),
-            cause: SanitizedCause::Io,
-        },
-        WebSocketError::Url(_) | WebSocketError::Http(_) | WebSocketError::HttpFormat(_) => {
-            ProviderError::Transport {
-                context: context.clone(),
-                cause: SanitizedCause::Connection,
-            }
-        }
-        WebSocketError::Capacity(_) | WebSocketError::WriteBufferFull(_) => {
-            ProviderError::Protocol {
-                context: context.clone(),
-                detail: "WebSocket capacity invariant failed",
-            }
-        }
-    }
-}
-
-fn contextualize_websocket_configuration(
-    error: ProviderError,
-    instrument: &Instrument,
-    timeframe: Timeframe,
-) -> ProviderError {
-    match error {
-        ProviderError::Configuration(detail) => ProviderError::WebSocketConfiguration {
-            context: ErrorContext::operation(ErrorOperation::WebSocket)
-                .with_market(instrument, timeframe),
-            detail,
-        },
-        other => other,
-    }
+    connect_websocket_url(&url, instrument, timeframe, config, BinanceWsCodec, None).await
 }
 
 #[derive(Clone)]
 pub struct BinanceProvider {
-    client: Client,
+    http: HttpRuntime,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     base_url: Url,
     clock: Arc<dyn Clock>,
-    gate_sender: RateGateSender,
-    gate_snapshot: RateGateSnapshot,
+    rate_limit_fallback: Duration,
+    live: LiveSupervisorConfig,
+    max_connection_age: Duration,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    advertised_history_page_limit: u16,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    max_gap_reconciliation_candles: usize,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    max_gap_reconciliation_pages: usize,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    ws_base_url: Option<String>,
+}
+struct BinanceBuildConfig {
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    base_url: Url,
+    request_timeout: Duration,
     body_limit: usize,
     rate_limit_fallback: Duration,
     live: LiveSupervisorConfig,
+    max_connection_age: Duration,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    advertised_history_page_limit: u16,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    max_gap_reconciliation_candles: usize,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    max_gap_reconciliation_pages: usize,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     ws_base_url: Option<String>,
 }
 
-#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[derive(Clone, Debug)]
 pub struct BinanceTestConfig {
     pub base_url: String,
@@ -972,6 +520,10 @@ impl BinanceTestConfig {
             rest: self,
             ws_base_url: base_url.into(),
             live: LiveSupervisorConfig::default(),
+            max_connection_age: MAX_CONNECTION_AGE,
+            advertised_history_page_limit: 1000,
+            max_gap_reconciliation_candles: MAX_GAP_RECONCILIATION_CANDLES,
+            max_gap_reconciliation_pages: MAX_GAP_RECONCILIATION_PAGES,
         }
     }
 }
@@ -982,6 +534,159 @@ pub struct BinanceLiveTestConfig {
     pub rest: BinanceTestConfig,
     pub ws_base_url: String,
     pub live: LiveSupervisorConfig,
+    pub max_connection_age: Duration,
+    pub advertised_history_page_limit: u16,
+    pub max_gap_reconciliation_candles: usize,
+    pub max_gap_reconciliation_pages: usize,
+}
+
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
+pub(crate) struct BinanceLiveAdapter {
+    provider: BinanceProvider,
+}
+
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
+impl BinanceLiveAdapter {
+    fn new(provider: BinanceProvider) -> Self {
+        Self { provider }
+    }
+}
+
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
+pub(crate) struct BinanceLiveSocket {
+    raw: RawWebSocket,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    stalled_write_probe_frames: usize,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    stalled_write_probe_payload_size: usize,
+}
+
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
+impl LiveSocket for BinanceLiveSocket {
+    async fn read(&mut self) -> Result<LiveSocketEvent, ProviderError> {
+        match self.raw.read().await? {
+            DecodedFrame::Provider(BinanceDecoded::Candle(candle)) => {
+                Ok(LiveSocketEvent::Candle(candle))
+            }
+            DecodedFrame::Ignored => Ok(LiveSocketEvent::Ignored),
+            DecodedFrame::ProviderError(error) => Ok(LiveSocketEvent::DecodedError(error)),
+            DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested => {
+                Ok(LiveSocketEvent::ReconnectRequested)
+            }
+        }
+    }
+
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    async fn after_gap_sync_test_probe(&mut self) -> Result<(), ProviderError> {
+        if self.stalled_write_probe_frames == 0 {
+            return Ok(());
+        }
+        let payload = Message::Binary(vec![0; self.stalled_write_probe_payload_size].into());
+        for _ in 0..self.stalled_write_probe_frames {
+            self.raw.send(payload.clone()).await?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
+impl LiveAdapter for BinanceLiveAdapter {
+    type Socket = BinanceLiveSocket;
+
+    fn validate_request(
+        &self,
+        _instrument: &Instrument,
+        _timeframe: Timeframe,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    async fn connect_ready_socket(
+        &self,
+        instrument: Instrument,
+        timeframe: Timeframe,
+    ) -> Result<Self::Socket, ProviderError> {
+        let raw = self
+            .provider
+            .connect_live_socket(&instrument, timeframe)
+            .await?;
+        Ok(BinanceLiveSocket {
+            raw,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            stalled_write_probe_frames: self.provider.live.stalled_write_probe_frames,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            stalled_write_probe_payload_size: self
+                .provider
+                .live
+                .ws_config
+                .write_buffer_size
+                .min(self.provider.live.ws_config.max_frame_size)
+                .min(self.provider.live.ws_config.max_message_size)
+                .max(1),
+        })
+    }
+
+    async fn history(
+        &self,
+        instrument: Instrument,
+        timeframe: Timeframe,
+        request: HistoryRequest,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<Candle>, ProviderError> {
+        self.provider
+            .history(&instrument, timeframe, request, cancellation)
+            .await
+    }
+
+    fn rate_gate(&self) -> LiveRateGate {
+        LiveRateGate {
+            snapshot: self.provider.rate_gate(),
+            process_block: ProcessBlockPolicy::InvalidBanExpiry,
+        }
+    }
+
+    fn live_config(&self) -> LiveConfig<'_> {
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        let (max_successors, max_pages) = (
+            self.provider.max_gap_reconciliation_candles,
+            self.provider.max_gap_reconciliation_pages,
+        );
+        #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+        let (max_successors, max_pages) =
+            (MAX_GAP_RECONCILIATION_CANDLES, MAX_GAP_RECONCILIATION_PAGES);
+        LiveConfig {
+            supervisor: &self.provider.live,
+            reconciliation: ReconciliationLimits {
+                max_successors,
+                max_pages,
+                span_exceeded: "Binance gap reconciliation target exceeds the per-generation span limit",
+                page_exceeded: "Binance gap reconciliation exceeded the per-generation page limit",
+                distinct_exceeded: "Binance gap reconciliation exceeded the distinct buffered-candle limit",
+            },
+        }
+    }
+
+    fn connection_rotation(&self) -> ConnectionRotation {
+        ConnectionRotation::After {
+            max_age: self.provider.max_connection_age,
+            detail: "24-hour WebSocket connection age reached",
+        }
+    }
 }
 
 impl BinanceProvider {
@@ -989,10 +694,13 @@ impl BinanceProvider {
     pub fn new(clock: Arc<dyn Clock>) -> Result<Self, ProviderError> {
         Self::build(
             clock,
-            REST_REQUEST_TIMEOUT,
-            REST_BODY_LIMIT,
-            RATE_LIMIT_FALLBACK,
-            LiveSupervisorConfig::default(),
+            BinanceBuildConfig {
+                request_timeout: REST_REQUEST_TIMEOUT,
+                body_limit: REST_BODY_LIMIT,
+                rate_limit_fallback: RATE_LIMIT_FALLBACK,
+                live: LiveSupervisorConfig::default(),
+                max_connection_age: MAX_CONNECTION_AGE,
+            },
         )
     }
 
@@ -1011,13 +719,19 @@ impl BinanceProvider {
     ) -> Result<Self, ProviderError> {
         let base_url = validate_loopback_base(&config.base_url)?;
         Self::build(
-            base_url,
             clock,
-            config.request_timeout,
-            config.body_limit,
-            config.rate_limit_fallback,
-            LiveSupervisorConfig::default(),
-            None,
+            BinanceBuildConfig {
+                base_url,
+                request_timeout: config.request_timeout,
+                body_limit: config.body_limit,
+                rate_limit_fallback: config.rate_limit_fallback,
+                live: LiveSupervisorConfig::default(),
+                max_connection_age: MAX_CONNECTION_AGE,
+                advertised_history_page_limit: 1000,
+                max_gap_reconciliation_candles: MAX_GAP_RECONCILIATION_CANDLES,
+                max_gap_reconciliation_pages: MAX_GAP_RECONCILIATION_PAGES,
+                ws_base_url: None,
+            },
         )
     }
 
@@ -1029,56 +743,64 @@ impl BinanceProvider {
         let base_url = validate_loopback_base(&config.rest.base_url)?;
         validate_loopback_ws_base(&config.ws_base_url)?;
         Self::build(
-            base_url,
             clock,
-            config.rest.request_timeout,
-            config.rest.body_limit,
-            config.rest.rate_limit_fallback,
-            config.live,
-            Some(config.ws_base_url),
+            BinanceBuildConfig {
+                base_url,
+                request_timeout: config.rest.request_timeout,
+                body_limit: config.rest.body_limit,
+                rate_limit_fallback: config.rest.rate_limit_fallback,
+                live: config.live,
+                max_connection_age: config.max_connection_age,
+                advertised_history_page_limit: config.advertised_history_page_limit,
+                max_gap_reconciliation_candles: config.max_gap_reconciliation_candles,
+                max_gap_reconciliation_pages: config.max_gap_reconciliation_pages,
+                ws_base_url: Some(config.ws_base_url),
+            },
         )
     }
 
-    fn build(
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        base_url: Url,
-        clock: Arc<dyn Clock>,
-        request_timeout: Duration,
-        body_limit: usize,
-        rate_limit_fallback: Duration,
-        live: LiveSupervisorConfig,
-        #[cfg(all(
-            feature = "test-transport",
-            not(feature = "production-transport")
-        ))]
-        ws_base_url: Option<String>,
-    ) -> Result<Self, ProviderError> {
-        if request_timeout.is_zero() || body_limit == 0 || rate_limit_fallback.is_zero() {
+    fn build(clock: Arc<dyn Clock>, config: BinanceBuildConfig) -> Result<Self, ProviderError> {
+        if config.request_timeout.is_zero()
+            || config.body_limit == 0
+            || config.rate_limit_fallback.is_zero()
+        {
             return Err(ProviderError::Configuration(
                 "REST timeout, body limit, and fallback must be positive",
             ));
         }
-        live.validate()?;
-        let client = Client::builder()
-            .no_proxy()
-            .timeout(request_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("fccli/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|_| ProviderError::Configuration("failed to build REST client"))?;
-        let (gate_sender, gate_snapshot) = rate_gate_channel(RateGateState::Open);
+        config.live.validate()?;
+        if config.max_connection_age.is_zero() {
+            return Err(ProviderError::Configuration(
+                "live connection max age must be positive",
+            ));
+        }
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        if config.max_gap_reconciliation_candles == 0 || config.max_gap_reconciliation_pages == 0 {
+            return Err(ProviderError::Configuration(
+                "live reconciliation limits must be positive",
+            ));
+        }
+        let http = HttpRuntime::new(
+            Arc::clone(&clock),
+            config.request_timeout,
+            config.body_limit,
+        )?;
         Ok(Self {
-            client,
+            http,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            base_url,
+            base_url: config.base_url,
             clock,
-            gate_sender,
-            gate_snapshot,
-            body_limit,
-            rate_limit_fallback,
-            live,
+            rate_limit_fallback: config.rate_limit_fallback,
+            live: config.live,
+            max_connection_age: config.max_connection_age,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            ws_base_url,
+            advertised_history_page_limit: config.advertised_history_page_limit,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            max_gap_reconciliation_candles: config.max_gap_reconciliation_candles,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            max_gap_reconciliation_pages: config.max_gap_reconciliation_pages,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            ws_base_url: config.ws_base_url,
         })
     }
 
@@ -1118,47 +840,24 @@ impl BinanceProvider {
                 query.push(("endTime", end_time.to_string()));
             }
 
-            let response = tokio::select! {
-                biased;
-                () = cancellation.cancelled() => return Err(cancelled(context.clone())),
-                result = self.client.get(url).query(&query).send() => result.map_err(|error| {
-                    if error.is_timeout() {
-                        ProviderError::Timeout { context: context.clone(), kind: TimeoutKind::Request }
-                    } else {
-                        ProviderError::Transport { context: context.clone(), cause: SanitizedCause::Connection }
-                    }
-                })?,
-            };
+            let response = self
+                .http
+                .send(
+                    self.http.client().get(url).query(&query),
+                    &cancellation,
+                    &context,
+                )
+                .await?;
 
             let status = response.status();
             if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::IM_A_TEAPOT {
                 return self.handle_rate_limit(&response, context);
             }
-            if status.is_server_error() {
-                return Err(ProviderError::ServerStatus {
-                    context,
-                    status: status.as_u16(),
-                });
-            }
-            if status.is_redirection() {
-                return Err(ProviderError::ClientStatus {
-                    context,
-                    status: status.as_u16(),
-                    code: None,
-                    message: None,
-                });
-            }
-            if status.is_client_error() {
-                let bytes =
-                    match read_capped(response, self.body_limit, &cancellation, &context).await {
-                        Ok(bytes) => bytes,
-                        Err(error) if is_cancelled(&error) => return Err(error),
-                        Err(_) => Vec::new(),
-                    };
-                return Err(map_http_error(status, &bytes, context));
-            }
-            let bytes = read_capped(response, self.body_limit, &cancellation, &context).await?;
-            decode_klines(&bytes, request.limit(), context)
+            let bytes = self
+                .http
+                .read_response(response, &cancellation, context.clone(), map_http_error)
+                .await?;
+            decode_klines(&bytes, request, timeframe, context)
         }
         #[cfg(all(feature = "production-transport", feature = "test-transport"))]
         {
@@ -1172,31 +871,11 @@ impl BinanceProvider {
         cancellation: &CancellationToken,
         context: &ErrorContext,
     ) -> Result<(), ProviderError> {
-        let mut snapshot = self.gate_snapshot.clone();
-        loop {
-            match snapshot
-                .current()
-                .map_err(|_| ProviderError::Invariant("rate gate closed"))?
-            {
-                RateGateState::Open => return Ok(()),
-                RateGateState::ProcessBlocked(ProcessBlocker::InvalidBanExpiry) => {
-                    return Err(ProviderError::InvalidBanExpiry);
-                }
-                RateGateState::TimedUntil(deadline) if deadline <= self.clock.now() => {
-                    return Ok(());
-                }
-                RateGateState::TimedUntil(deadline) => {
-                    tokio::select! {
-                        biased;
-                        () = cancellation.cancelled() => return Err(cancelled(context.clone())),
-                        changed = snapshot.changed() => {
-                            changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?;
-                        }
-                        () = self.clock.sleep_until(deadline) => {}
-                    }
-                }
-            }
-        }
+        self.http
+            .await_gate(cancellation, context, |blocker| match blocker {
+                ProcessBlocker::InvalidBanExpiry => ProviderError::InvalidBanExpiry,
+            })
+            .await
     }
 
     fn handle_rate_limit(
@@ -1214,39 +893,23 @@ impl BinanceProvider {
             .and_then(|seconds| {
                 checked_deadline(self.clock.now(), Duration::from_secs(seconds)).ok()
             });
-
         let deadline = if status == StatusCode::TOO_MANY_REQUESTS {
             parsed.or_else(|| checked_deadline(self.clock.now(), self.rate_limit_fallback).ok())
         } else {
             parsed
         };
-        if let Some(deadline) = deadline {
-            self.gate_sender
-                .publish(RateGateState::TimedUntil(deadline))
-                .map_err(|_| ProviderError::Invariant("rate gate closed"))?;
-        } else {
-            self.gate_sender
-                .publish(RateGateState::ProcessBlocked(
-                    ProcessBlocker::InvalidBanExpiry,
-                ))
-                .map_err(|_| ProviderError::Invariant("rate gate closed"))?;
-        }
-        let effective = self
-            .gate_snapshot
-            .current()
-            .map_err(|_| ProviderError::Invariant("rate gate closed"))?;
-        if matches!(
-            effective,
-            RateGateState::ProcessBlocked(ProcessBlocker::InvalidBanExpiry)
-        ) {
-            return Err(ProviderError::InvalidBanExpiry);
-        }
-        Err(ProviderError::RateLimited {
-            context,
-            status: status.as_u16(),
-        })
+        let decision = deadline.map_or(
+            RateLimitDecision::ProcessBlocked(ProcessBlocker::InvalidBanExpiry),
+            RateLimitDecision::TimedUntil,
+        );
+        self.http.apply_rate_limit(decision, context, status)?;
+        unreachable!("rate-limit application always returns an error")
     }
 
+    #[cfg(any(
+        all(feature = "production-transport", not(feature = "test-transport")),
+        all(feature = "test-transport", not(feature = "production-transport"))
+    ))]
     async fn connect_live_socket(
         &self,
         instrument: &Instrument,
@@ -1267,783 +930,7 @@ impl BinanceProvider {
             connect_test_websocket(base, instrument, timeframe, self.live.ws_config).await
         }
         #[cfg(all(feature = "production-transport", feature = "test-transport"))]
-        {
-            let _ = (instrument, timeframe);
-            unreachable!("mutually exclusive transport features are rejected by src/lib.rs")
-        }
-    }
-
-    async fn supervise_live(
-        self,
-        mut request: LiveRequest,
-        sender: EventEmitter,
-    ) -> Result<(), ProviderError> {
-        let mut generation_number = 0_u64;
-        let mut backoff_index = 0_usize;
-        loop {
-            if request.cancellation.is_cancelled() {
-                sender.shutdown().await;
-                return Ok(());
-            }
-            if matches!(
-                self.gate_snapshot.current(),
-                Ok(RateGateState::ProcessBlocked(_))
-            ) {
-                self.send_invalid_ban_and_stop(&sender).await;
-                return Err(ProviderError::InvalidBanExpiry);
-            }
-            generation_number = generation_number
-                .checked_add(1)
-                .ok_or(ProviderError::Invariant("gap generation overflow"))?;
-            let generation = GapGeneration(generation_number);
-            send_market(
-                &sender,
-                &request.cancellation,
-                MarketEvent::Status {
-                    generation: Some(generation),
-                    status: ConnectionStatus::Connecting,
-                },
-            )
-            .await?;
-            let connect_result = {
-                let connect_instrument = request.instrument.clone();
-                let connect_timeframe = request.timeframe;
-                let connect = self.connect_live_socket(&connect_instrument, connect_timeframe);
-                tokio::pin!(connect);
-                let mut gate = self.gate_snapshot.clone();
-                loop {
-                    tokio::select! {
-                        biased;
-                        () = request.cancellation.cancelled() => {
-                            sender.shutdown().await;
-                            return Ok(());
-                        }
-                        changed = request.accepted_watermark_rx.changed() => {
-                            if changed.is_err() {
-                                break Err(control_channel_closed(&request.instrument, request.timeframe));
-                            }
-                        }
-                        ack = request.reconcile_ack_rx.changed() => {
-                            if ack.is_err() {
-                                break Err(control_channel_closed(&request.instrument, request.timeframe));
-                            }
-                        }
-                        changed = gate.changed() => match changed {
-                            Err(_) => break Err(ProviderError::Invariant("rate gate closed")),
-                            Ok(RateGateState::ProcessBlocked(_)) => {
-                                self.send_invalid_ban_and_stop(&sender).await;
-                                return Err(ProviderError::InvalidBanExpiry);
-                            }
-                            Ok(RateGateState::Open | RateGateState::TimedUntil(_)) => {}
-                        },
-                        result = &mut connect => break result,
-                    }
-                }
-            };
-            let mut socket = match connect_result {
-                Ok(socket) => socket,
-                Err(error) if is_terminal_live_error(&error) => {
-                    sender.invalidate_generation(generation);
-                    send_market(
-                        &sender,
-                        &request.cancellation,
-                        MarketEvent::TerminalError(error.clone()),
-                    )
-                    .await?;
-                    return Err(error);
-                }
-                Err(error) => {
-                    sender.invalidate_generation(generation);
-                    self.recover_and_backoff(
-                        &sender,
-                        &mut request,
-                        Some(generation),
-                        error,
-                        &mut backoff_index,
-                    )
-                    .await?;
-                    continue;
-                }
-            };
-            let age_deadline = checked_deadline(self.clock.now(), self.live.max_connection_age)
-                .map_err(|_| ProviderError::Invariant("live connection age deadline overflow"))?;
-            let outcome = self
-                .run_generation(&mut request, &sender, &mut socket, generation, age_deadline)
-                .await;
-            drop(socket);
-            if !matches!(&outcome, Ok(GenerationOutcome::Cancelled)) {
-                sender.invalidate_generation(generation);
-            }
-            match outcome {
-                Ok(GenerationOutcome::Cancelled) => {
-                    sender.shutdown().await;
-                    return Ok(());
-                }
-                Ok(GenerationOutcome::AcknowledgedReconnect(error)) => {
-                    if sender.connected_delivered(generation) {
-                        backoff_index = 0;
-                    }
-                    self.recover_and_backoff(
-                        &sender,
-                        &mut request,
-                        Some(generation),
-                        error,
-                        &mut backoff_index,
-                    )
-                    .await?;
-                }
-                Ok(GenerationOutcome::Reconnect(error)) => {
-                    self.recover_and_backoff(
-                        &sender,
-                        &mut request,
-                        Some(generation),
-                        error,
-                        &mut backoff_index,
-                    )
-                    .await?;
-                }
-                Err(error) if matches!(error, ProviderError::InvalidBanExpiry) => {
-                    self.send_invalid_ban_and_stop(&sender).await;
-                    return Err(error);
-                }
-                Err(error) if is_terminal_live_error(&error) => {
-                    send_market(
-                        &sender,
-                        &request.cancellation,
-                        MarketEvent::TerminalError(error.clone()),
-                    )
-                    .await?;
-                    return Err(error);
-                }
-                Err(error) => {
-                    self.recover_and_backoff(
-                        &sender,
-                        &mut request,
-                        Some(generation),
-                        error,
-                        &mut backoff_index,
-                    )
-                    .await?
-                }
-            }
-        }
-    }
-
-    async fn run_generation(
-        &self,
-        request: &mut LiveRequest,
-        sender: &EventEmitter,
-        socket: &mut RawWebSocket,
-        generation: GapGeneration,
-        age_deadline: MonoInstant,
-    ) -> Result<GenerationOutcome, ProviderError> {
-        send_market(
-            sender,
-            &request.cancellation,
-            MarketEvent::Status {
-                generation: Some(generation),
-                status: ConnectionStatus::GapSync,
-            },
-        )
-        .await?;
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        if self.live.stalled_write_probe_frames != 0 {
-            let payload_size = self
-                .live
-                .ws_config
-                .write_buffer_size
-                .min(self.live.ws_config.max_frame_size)
-                .min(self.live.ws_config.max_message_size)
-                .max(1);
-            let payload = Message::Binary(vec![0; payload_size].into());
-            for _ in 0..self.live.stalled_write_probe_frames {
-                tokio::select! {
-                    biased;
-                    () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
-                    result = socket.send(payload.clone()) => result?,
-                }
-            }
-        }
-        let mut gate = self.gate_snapshot.clone();
-        let first_deadline = checked_deadline(self.clock.now(), self.live.first_kline_timeout)
-            .map_err(|_| ProviderError::Invariant("first-kline deadline overflow"))?;
-        let first = loop {
-            tokio::select! {
-                biased;
-                () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
-                changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
-                ack = request.reconcile_ack_rx.changed() => { ack.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
-                changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::InvalidBanExpiry); },
-                frame = socket.read() => match frame? {
-                    DecodedFrame::Candle(candle) => break candle,
-                    DecodedFrame::Ignored => {
-                        let now = self.clock.now();
-                        if now >= first_deadline {
-                            return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), kind: TimeoutKind::FirstKline }));
-                        }
-                        if now >= age_deadline {
-                            return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached")));
-                        }
-                    }
-                    DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => return Ok(GenerationOutcome::Reconnect(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" })),
-                    DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
-                    DecodedFrame::ProviderError(error) => return Ok(GenerationOutcome::Reconnect(error)),
-                },
-                () = self.clock.sleep_until(age_deadline) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached"))),
-                () = self.clock.sleep_until(first_deadline) => {
-                    return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), kind: TimeoutKind::FirstKline }));
-                }
-            }
-        };
-        let confirmed = request
-            .accepted_watermark_rx
-            .current()
-            .map_err(|_| ProviderError::ChannelClosed {
-                context: ErrorContext::operation(ErrorOperation::Reconciliation)
-                    .with_market(&request.instrument, request.timeframe),
-            })?
-            .max(request.startup_watermark);
-        let start = confirmed.unwrap_or_else(|| first.open_time());
-        let mut target_open_time = first.open_time().max(start);
-        let mut revision = ReplayRevision(1);
-        let mut buffered = BTreeMap::new();
-        if first.open_time() >= start {
-            coalesce_candle(&mut buffered, first);
-        }
-        let mut deferred_reconnect: Option<ProviderError> = None;
-        let mut rest_synced_through = None;
-
-        loop {
-            let mut cursor = match rest_synced_through {
-                Some(last) => next_gap_cursor(request.timeframe, last)?,
-                None => start,
-            };
-            while cursor <= target_open_time {
-                let request_target = target_open_time;
-                let history_request =
-                    HistoryRequest::gap(cursor, request_target, GAP_PAGE_LIMIT)
-                        .map_err(|_| ProviderError::Invariant("invalid gap history request"))?;
-                let page = {
-                    let history_instrument = request.instrument.clone();
-                    let history_timeframe = request.timeframe;
-                    let history_cancel = request.cancellation.child_token();
-                    let history = self.history(
-                        &history_instrument,
-                        history_timeframe,
-                        history_request,
-                        history_cancel,
-                    );
-                    tokio::pin!(history);
-                    enum ReconcileWake {
-                        Cancelled,
-                        AcceptedWatermark(Result<Option<i64>, ProviderError>),
-                        Ack(Result<(), ProviderError>),
-                        ConnectionAged,
-                        Gate(Result<RateGateState, ProviderError>),
-                        Socket(Result<DecodedFrame, ProviderError>),
-                        Page(Result<Vec<Candle>, ProviderError>),
-                    }
-
-                    loop {
-                        if request.cancellation.is_cancelled() {
-                            return Ok(GenerationOutcome::Cancelled);
-                        }
-                        let wake = tokio::select! {
-                            () = request.cancellation.cancelled() => ReconcileWake::Cancelled,
-                            changed = request.accepted_watermark_rx.changed() => ReconcileWake::AcceptedWatermark(changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))),
-                            ack = request.reconcile_ack_rx.changed() => ReconcileWake::Ack(ack.map(|_| ()).map_err(|_| control_channel_closed(&request.instrument, request.timeframe))),
-                            () = self.clock.sleep_until(age_deadline) => ReconcileWake::ConnectionAged,
-                            changed = gate.changed() => ReconcileWake::Gate(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))),
-                            frame = socket.read() => ReconcileWake::Socket(frame),
-                            page = &mut history => ReconcileWake::Page(page),
-                        };
-                        if request.cancellation.is_cancelled() {
-                            return Ok(GenerationOutcome::Cancelled);
-                        }
-                        match wake {
-                            ReconcileWake::Cancelled => return Ok(GenerationOutcome::Cancelled),
-                            ReconcileWake::AcceptedWatermark(changed) => {
-                                if let Some(watermark) = changed? {
-                                    target_open_time = target_open_time.max(watermark);
-                                }
-                            }
-                            ReconcileWake::Ack(changed) => changed?,
-                            ReconcileWake::ConnectionAged => {
-                                return Ok(GenerationOutcome::Reconnect(live_protocol_error(
-                                    request,
-                                    "24-hour WebSocket connection age reached",
-                                )));
-                            }
-                            ReconcileWake::Gate(changed) => {
-                                if matches!(changed?, RateGateState::ProcessBlocked(_)) {
-                                    return Err(ProviderError::InvalidBanExpiry);
-                                }
-                            }
-                            ReconcileWake::Socket(frame) => match frame {
-                                Ok(DecodedFrame::Candle(candle)) => {
-                                    apply_reconciliation_candle(
-                                        &mut buffered,
-                                        candle,
-                                        &mut revision,
-                                        &mut target_open_time,
-                                    )?;
-                                }
-                                Ok(DecodedFrame::Ignored) => {}
-                                Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => {
-                                    return Ok(GenerationOutcome::Reconnect(live_protocol_error(
-                                        request,
-                                        "WebSocket peer requested reconnect",
-                                    )));
-                                }
-                                Ok(DecodedFrame::ProviderError(error))
-                                    if is_terminal_live_error(&error) =>
-                                {
-                                    return Err(error);
-                                }
-                                Err(error) if is_terminal_live_error(&error) => return Err(error),
-                                Ok(DecodedFrame::ProviderError(error)) | Err(error) => {
-                                    return Ok(GenerationOutcome::Reconnect(error));
-                                }
-                            },
-                            ReconcileWake::Page(page) => {
-                                if request.cancellation.is_cancelled() {
-                                    return Ok(GenerationOutcome::Cancelled);
-                                }
-                                let terminal = async {
-                                tokio::select! {
-                                    biased;
-                                    () = request.cancellation.cancelled() => Ok((Some(GenerationOutcome::Cancelled), false)),
-                                    changed = request.accepted_watermark_rx.changed() => changed
-                                        .map(|watermark| {
-                                            if let Some(watermark) = watermark {
-                                                target_open_time = target_open_time.max(watermark);
-                                            }
-                                            (None, true)
-                                        })
-                                        .map_err(|_| control_channel_closed(&request.instrument, request.timeframe)),
-                                    ack = request.reconcile_ack_rx.changed() => ack
-                                        .map(|_| (None, false))
-                                        .map_err(|_| control_channel_closed(&request.instrument, request.timeframe)),
-                                    () = self.clock.sleep_until(age_deadline) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached"))), false)),
-                                    changed = gate.changed() => match changed {
-                                        Ok(RateGateState::ProcessBlocked(_)) => Err(ProviderError::InvalidBanExpiry),
-                                        Ok(_) => Ok((None, false)),
-                                        Err(_) => Err(ProviderError::Invariant("rate gate closed")),
-                                    },
-                                    frame = socket.read() => match frame {
-                                        Ok(DecodedFrame::Candle(candle)) => {
-                                            apply_reconciliation_candle(&mut buffered, candle, &mut revision, &mut target_open_time)?;
-                                            Ok((None, false))
-                                        }
-                                        Ok(DecodedFrame::Ignored) => Ok((None, false)),
-                                        Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))), false)),
-                                        Ok(DecodedFrame::ProviderError(error)) | Err(error) if is_terminal_live_error(&error) => Err(error),
-                                        Ok(DecodedFrame::ProviderError(error)) | Err(error) => Ok((Some(GenerationOutcome::Reconnect(error)), false)),
-                                    },
-                                }
-                            }
-                            .now_or_never()
-                            .transpose()?;
-                                if request.cancellation.is_cancelled() {
-                                    return Ok(GenerationOutcome::Cancelled);
-                                }
-                                let watermark_consumed = match terminal {
-                                    Some((Some(outcome), _)) => return Ok(outcome),
-                                    Some((None, true)) => true,
-                                    _ => false,
-                                };
-                                if watermark_consumed {
-                                    let follow_up = async {
-                                    tokio::select! {
-                                        biased;
-                                        () = request.cancellation.cancelled() => Ok(Some(GenerationOutcome::Cancelled)),
-                                        frame = socket.read() => match frame {
-                                            Ok(DecodedFrame::Candle(candle)) => {
-                                                apply_reconciliation_candle(&mut buffered, candle, &mut revision, &mut target_open_time)?;
-                                                Ok(None)
-                                            }
-                                            Ok(DecodedFrame::Ignored) => Ok(None),
-                                            Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect")))),
-                                            Ok(DecodedFrame::ProviderError(error)) | Err(error) if is_terminal_live_error(&error) => Err(error),
-                                            Ok(DecodedFrame::ProviderError(error)) | Err(error) => Ok(Some(GenerationOutcome::Reconnect(error))),
-                                        },
-                                        () = self.clock.sleep_until(age_deadline) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached")))),
-                                        changed = gate.changed() => match changed {
-                                            Ok(RateGateState::ProcessBlocked(_)) => Err(ProviderError::InvalidBanExpiry),
-                                            Ok(_) => Ok(None),
-                                            Err(_) => Err(ProviderError::Invariant("rate gate closed")),
-                                        },
-                                        ack = request.reconcile_ack_rx.changed() => ack
-                                            .map(|_| None)
-                                            .map_err(|_| control_channel_closed(&request.instrument, request.timeframe)),
-                                    }
-                                }
-                                .now_or_never()
-                                .transpose()?;
-                                    if request.cancellation.is_cancelled() {
-                                        return Ok(GenerationOutcome::Cancelled);
-                                    }
-                                    if let Some(Some(outcome)) = follow_up {
-                                        return Ok(outcome);
-                                    }
-                                }
-                                break page;
-                            }
-                        }
-                    }
-                };
-                let page = page?;
-                let last = page.last().map(Candle::open_time);
-                if page.is_empty() {
-                    if confirmed.is_none() && cursor == start {
-                        break;
-                    }
-                    return Ok(GenerationOutcome::Reconnect(
-                        ProviderError::GapSyncNoProgress {
-                            target_open_time: request_target,
-                            last_open_time: None,
-                        },
-                    ));
-                }
-                if last.is_some_and(|value| value < cursor) {
-                    return Ok(GenerationOutcome::Reconnect(
-                        ProviderError::GapSyncNoProgress {
-                            target_open_time: request_target,
-                            last_open_time: last,
-                        },
-                    ));
-                }
-                let page_len = page.len();
-                let mut accepted_any = false;
-                for candle in page {
-                    accepted_any |= coalesce_candle(&mut buffered, candle);
-                }
-                let Some(last) = last else { unreachable!() };
-                rest_synced_through = Some(last);
-                if last >= target_open_time {
-                    break;
-                }
-                if last < request_target && page_len < usize::from(GAP_PAGE_LIMIT) {
-                    return Ok(GenerationOutcome::Reconnect(
-                        ProviderError::GapSyncNoProgress {
-                            target_open_time: request_target,
-                            last_open_time: Some(last),
-                        },
-                    ));
-                }
-                if !accepted_any && last < request_target {
-                    return Ok(GenerationOutcome::Reconnect(
-                        ProviderError::GapSyncNoProgress {
-                            target_open_time: request_target,
-                            last_open_time: Some(last),
-                        },
-                    ));
-                }
-                cursor = next_gap_cursor(request.timeframe, last)?;
-            }
-            let page_candles = buffered.values().cloned().collect();
-            let expected = ReconcileExpectation {
-                generation,
-                revision,
-                target_open_time,
-            };
-            request
-                .reconcile_ack_rx
-                .register_expectation(expected)
-                .map_err(|error| match error {
-                    ReconcileExpectationError::Closed => {
-                        control_channel_closed(&request.instrument, request.timeframe)
-                    }
-                    ReconcileExpectationError::Regression | ReconcileExpectationError::Conflict => {
-                        ProviderError::Invariant("reconciliation expectation invariant violated")
-                    }
-                })?;
-            send_market(
-                sender,
-                &request.cancellation,
-                MarketEvent::ReconcileBatch {
-                    generation,
-                    revision,
-                    target_open_time,
-                    candles: page_candles,
-                },
-            )
-            .await?;
-            let ack_deadline = checked_deadline(self.clock.now(), self.live.reconcile_ack_timeout)
-                .map_err(|_| ProviderError::Invariant("ack deadline overflow"))?;
-            loop {
-                tokio::select! {
-                    biased;
-                    () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
-                    changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
-                    () = self.clock.sleep_until(age_deadline) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached"))),
-                    changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::InvalidBanExpiry); },
-                    frame = socket.read(), if deferred_reconnect.is_none() => match frame? {
-                        DecodedFrame::Candle(candle) => {
-                            apply_reconciliation_candle(&mut buffered, candle, &mut revision, &mut target_open_time)?;
-                            break;
-                        }
-                        DecodedFrame::Ignored => {
-                            if let Some(ack) = request
-                                .reconcile_ack_rx
-                                .current()
-                                .map_err(|_| {
-                                    control_channel_closed(&request.instrument, request.timeframe)
-                                })?
-                                && ack.generation == generation
-                                && ack.revision == revision
-                                && ack.through >= target_open_time
-                            {
-                                return if let Some(error) = deferred_reconnect.take() {
-                                    Ok(GenerationOutcome::Reconnect(error))
-                                } else {
-                                    self.connected_loop(request, sender, socket, generation, age_deadline).await
-                                };
-                            }
-                            if self.clock.now() >= ack_deadline {
-                                return Ok(GenerationOutcome::Reconnect(ProviderError::ReconcileAckTimeout { generation, revision, target_open_time }));
-                            }
-                        }
-                        DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))),
-                        DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
-                        DecodedFrame::ProviderError(error) => deferred_reconnect = Some(error),
-                    },
-                    ack = request.reconcile_ack_rx.changed() => {
-                        let ReconcileAck { generation: ack_generation, revision: ack_revision, through } = ack.map_err(|_| ProviderError::ChannelClosed { context: ErrorContext::operation(ErrorOperation::Reconciliation).with_market(&request.instrument, request.timeframe) })?;
-                        if ack_generation == generation && ack_revision == revision && through >= target_open_time {
-                            return if let Some(error) = deferred_reconnect.take() {
-                                Ok(GenerationOutcome::Reconnect(error))
-                            } else {
-                                self.connected_loop(request, sender, socket, generation, age_deadline).await
-                            };
-                        }
-                    },
-                    () = self.clock.sleep_until(ack_deadline) => {
-                        if let Ok(Some(ack)) = request.reconcile_ack_rx.current()
-                            && ack.generation == generation
-                            && ack.revision == revision
-                            && ack.through >= target_open_time
-                        {
-                            return if let Some(error) = deferred_reconnect.take() {
-                                Ok(GenerationOutcome::Reconnect(error))
-                            } else {
-                                self.connected_loop(request, sender, socket, generation, age_deadline).await
-                            };
-                        }
-                        return Ok(GenerationOutcome::Reconnect(ProviderError::ReconcileAckTimeout { generation, revision, target_open_time }));
-                    }
-                }
-            }
-        }
-    }
-
-    async fn connected_loop(
-        &self,
-        request: &mut LiveRequest,
-        sender: &EventEmitter,
-        socket: &mut RawWebSocket,
-        generation: GapGeneration,
-        age_deadline: MonoInstant,
-    ) -> Result<GenerationOutcome, ProviderError> {
-        let mut connected_queued = false;
-        let mut pending = BTreeMap::<i64, Candle>::new();
-        let mut gate = self.gate_snapshot.clone();
-        loop {
-            if matches!(gate.current(), Ok(RateGateState::ProcessBlocked(_))) {
-                return Err(ProviderError::InvalidBanExpiry);
-            }
-            tokio::select! {
-                biased;
-                () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
-                changed = gate.changed() => match changed.map_err(|_| ProviderError::Invariant("rate gate closed"))? {
-                    RateGateState::ProcessBlocked(_) => return Err(ProviderError::InvalidBanExpiry),
-                    RateGateState::Open | RateGateState::TimedUntil(_) => {}
-                },
-                changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
-                ack = request.reconcile_ack_rx.changed() => { ack.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
-                result = send_market(sender, &request.cancellation, MarketEvent::Status { generation: Some(generation), status: ConnectionStatus::Connected }), if !connected_queued => {
-                    result?;
-                    connected_queued = true;
-                },
-                permit = sender.reserve_regular(), if connected_queued && !pending.is_empty() => {
-                    let permit = permit?;
-                    let key = *pending.first_key_value().expect("pending is nonempty").0;
-                    let candle = pending.remove(&key).expect("key came from pending");
-                    sender.send_reserved(permit, MarketEvent::Candle { generation, candle })?;
-                },
-                frame = socket.read() => {
-                    if self.clock.now() >= age_deadline {
-                        let error = live_protocol_error(request, "24-hour WebSocket connection age reached");
-                        return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
-                    }
-                    match frame {
-                        Ok(DecodedFrame::Candle(candle)) => {
-                            let is_new_key = !pending.contains_key(&candle.open_time());
-                            if is_new_key && pending.len() == self.live.keyed_candle_capacity {
-                                let outcome = ProviderError::QueueSaturated;
-                                return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(outcome) } else { GenerationOutcome::Reconnect(outcome) });
-                            }
-                            coalesce_candle(&mut pending, candle);
-                        }
-                        Ok(DecodedFrame::Ignored) => {}
-                        Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => {
-                            let error = live_protocol_error(request, "WebSocket peer requested reconnect");
-                            return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
-                        }
-                        Ok(DecodedFrame::ProviderError(error)) if is_terminal_live_error(&error) => return Err(error),
-                        Err(error) if is_terminal_live_error(&error) => return Err(error),
-                        Ok(DecodedFrame::ProviderError(error)) | Err(error) => {
-                            return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
-                        }
-                    }
-                },
-                () = self.clock.sleep_until(age_deadline) => {
-                    let error = live_protocol_error(request, "24-hour WebSocket connection age reached");
-                    return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
-                },
-            }
-        }
-    }
-
-    async fn recover_and_backoff(
-        &self,
-        sender: &EventEmitter,
-        request: &mut LiveRequest,
-        generation: Option<GapGeneration>,
-        error: ProviderError,
-        backoff_index: &mut usize,
-    ) -> Result<(), ProviderError> {
-        let cancellation = request.cancellation.clone();
-        let mut gate = self.gate_snapshot.clone();
-        let initial_gate = match gate.current() {
-            Ok(state) => state,
-            Err(_) => {
-                let error = ProviderError::Invariant("rate gate closed");
-                send_market(
-                    sender,
-                    &cancellation,
-                    MarketEvent::TerminalError(error.clone()),
-                )
-                .await?;
-                return Err(error);
-            }
-        };
-        if matches!(initial_gate, RateGateState::ProcessBlocked(_)) {
-            self.send_invalid_ban_and_stop(sender).await;
-            return Err(ProviderError::InvalidBanExpiry);
-        }
-        let gate_deadline = match initial_gate {
-            RateGateState::TimedUntil(deadline) => Some(deadline),
-            RateGateState::Open | RateGateState::ProcessBlocked(_) => None,
-        };
-        let seconds = [1_u64, 2, 4, 8, 16, 30]
-            .get(*backoff_index)
-            .copied()
-            .unwrap_or(30);
-        *backoff_index = backoff_index.saturating_add(1);
-        let backoff = checked_deadline(self.clock.now(), Duration::from_secs(seconds))
-            .map_err(|_| ProviderError::Invariant("backoff deadline overflow"))?;
-        let mut deadline = gate_deadline.map_or(backoff, |value| value.max(backoff));
-        let queue_saturated = matches!(&error, ProviderError::QueueSaturated);
-        let control_generation = if queue_saturated { None } else { generation };
-        let recoverable = MarketEvent::RecoverableError {
-            generation: control_generation,
-            error,
-            rate_gate_deadline: gate_deadline,
-        };
-        let backoff_status = MarketEvent::Status {
-            generation: control_generation,
-            status: ConnectionStatus::Backoff,
-        };
-        let emergency_barrier = if queue_saturated {
-            if let Some(generation) = generation {
-                sender.invalidate_generation(generation);
-            }
-            Some(sender.queue_emergency_pair(recoverable, backoff_status)?)
-        } else {
-            send_market(sender, &cancellation, recoverable).await?;
-            send_market(sender, &cancellation, backoff_status).await?;
-            None
-        };
-        let mut deadline_elapsed = false;
-        loop {
-            let barrier_elapsed = emergency_barrier
-                .as_ref()
-                .is_none_or(|barrier| barrier.is_dequeued());
-            if deadline_elapsed && barrier_elapsed {
-                return Ok(());
-            }
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => {
-                    sender.shutdown().await;
-                    return Ok(());
-                },
-                changed = request.accepted_watermark_rx.changed() => {
-                    if changed.is_err() {
-                        let error = control_channel_closed(&request.instrument, request.timeframe);
-                        send_market(sender, &cancellation, MarketEvent::TerminalError(error.clone())).await?;
-                        return Err(error);
-                    }
-                },
-                ack = request.reconcile_ack_rx.changed() => {
-                    if ack.is_err() {
-                        let error = control_channel_closed(&request.instrument, request.timeframe);
-                        send_market(sender, &cancellation, MarketEvent::TerminalError(error.clone())).await?;
-                        return Err(error);
-                    }
-                },
-                () = sender.wait_closed() => return Err(live_channel_closed()),
-                changed = gate.changed() => match changed {
-                    Err(_) => {
-                        let error = ProviderError::Invariant("rate gate closed");
-                        send_market(sender, &cancellation, MarketEvent::TerminalError(error.clone())).await?;
-                        return Err(error);
-                    }
-                    Ok(RateGateState::ProcessBlocked(_)) => {
-                        self.send_invalid_ban_and_stop(sender).await;
-                        return Err(ProviderError::InvalidBanExpiry);
-                    }
-                    Ok(RateGateState::TimedUntil(value)) => {
-                        deadline = deadline.max(value);
-                        deadline_elapsed = self.clock.now() >= deadline;
-                    }
-                    Ok(RateGateState::Open) => {}
-                },
-                () = self.clock.sleep_until(deadline), if !deadline_elapsed => {
-                    match gate.current() {
-                        Err(_) => {
-                            let error = ProviderError::Invariant("rate gate closed");
-                            send_market(sender, &cancellation, MarketEvent::TerminalError(error.clone())).await?;
-                            return Err(error);
-                        }
-                        Ok(RateGateState::ProcessBlocked(_)) => {
-                            self.send_invalid_ban_and_stop(sender).await;
-                            return Err(ProviderError::InvalidBanExpiry);
-                        }
-                        Ok(RateGateState::TimedUntil(value)) if value > deadline => deadline = value,
-                        Ok(RateGateState::Open | RateGateState::TimedUntil(_)) => deadline_elapsed = true,
-                    }
-                },
-                () = async { if let Some(barrier) = &emergency_barrier { barrier.wait_dequeued().await } }, if !barrier_elapsed => {}
-            }
-        }
-    }
-
-    async fn send_invalid_ban_and_stop(&self, sender: &EventEmitter) {
-        let _ = sender
-            .queue_terminal_pair(
-                MarketEvent::RecoverableError {
-                    generation: None,
-                    error: ProviderError::InvalidBanExpiry,
-                    rate_gate_deadline: None,
-                },
-                MarketEvent::Status {
-                    generation: None,
-                    status: ConnectionStatus::Stopped,
-                },
-            )
-            .await;
+        unreachable!("mutually exclusive transport features are rejected by src/lib.rs")
     }
 
     pub fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
@@ -2058,556 +945,36 @@ impl BinanceProvider {
 
     #[must_use]
     pub fn rate_gate(&self) -> RateGateSnapshot {
-        self.gate_snapshot.clone()
+        self.http.gate_snapshot()
     }
-}
 
-enum GenerationOutcome {
-    Cancelled,
-    AcknowledgedReconnect(ProviderError),
-    Reconnect(ProviderError),
-}
-
-type StatusKey = (Option<GapGeneration>, ConnectionStatus);
-
-struct EventEnvelope {
-    item: Option<Result<MarketEvent, ProviderError>>,
-    generation: Option<GapGeneration>,
-    purge_on_invalidate: bool,
-    connected_delivered: Arc<AtomicU64>,
-    control_key: Option<StatusKey>,
-    pending_controls: Arc<Mutex<Vec<StatusKey>>>,
-    _regular_permit: Option<OwnedSemaphorePermit>,
-    _control_permit: Option<OwnedSemaphorePermit>,
-    emergency_slot: Option<u8>,
-    emergency_barrier: Option<Arc<EmergencyBarrier>>,
-}
-
-impl EventEnvelope {
-    fn into_item(mut self) -> Result<MarketEvent, ProviderError> {
-        let item = self.item.take().expect("event envelope contains an item");
-        if let Ok(MarketEvent::Status {
-            generation: Some(generation),
-            status: ConnectionStatus::Connected,
-        }) = &item
+    fn history_page_limit(&self) -> u16 {
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         {
-            self.connected_delivered
-                .fetch_max(generation.0, Ordering::AcqRel);
+            self.advertised_history_page_limit
         }
-        item
-    }
-
-    fn is_stopped(&self) -> bool {
-        matches!(
-            self.item.as_ref(),
-            Some(Ok(MarketEvent::Status {
-                generation: None,
-                status: ConnectionStatus::Stopped,
-            }))
-        )
-    }
-}
-
-impl Drop for EventEnvelope {
-    fn drop(&mut self) {
-        if let Some(key) = self.control_key {
-            let mut pending = self
-                .pending_controls
-                .lock()
-                .expect("control mutex poisoned");
-            if let Some(index) = pending.iter().position(|pending_key| *pending_key == key) {
-                pending.swap_remove(index);
-            }
-        }
-        if let (Some(slot), Some(barrier)) = (self.emergency_slot, &self.emergency_barrier) {
-            barrier.dequeued(slot);
+        #[cfg(any(
+            all(feature = "production-transport", not(feature = "test-transport")),
+            all(feature = "production-transport", feature = "test-transport")
+        ))]
+        {
+            1000
         }
     }
-}
-
-struct EmergencyBarrier {
-    pending: AtomicU8,
-    suppressed: AtomicU8,
-    notify: Notify,
-}
-
-impl EmergencyBarrier {
-    const fn new() -> Self {
-        Self {
-            pending: AtomicU8::new(0),
-            suppressed: AtomicU8::new(0),
-            notify: Notify::const_new(),
-        }
-    }
-
-    fn begin_pair(&self) -> Result<(), ProviderError> {
-        self.suppressed.store(0, Ordering::Release);
-        self.pending
-            .compare_exchange(0, 0b11, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| ())
-            .map_err(|_| ProviderError::Invariant("emergency barrier already active"))
-    }
-
-    fn dequeued(&self, slot: u8) {
-        self.pending.fetch_and(!(1 << slot), Ordering::AcqRel);
-        self.notify.notify_one();
-    }
-
-    fn suppress_pending(&self) {
-        self.suppressed
-            .fetch_or(self.pending.load(Ordering::Acquire), Ordering::AcqRel);
-    }
-
-    fn begin_shutdown(&self) {
-        self.suppressed.store(0, Ordering::Release);
-        self.pending.store(0b01, Ordering::Release);
-    }
-
-    fn is_suppressed(&self, slot: u8) -> bool {
-        self.suppressed.load(Ordering::Acquire) & (1 << slot) != 0
-    }
-
-    fn is_dequeued(&self) -> bool {
-        self.pending.load(Ordering::Acquire) == 0
-    }
-
-    async fn wait_dequeued(&self) {
-        while !self.is_dequeued() {
-            let notified = self.notify.notified();
-            if self.is_dequeued() {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
-
-#[derive(Clone)]
-struct EventEmitter {
-    sender: mpsc::Sender<EventEnvelope>,
-    regular_permits: Arc<Semaphore>,
-    control_permits: Arc<Semaphore>,
-    invalidated_through: Arc<AtomicU64>,
-    connected_delivered: Arc<AtomicU64>,
-    pending_controls: Arc<Mutex<Vec<StatusKey>>>,
-    emergency_barrier: Arc<EmergencyBarrier>,
-    shutdown: Arc<AtomicBool>,
-}
-
-impl EventEmitter {
-    fn new(
-        sender: mpsc::Sender<EventEnvelope>,
-        regular_capacity: usize,
-        control_capacity: usize,
-    ) -> Self {
-        Self {
-            sender,
-            regular_permits: Arc::new(Semaphore::new(regular_capacity)),
-            control_permits: Arc::new(Semaphore::new(control_capacity)),
-            invalidated_through: Arc::new(AtomicU64::new(0)),
-            connected_delivered: Arc::new(AtomicU64::new(0)),
-            pending_controls: Arc::new(Mutex::new(Vec::new())),
-            emergency_barrier: Arc::new(EmergencyBarrier::new()),
-            shutdown: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    async fn reserve_regular(&self) -> Result<OwnedSemaphorePermit, ProviderError> {
-        if self.shutdown.load(Ordering::Acquire) {
-            return Err(live_channel_closed());
-        }
-        Arc::clone(&self.regular_permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| live_channel_closed())
-    }
-
-    fn send_reserved(
-        &self,
-        permit: OwnedSemaphorePermit,
-        event: MarketEvent,
-    ) -> Result<(), ProviderError> {
-        if self.shutdown.load(Ordering::Acquire) {
-            return Err(live_channel_closed());
-        }
-        let generation = event_generation(&event);
-        let purge_on_invalidate = event_purges_with_generation(&event);
-        self.sender
-            .try_send(EventEnvelope {
-                item: Some(Ok(event)),
-                generation,
-                purge_on_invalidate,
-                connected_delivered: Arc::clone(&self.connected_delivered),
-                control_key: None,
-                pending_controls: Arc::clone(&self.pending_controls),
-                _regular_permit: Some(permit),
-                _control_permit: None,
-                emergency_slot: None,
-                emergency_barrier: None,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Closed(_) => live_channel_closed(),
-                mpsc::error::TrySendError::Full(_) => {
-                    ProviderError::Invariant("reserved market event channel capacity exhausted")
-                }
-            })
-    }
-
-    async fn wait_closed(&self) {
-        self.sender.closed().await;
-    }
-
-    async fn send_regular(&self, event: MarketEvent) -> Result<(), ProviderError> {
-        let control_key = status_key(&event);
-        if control_key.is_some_and(|key| {
-            self.pending_controls
-                .lock()
-                .expect("control mutex poisoned")
-                .contains(&key)
-        }) {
-            return Ok(());
-        }
-        let control_permit = if is_control_event(&event) {
-            Some(
-                Arc::clone(&self.control_permits)
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| live_channel_closed())?,
-            )
-        } else {
-            None
-        };
-        let permit = self.reserve_regular().await?;
-        if self.shutdown.load(Ordering::Acquire) {
-            return Err(live_channel_closed());
-        }
-        if let Some(key) = control_key {
-            self.pending_controls
-                .lock()
-                .expect("control mutex poisoned")
-                .push(key);
-        }
-        let generation = event_generation(&event);
-        let purge_on_invalidate = event_purges_with_generation(&event);
-        self.sender
-            .try_send(EventEnvelope {
-                item: Some(Ok(event)),
-                generation,
-                purge_on_invalidate,
-                connected_delivered: Arc::clone(&self.connected_delivered),
-                control_key,
-                pending_controls: Arc::clone(&self.pending_controls),
-                _regular_permit: Some(permit),
-                _control_permit: control_permit,
-                emergency_slot: None,
-                emergency_barrier: None,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Closed(_) => live_channel_closed(),
-                mpsc::error::TrySendError::Full(_) => {
-                    ProviderError::Invariant("reserved market event channel capacity exhausted")
-                }
-            })
-    }
-
-    fn connected_delivered(&self, generation: GapGeneration) -> bool {
-        self.connected_delivered.load(Ordering::Acquire) >= generation.0
-    }
-
-    fn invalidate_generation(&self, generation: GapGeneration) {
-        self.invalidated_through
-            .fetch_max(generation.0, Ordering::AcqRel);
-    }
-
-    fn queue_emergency_pair(
-        &self,
-        first: MarketEvent,
-        second: MarketEvent,
-    ) -> Result<Arc<EmergencyBarrier>, ProviderError> {
-        self.emergency_barrier.begin_pair()?;
-        for (slot, event) in [first, second].into_iter().enumerate() {
-            self.sender
-                .try_send(EventEnvelope {
-                    item: Some(Ok(event)),
-                    generation: None,
-                    purge_on_invalidate: false,
-                    connected_delivered: Arc::clone(&self.connected_delivered),
-                    control_key: None,
-                    pending_controls: Arc::clone(&self.pending_controls),
-                    _regular_permit: None,
-                    _control_permit: None,
-                    emergency_slot: Some(slot as u8),
-                    emergency_barrier: Some(Arc::clone(&self.emergency_barrier)),
-                })
-                .map_err(|error| match error {
-                    mpsc::error::TrySendError::Closed(_) => live_channel_closed(),
-                    mpsc::error::TrySendError::Full(_) => {
-                        ProviderError::Invariant("emergency market event reservation exhausted")
-                    }
-                })?;
-        }
-        Ok(Arc::clone(&self.emergency_barrier))
-    }
-
-    async fn queue_terminal_pair(
-        &self,
-        first: MarketEvent,
-        second: MarketEvent,
-    ) -> Result<(), ProviderError> {
-        self.emergency_barrier.suppress_pending();
-        self.emergency_barrier.wait_dequeued().await;
-        let _ = self.queue_emergency_pair(first, second)?;
-        Ok(())
-    }
-
-    async fn shutdown(&self) {
-        if self.shutdown.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.invalidated_through.store(u64::MAX, Ordering::Release);
-        self.emergency_barrier.suppress_pending();
-        // Cancellation makes the stream discard every non-Stopped envelope. Wait until any
-        // reserved saturation pair has actually left the bounded channel before reusing its
-        // reservation for the sole terminal event. Receiver drop also drops the queued
-        // envelopes and releases this barrier, so shutdown cannot deadlock on a closed stream.
-        self.emergency_barrier.wait_dequeued().await;
-        self.emergency_barrier.begin_shutdown();
-        let envelope = EventEnvelope {
-            item: Some(Ok(MarketEvent::Status {
-                generation: None,
-                status: ConnectionStatus::Stopped,
-            })),
-            generation: None,
-            purge_on_invalidate: false,
-            connected_delivered: Arc::clone(&self.connected_delivered),
-            control_key: None,
-            pending_controls: Arc::clone(&self.pending_controls),
-            _regular_permit: None,
-            _control_permit: None,
-            emergency_slot: Some(0),
-            emergency_barrier: Some(Arc::clone(&self.emergency_barrier)),
-        };
-        let _ = self.sender.try_send(envelope);
-    }
-}
-
-fn event_generation(event: &MarketEvent) -> Option<GapGeneration> {
-    match event {
-        MarketEvent::Status { generation, .. }
-        | MarketEvent::RecoverableError { generation, .. } => *generation,
-        MarketEvent::ReconcileBatch { generation, .. } | MarketEvent::Candle { generation, .. } => {
-            Some(*generation)
-        }
-        MarketEvent::TerminalError(_) => None,
-    }
-}
-fn is_control_event(event: &MarketEvent) -> bool {
-    !matches!(
-        event,
-        MarketEvent::Candle { .. } | MarketEvent::ReconcileBatch { .. }
-    )
-}
-
-fn event_purges_with_generation(event: &MarketEvent) -> bool {
-    matches!(
-        event,
-        MarketEvent::Candle { .. }
-            | MarketEvent::ReconcileBatch { .. }
-            | MarketEvent::Status {
-                generation: Some(_),
-                status: ConnectionStatus::Connecting
-                    | ConnectionStatus::GapSync
-                    | ConnectionStatus::Connected,
-            }
-    )
-}
-fn status_key(event: &MarketEvent) -> Option<(Option<GapGeneration>, ConnectionStatus)> {
-    match event {
-        MarketEvent::Status { generation, status } => Some((*generation, *status)),
-        _ => None,
-    }
-}
-
-fn live_channel_closed() -> ProviderError {
-    ProviderError::ChannelClosed {
-        context: ErrorContext::operation(ErrorOperation::LiveFeed),
-    }
-}
-
-async fn send_market(
-    sender: &EventEmitter,
-    cancellation: &CancellationToken,
-    event: MarketEvent,
-) -> Result<(), ProviderError> {
-    tokio::select! { biased; () = cancellation.cancelled() => Ok(()), result = sender.send_regular(event) => result }
-}
-fn apply_reconciliation_candle(
-    pending: &mut BTreeMap<i64, Candle>,
-    candidate: Candle,
-    revision: &mut ReplayRevision,
-    target_open_time: &mut i64,
-) -> Result<(), ProviderError> {
-    let open_time = candidate.open_time();
-    let _ = coalesce_candle(pending, candidate);
-    revision.0 = revision
-        .0
-        .checked_add(1)
-        .ok_or(ProviderError::Invariant("replay revision overflow"))?;
-    *target_open_time = (*target_open_time).max(open_time);
-    Ok(())
-}
-
-fn coalesce_candle(pending: &mut BTreeMap<i64, Candle>, candidate: Candle) -> bool {
-    use FinalityAuthority::{
-        RestProvisionalClosed, RestProvisionalOpen, WsAuthoritativeClosed, WsAuthoritativeOpen,
-    };
-    let key = candidate.open_time();
-    match pending.get(&key) {
-        None => {
-            pending.insert(key, candidate);
-            true
-        }
-        Some(current) => {
-            let replace = match (current.authority(), candidate.authority()) {
-                (_, WsAuthoritativeClosed) => true,
-                (WsAuthoritativeClosed, _) => false,
-                (WsAuthoritativeOpen, RestProvisionalOpen | RestProvisionalClosed) => false,
-                (RestProvisionalOpen | RestProvisionalClosed, WsAuthoritativeOpen) => true,
-                (WsAuthoritativeOpen, WsAuthoritativeOpen) => true,
-                (RestProvisionalClosed, RestProvisionalOpen) => false,
-                (RestProvisionalOpen, RestProvisionalClosed)
-                | (RestProvisionalOpen, RestProvisionalOpen)
-                | (RestProvisionalClosed, RestProvisionalClosed) => true,
-            };
-            if replace {
-                pending.insert(key, candidate);
-            }
-            replace
-        }
-    }
-}
-
-fn control_channel_closed(instrument: &Instrument, timeframe: Timeframe) -> ProviderError {
-    ProviderError::ChannelClosed {
-        context: ErrorContext::operation(ErrorOperation::Reconciliation)
-            .with_market(instrument, timeframe),
-    }
-}
-
-fn live_protocol_error(request: &LiveRequest, detail: &'static str) -> ProviderError {
-    ProviderError::Protocol {
-        context: ErrorContext::operation(ErrorOperation::WebSocket)
-            .with_market(&request.instrument, request.timeframe),
-        detail,
-    }
-}
-
-fn next_gap_cursor(_timeframe: Timeframe, value: i64) -> Result<i64, ProviderError> {
-    value
-        .checked_add(1)
-        .ok_or(ProviderError::Invariant("gap cursor overflow"))
-}
-
-#[cfg(feature = "test-transport")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LiveErrorDisposition {
-    Recoverable,
-    Terminal,
-}
-
-#[cfg(feature = "test-transport")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LiveInBandEventDisposition {
-    RecoverableInBand,
-    TerminalInBand,
-}
-
-#[cfg(feature = "test-transport")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LiveCompletionDisposition {
-    Running,
-    FinishedErr,
-}
-
-#[cfg(feature = "test-transport")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LiveErrorClassification {
-    pub disposition: LiveErrorDisposition,
-    pub event: LiveInBandEventDisposition,
-    pub completion: LiveCompletionDisposition,
-    pub retries: bool,
-}
-
-#[cfg(feature = "test-transport")]
-#[must_use]
-pub fn classify_live_error_for_test(error: &ProviderError) -> LiveErrorClassification {
-    if is_terminal_live_error(error) {
-        LiveErrorClassification {
-            disposition: LiveErrorDisposition::Terminal,
-            event: LiveInBandEventDisposition::TerminalInBand,
-            completion: LiveCompletionDisposition::FinishedErr,
-            retries: false,
-        }
-    } else {
-        LiveErrorClassification {
-            disposition: LiveErrorDisposition::Recoverable,
-            event: LiveInBandEventDisposition::RecoverableInBand,
-            completion: LiveCompletionDisposition::Running,
-            retries: true,
-        }
-    }
-}
-
-#[cfg(feature = "test-transport")]
-#[derive(Clone, Debug, PartialEq)]
-pub enum LiveInputClassification {
-    Continue,
-    Error {
-        error: ProviderError,
-        policy: LiveErrorClassification,
-    },
-}
-
-#[cfg(feature = "test-transport")]
-#[must_use]
-pub fn classify_live_input_for_test(
-    input: Result<DecodedFrame, ProviderError>,
-    instrument: &Instrument,
-    timeframe: Timeframe,
-) -> LiveInputClassification {
-    let error = match input {
-        Ok(DecodedFrame::Candle(_) | DecodedFrame::Ignored) => {
-            return LiveInputClassification::Continue;
-        }
-        Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => ProviderError::Protocol {
-            context: ErrorContext::operation(ErrorOperation::WebSocket)
-                .with_market(instrument, timeframe),
-            detail: "WebSocket peer requested reconnect",
-        },
-        Ok(DecodedFrame::ProviderError(error)) | Err(error) => error,
-    };
-    LiveInputClassification::Error {
-        policy: classify_live_error_for_test(&error),
-        error,
-    }
-}
-
-fn is_terminal_live_error(error: &ProviderError) -> bool {
-    matches!(
-        error,
-        ProviderError::Configuration(_)
-            | ProviderError::WebSocketConfiguration { .. }
-            | ProviderError::Invariant(_)
-            | ProviderError::ClientStatus { .. }
-            | ProviderError::InvalidSymbol { .. }
-            | ProviderError::ChannelClosed { .. }
-    )
 }
 
 impl MarketDataProvider for BinanceProvider {
     fn id(&self) -> ProviderId {
         ProviderId::new("binance").expect("static provider id")
     }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            markets: &[Market::Spot, Market::Perpetual],
+            timeframes: &Timeframe::ALL,
+            history_page_limit: self.history_page_limit(),
+        }
+    }
+
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
         BinanceProvider::canonicalize(self, spec)
     }
@@ -2627,121 +994,32 @@ impl MarketDataProvider for BinanceProvider {
         ))
     }
     fn open_live<'a>(&'a self, request: LiveRequest) -> ProviderFuture<'a, LiveFeed> {
-        Box::pin(async move {
-            self.live.validate()?;
-            let physical_capacity = self
-                .live
-                .market_event_capacity
-                .checked_add(2)
-                .ok_or(ProviderError::Invariant("market event capacity overflow"))?;
-            let (sender, receiver) = mpsc::channel(physical_capacity);
-            let sender = EventEmitter::new(
-                sender,
-                self.live.market_event_capacity,
-                self.live.control_capacity,
-            );
-            let invalidated_through = Arc::clone(&sender.invalidated_through);
-            let emergency_barrier = Arc::clone(&sender.emergency_barrier);
-            let cancellation = request.cancellation.clone();
-            let stream_cancellation = cancellation.clone();
-            let producer = self.clone();
-            let events = stream::unfold(receiver, move |mut receiver| {
-                let invalidated_through = Arc::clone(&invalidated_through);
-                let emergency_barrier = Arc::clone(&emergency_barrier);
-                let cancellation = stream_cancellation.clone();
-                async move {
-                    loop {
-                        let cancelled = cancellation.is_cancelled();
-                        let envelope = if cancelled {
-                            receiver.recv().await?
-                        } else {
-                            tokio::select! {
-                                biased;
-                                () = cancellation.cancelled() => continue,
-                                envelope = receiver.recv() => envelope?,
-                            }
-                        };
-                        if cancellation.is_cancelled() && !envelope.is_stopped() {
-                            drop(envelope);
-                            continue;
-                        }
-                        let invalidated = envelope.purge_on_invalidate
-                            && envelope.generation.is_some_and(|generation| {
-                                generation.0 <= invalidated_through.load(Ordering::Acquire)
-                            });
-                        let suppressed = envelope
-                            .emergency_slot
-                            .is_some_and(|slot| emergency_barrier.is_suppressed(slot));
-                        if invalidated || suppressed {
-                            drop(envelope);
-                            continue;
-                        }
-                        return Some((envelope.into_item(), receiver));
-                    }
-                }
-            });
-            Ok(LiveFeed::spawn(
-                Box::pin(events),
-                cancellation,
-                Arc::clone(&self.clock),
-                async move { producer.supervise_live(request, sender).await },
+        #[cfg(any(
+            all(feature = "production-transport", not(feature = "test-transport")),
+            all(feature = "test-transport", not(feature = "production-transport"))
+        ))]
+        {
+            let adapter = BinanceLiveAdapter::new(self.clone());
+            let clock = Arc::clone(&self.clock);
+            let capabilities = MarketDataProvider::capabilities(self);
+            Box::pin(crate::provider::runtime::live::open_live(
+                adapter,
+                clock,
+                capabilities,
+                request,
             ))
-        })
+        }
+        #[cfg(all(feature = "production-transport", feature = "test-transport"))]
+        {
+            let _ = request;
+            Box::pin(async {
+                unreachable!("mutually exclusive transport features are rejected by src/lib.rs")
+            })
+        }
     }
     fn rate_gate(&self) -> RateGateSnapshot {
         BinanceProvider::rate_gate(self)
     }
-}
-
-async fn read_capped(
-    mut response: reqwest::Response,
-    limit: usize,
-    cancellation: &CancellationToken,
-    context: &ErrorContext,
-) -> Result<Vec<u8>, ProviderError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(payload(
-            context,
-            PayloadError::OverBudget { limit_bytes: limit },
-        ));
-    }
-    let mut body =
-        Vec::with_capacity(response.content_length().unwrap_or(0).min(limit as u64) as usize);
-    loop {
-        let chunk = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(cancelled(context.clone())),
-            chunk = response.chunk() => chunk.map_err(|error| {
-                if error.is_timeout() {
-                    ProviderError::Timeout {
-                        context: context.clone(),
-                        kind: TimeoutKind::Request,
-                    }
-                } else {
-                    ProviderError::Transport {
-                        context: context.clone(),
-                        cause: SanitizedCause::Connection,
-                    }
-                }
-            })?,
-        };
-        let Some(chunk) = chunk else { break };
-        if body
-            .len()
-            .checked_add(chunk.len())
-            .is_none_or(|size| size > limit)
-        {
-            return Err(payload(
-                context,
-                PayloadError::OverBudget { limit_bytes: limit },
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
 }
 
 struct RawKline(
@@ -2788,7 +1066,8 @@ impl<'de> Visitor<'de> for BoundedRowsVisitor {
 }
 fn decode_klines(
     bytes: &[u8],
-    requested_limit: u16,
+    request: HistoryRequest,
+    timeframe: Timeframe,
     context: ErrorContext,
 ) -> Result<Vec<Candle>, ProviderError> {
     if bytes
@@ -2803,7 +1082,7 @@ fn decode_klines(
             Err(payload(&context, PayloadError::MalformedJson))
         };
     }
-    let limit = usize::from(requested_limit).min(1000);
+    let limit = usize::from(request.limit()).min(1000);
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let rows =
         serde::de::Deserializer::deserialize_seq(&mut deserializer, BoundedRowsVisitor { limit })
@@ -2812,6 +1091,7 @@ fn decode_klines(
         .end()
         .map_err(|_| payload(&context, PayloadError::MalformedJson))?;
     let mut candles = Vec::with_capacity(rows.len());
+    let mut previous_open = None;
     for row in rows {
         let fields = match row {
             Value::Array(fields) => fields,
@@ -2845,16 +1125,49 @@ fn decode_klines(
         let volume = decimal_field(&raw.5, "base_volume", &context)?;
         let close_time = integer_field(&raw.6, "close_time", &context)?;
         validate_ignored_fields(&raw, &context)?;
-        candles.push(
-            Candle::from_rest(open_time, close_time, open, high, low, close, volume).map_err(
-                |source| ProviderError::Domain {
-                    context: context.clone(),
-                    source,
-                },
-            )?,
-        );
+        let candle = Candle::from_rest(open_time, close_time, open, high, low, close, volume)
+            .map_err(|source| ProviderError::Domain {
+                context: context.clone(),
+                source,
+            })?;
+        validate_rest_candle_time_window(
+            open_time,
+            close_time,
+            timeframe,
+            request,
+            previous_open,
+            &context,
+        )?;
+        previous_open = Some(open_time);
+        candles.push(candle);
     }
     Ok(candles)
+}
+
+fn validate_rest_candle_time_window(
+    open_time: i64,
+    close_time: i64,
+    timeframe: Timeframe,
+    request: HistoryRequest,
+    previous_open: Option<i64>,
+    context: &ErrorContext,
+) -> Result<(), ProviderError> {
+    let expected_close = timeframe_successor_open(timeframe, open_time)
+        .and_then(|successor| successor.checked_sub(1));
+    let outside_start = request
+        .start_time()
+        .is_some_and(|start_time| open_time < start_time);
+    let outside_end = request
+        .end_time()
+        .is_some_and(|end_time| open_time > end_time);
+    if expected_close != Some(close_time)
+        || outside_start
+        || outside_end
+        || previous_open.is_some_and(|previous| open_time <= previous)
+    {
+        return Err(payload(context, PayloadError::MalformedProtocol));
+    }
+    Ok(())
 }
 
 fn validate_ignored_fields(raw: &RawKline, context: &ErrorContext) -> Result<(), ProviderError> {
@@ -2955,23 +1268,6 @@ fn payload(context: &ErrorContext, source: PayloadError) -> ProviderError {
         context: context.clone(),
         source,
     }
-}
-
-fn cancelled(context: ErrorContext) -> ProviderError {
-    ProviderError::Transport {
-        context,
-        cause: SanitizedCause::Cancelled,
-    }
-}
-
-fn is_cancelled(error: &ProviderError) -> bool {
-    matches!(
-        error,
-        ProviderError::Transport {
-            cause: SanitizedCause::Cancelled,
-            ..
-        }
-    )
 }
 
 #[cfg(feature = "test-transport")]

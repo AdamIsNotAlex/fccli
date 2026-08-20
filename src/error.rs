@@ -236,6 +236,7 @@ pub enum PayloadError {
 pub enum TimeoutKind {
     Request,
     FirstKline,
+    SubscribeAck,
     StalledWrite,
     WebSocketInactivity,
     ProducerJoin,
@@ -247,6 +248,7 @@ impl fmt::Display for TimeoutKind {
         f.write_str(match self {
             Self::Request => "request",
             Self::FirstKline => "first kline",
+            Self::SubscribeAck => "subscribe acknowledgement",
             Self::StalledWrite => "stalled write",
             Self::WebSocketInactivity => "websocket message inactivity",
             Self::ProducerJoin => "producer join",

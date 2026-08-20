@@ -2,9 +2,14 @@
 
 pub mod binance;
 pub mod hyperliquid;
+pub(crate) mod runtime;
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+#[doc(hidden)]
+pub mod test_transport;
 
 use futures_util::Stream;
 use std::{
+    collections::{BTreeMap, btree_map::Entry},
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -15,7 +20,7 @@ use crate::{
     clock::Clock,
     error::ProviderError,
     model::{
-        Candle, GapGeneration, HistoryRequest, Instrument, InstrumentSpec, MarketEvent,
+        Candle, GapGeneration, HistoryRequest, Instrument, InstrumentSpec, Market, MarketEvent,
         MonoInstant, ProviderId, ReplayRevision, Timeframe,
     },
 };
@@ -27,8 +32,17 @@ pub type ProviderFuture<'a, T> =
 pub type MarketEventStream =
     Pin<Box<dyn Stream<Item = Result<MarketEvent, ProviderError>> + Send + 'static>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderCapabilities {
+    pub markets: &'static [Market],
+    pub timeframes: &'static [Timeframe],
+    /// Maximum rows accepted by one provider history request. Implementations must return non-zero.
+    pub history_page_limit: u16,
+}
+
 pub trait MarketDataProvider: Send + Sync {
     fn id(&self) -> ProviderId;
+    fn capabilities(&self) -> ProviderCapabilities;
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError>;
     fn history<'a>(
         &'a self,
@@ -43,63 +57,41 @@ pub trait MarketDataProvider: Send + Sync {
 
 #[derive(Clone)]
 pub struct ProviderRegistry {
-    binance: Arc<binance::BinanceProvider>,
-    hyperliquid: Option<Arc<hyperliquid::HyperliquidProvider>>,
-    #[cfg(feature = "test-transport")]
-    injected: Option<Arc<dyn MarketDataProvider>>,
+    providers: BTreeMap<ProviderId, Arc<dyn MarketDataProvider>>,
 }
 
 impl ProviderRegistry {
-    #[must_use]
-    pub fn new(binance: Arc<binance::BinanceProvider>) -> Self {
-        Self {
-            binance,
-            hyperliquid: None,
-            #[cfg(feature = "test-transport")]
-            injected: None,
+    pub fn new(
+        providers: impl IntoIterator<Item = Arc<dyn MarketDataProvider>>,
+    ) -> Result<Self, ProviderError> {
+        let mut registry = Self {
+            providers: BTreeMap::new(),
+        };
+        for provider in providers {
+            registry.register(provider)?;
         }
+        Ok(registry)
     }
 
-    #[must_use]
-    pub fn with_hyperliquid(mut self, provider: Arc<hyperliquid::HyperliquidProvider>) -> Self {
-        self.hyperliquid = Some(provider);
-        self
-    }
-
-    #[cfg(feature = "test-transport")]
-    #[must_use]
-    pub fn with_test_provider(
-        binance: Arc<binance::BinanceProvider>,
-        provider: Arc<dyn MarketDataProvider>,
-    ) -> Self {
-        Self {
-            binance,
-            hyperliquid: None,
-            injected: Some(provider),
-        }
-    }
-
-    pub fn get(&self, id: ProviderId) -> Result<Arc<dyn MarketDataProvider>, ProviderError> {
-        #[cfg(feature = "test-transport")]
-        if id.as_str() == "binance"
-            && let Some(provider) = &self.injected
-        {
-            return Ok(Arc::clone(provider));
-        }
-        match id.as_str() {
-            "binance" => Ok(self.binance.clone()),
-            "hyperliquid" => self.hyperliquid.clone().map(|provider| provider as _).ok_or(
-                ProviderError::Configuration("unsupported market-data provider"),
-            ),
-            _ => Err(ProviderError::Configuration(
-                "unsupported market-data provider",
+    pub fn register(&mut self, provider: Arc<dyn MarketDataProvider>) -> Result<(), ProviderError> {
+        match self.providers.entry(provider.id()) {
+            Entry::Vacant(entry) => {
+                entry.insert(provider);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(ProviderError::Configuration(
+                "duplicate market-data provider",
             )),
         }
     }
 
-    #[must_use]
-    pub fn binance(&self) -> Arc<binance::BinanceProvider> {
-        Arc::clone(&self.binance)
+    pub fn get(&self, id: &ProviderId) -> Result<Arc<dyn MarketDataProvider>, ProviderError> {
+        self.providers
+            .get(id)
+            .cloned()
+            .ok_or(ProviderError::Configuration(
+                "unsupported market-data provider",
+            ))
     }
 }
 
@@ -293,6 +285,22 @@ impl ReconcileAckSender {
         drop(state);
         self.0.notify.notify_waiters();
         Ok(ReconcileAckUpdate::Published)
+    }
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    #[doc(hidden)]
+    pub fn inject_unchecked_for_test(
+        &self,
+        value: ReconcileAck,
+    ) -> Result<(), ReconcileAckPublishError> {
+        let mut state = self.0.state.lock().expect("ack mutex poisoned");
+        if !state.receiver_open {
+            return Err(ReconcileAckPublishError::Closed);
+        }
+        state.ack = Some(value);
+        state.ack_version = state.ack_version.wrapping_add(1);
+        drop(state);
+        self.0.notify.notify_waiters();
+        Ok(())
     }
 }
 
