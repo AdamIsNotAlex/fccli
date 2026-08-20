@@ -621,6 +621,101 @@ async fn reconciliation_span_bound_reconnects_while_rest_page_is_pending() {
     http_server.abort();
     ws_server.abort();
 }
+
+#[tokio::test]
+async fn accepted_watermark_span_bound_reconnects_while_rest_page_is_pending() {
+    let (http_listener, http_ws_uri) = websocket_listener().await;
+    let http_uri = http_ws_uri.replacen("ws://", "http://", 1);
+    let (ws_listener, ws_uri) = websocket_listener().await;
+    let (history_started_tx, history_started_rx) = oneshot::channel();
+    let http_server = tokio::spawn(async move {
+        let (stream, _) = http_listener.accept().await.expect("HTTP accept");
+        let mut request = [0_u8; 2048];
+        stream.readable().await.expect("HTTP request readiness");
+        let bytes = stream.try_read(&mut request).expect("HTTP request");
+        assert!(bytes > 0, "history request must reach the pending server");
+        history_started_tx.send(()).expect("history started");
+        std::future::pending::<()>().await;
+    });
+    const START: i64 = 1_699_999_980_000;
+    let ws_server = tokio::spawn(async move {
+        let (stream, _) = ws_listener.accept().await.expect("WebSocket accept");
+        let mut websocket = accept_async(stream).await.expect("upgrade");
+        let _ = websocket
+            .next()
+            .await
+            .expect("subscribe")
+            .expect("subscribe");
+        websocket
+            .send(Message::Text(subscribe_ack().into()))
+            .await
+            .expect("ack");
+        websocket
+            .send(Message::Text(candle_message(START).into()))
+            .await
+            .expect("first candle");
+        std::future::pending::<()>().await;
+    });
+    let live = LiveSupervisorConfig {
+        max_gap_reconciliation_candles_for_test: 3,
+        ..LiveSupervisorConfig::default()
+    };
+    let provider = provider_with_http(&http_uri, &ws_uri, clock(), live);
+    let cancellation = CancellationToken::new();
+    let (watermark_tx, watermark_rx) = accepted_watermark_channel(None);
+    let (ack_tx, ack_rx) = reconcile_ack_channel();
+    let mut feed = provider
+        .open_live(LiveRequest {
+            instrument: instrument(),
+            timeframe: Timeframe::Minute1,
+            startup_watermark: None,
+            accepted_watermark_rx: watermark_rx,
+            reconcile_ack_rx: ack_rx,
+            cancellation: cancellation.clone(),
+        })
+        .await
+        .expect("feed");
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::Status {
+            status: ConnectionStatus::Connecting,
+            ..
+        }
+    ));
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::Status {
+            status: ConnectionStatus::GapSync,
+            ..
+        }
+    ));
+    await_signal(history_started_rx, "pending history request").await;
+    watermark_tx
+        .publish(Some(START + 3 * 60_000))
+        .expect("valid watermark advance");
+    tokio::task::yield_now().await;
+    assert!(
+        feed.events.next().now_or_never().is_none(),
+        "a watermark at the configured successor limit must remain valid"
+    );
+    watermark_tx
+        .publish(Some(START + 4 * 60_000))
+        .expect("out-of-bound watermark advance");
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::RecoverableError {
+            error: ProviderError::Protocol {
+                context,
+                detail: "Hyperliquid gap reconciliation target exceeds the per-generation span limit",
+            },
+            ..
+        } if context == ErrorContext::operation(ErrorOperation::Reconciliation)
+    ));
+    cancellation.cancel();
+    drop(ack_tx);
+    http_server.abort();
+    ws_server.abort();
+}
 #[tokio::test]
 async fn decoded_ack_wins_deterministic_deadline_tie_before_arbitration() {
     let (listener, ws_uri) = websocket_listener().await;

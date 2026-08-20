@@ -2076,7 +2076,15 @@ impl HyperliquidProvider {
                             ReconcileWake::Cancelled => return Ok(GenerationOutcome::Cancelled),
                             ReconcileWake::AcceptedWatermark(changed) => {
                                 if let Some(watermark) = changed? {
-                                    target_open_time = target_open_time.max(watermark);
+                                    if let Err(error) = advance_reconciliation_target(
+                                        &mut target_open_time,
+                                        watermark,
+                                        start,
+                                        request.timeframe,
+                                        max_reconciliation_successors,
+                                    ) {
+                                        return Ok(GenerationOutcome::Reconnect(error));
+                                    }
                                 }
                             }
                             ReconcileWake::Ack(changed) => changed?,
@@ -2137,13 +2145,21 @@ impl HyperliquidProvider {
                                     biased;
                                     () = request.cancellation.cancelled() => Ok((Some(GenerationOutcome::Cancelled), false)),
                                     changed = request.accepted_watermark_rx.changed() => changed
+                                        .map_err(|_| control_channel_closed(&request.instrument, request.timeframe))
                                         .map(|watermark| {
-                                            if let Some(watermark) = watermark {
-                                                target_open_time = target_open_time.max(watermark);
-                                            }
-                                            (None, true)
-                                        })
-                                        .map_err(|_| control_channel_closed(&request.instrument, request.timeframe)),
+                                            let outcome = watermark.and_then(|watermark| {
+                                                advance_reconciliation_target(
+                                                    &mut target_open_time,
+                                                    watermark,
+                                                    start,
+                                                    request.timeframe,
+                                                    max_reconciliation_successors,
+                                                )
+                                                .err()
+                                                .map(GenerationOutcome::Reconnect)
+                                            });
+                                            (outcome, true)
+                                        }),
                                     ack = request.reconcile_ack_rx.changed() => ack
                                         .map(|_| (None, false))
                                         .map_err(|_| control_channel_closed(&request.instrument, request.timeframe)),
@@ -3049,6 +3065,29 @@ async fn send_market(
 ) -> Result<(), ProviderError> {
     tokio::select! { biased; () = cancellation.cancelled() => Ok(()), result = sender.send_regular(event) => result }
 }
+fn advance_reconciliation_target(
+    target_open_time: &mut i64,
+    candidate: i64,
+    generation_start: i64,
+    timeframe: Timeframe,
+    maximum_successors: usize,
+) -> Result<(), ProviderError> {
+    let candidate_target = (*target_open_time).max(candidate);
+    if !gap_target_within_generation_span(
+        timeframe,
+        generation_start,
+        candidate_target,
+        maximum_successors,
+    ) {
+        return Err(ProviderError::Protocol {
+            context: ErrorContext::operation(ErrorOperation::Reconciliation),
+            detail: "Hyperliquid gap reconciliation target exceeds the per-generation span limit",
+        });
+    }
+    *target_open_time = candidate_target;
+    Ok(())
+}
+
 fn apply_reconciliation_candle(
     pending: &mut BTreeMap<i64, Candle>,
     candidate: Candle,
@@ -3059,30 +3098,29 @@ fn apply_reconciliation_candle(
     maximum_successors: usize,
 ) -> Result<(), ProviderError> {
     let open_time = candidate.open_time();
-    let candidate_target = (*target_open_time).max(open_time);
     let distinct_key_limit = maximum_successors
         .checked_add(1)
         .ok_or(ProviderError::Invariant(
             "reconciliation buffer bound overflow",
         ))?;
-    if !gap_target_within_generation_span(
-        timeframe,
-        generation_start,
-        candidate_target,
-        maximum_successors,
-    ) || (!pending.contains_key(&open_time) && pending.len() >= distinct_key_limit)
-    {
+    if !pending.contains_key(&open_time) && pending.len() >= distinct_key_limit {
         return Err(ProviderError::Protocol {
             context: ErrorContext::operation(ErrorOperation::Reconciliation),
             detail: "Hyperliquid gap reconciliation target exceeds the per-generation span limit",
         });
     }
+    advance_reconciliation_target(
+        target_open_time,
+        open_time,
+        generation_start,
+        timeframe,
+        maximum_successors,
+    )?;
     let _ = coalesce_candle(pending, candidate);
     revision.0 = revision
         .0
         .checked_add(1)
         .ok_or(ProviderError::Invariant("replay revision overflow"))?;
-    *target_open_time = candidate_target;
     Ok(())
 }
 
