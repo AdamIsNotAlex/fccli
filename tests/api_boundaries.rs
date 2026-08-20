@@ -262,6 +262,43 @@ fn main() {
     );
 }
 
+fn assert_registry_associated_function_is_absent(
+    fixture_name: &str,
+    forbidden_function: &str,
+    source: &str,
+) {
+    let fixture = CompileFixture::new(fixture_name, "test-transport", source);
+    let output = fixture.check();
+    assert!(
+        !output.status.success(),
+        "provider-specific registry function {forbidden_function} compiled"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let named_function = format!("`{forbidden_function}`");
+    let matching_diagnostic = stderr.match_indices("error[E0599]").any(|(start, _)| {
+        let diagnostic_tail = &stderr[start..];
+        let end = [
+            diagnostic_tail.find("\n\n"),
+            diagnostic_tail.find("\nnote:"),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(diagnostic_tail.len());
+        let diagnostic = &diagnostic_tail[..end];
+
+        (diagnostic.contains("no function or associated item named")
+            || diagnostic.contains("no associated function or constant named"))
+            && diagnostic.contains(&named_function)
+            && diagnostic.contains("for struct `ProviderRegistry`")
+    });
+    assert!(
+        matching_diagnostic,
+        "fixture failed for a reason other than the absent ProviderRegistry::{forbidden_function} associated function:\n{stderr}"
+    );
+}
+
 #[test]
 fn registry_has_no_provider_specific_accessor() {
     let fixture = CompileFixture::new(
@@ -291,6 +328,32 @@ fn main() {
             && stderr.contains("no method named `binance`")
             && stderr.contains("ProviderRegistry"),
         "fixture failed for a reason other than the absent registry accessor:\n{stderr}"
+    );
+}
+
+#[test]
+fn registry_has_no_provider_specific_associated_functions() {
+    assert_registry_associated_function_is_absent(
+        "registry-has-no-with-hyperliquid",
+        "with_hyperliquid",
+        r#"
+use fccli::provider::ProviderRegistry;
+
+fn main() {
+    let _ = ProviderRegistry::with_hyperliquid(todo!());
+}
+"#,
+    );
+    assert_registry_associated_function_is_absent(
+        "registry-has-no-with-test-provider",
+        "with_test_provider",
+        r#"
+use fccli::provider::ProviderRegistry;
+
+fn main() {
+    let _ = ProviderRegistry::with_test_provider(todo!());
+}
+"#,
     );
 }
 
