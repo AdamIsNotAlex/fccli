@@ -4,6 +4,7 @@
 - 规划基线：分支 `feat/abstration`，提交 `3f6b379`；基线工作树干净，provider runtime 重构尚未开始。这里记录的是恢复实施时的假设，不应在实现后继续当作当前状态证据。
 - 实施约束：先锁定 provider 协议契约，再抽取 WebSocket/EventEmitter；抽 live engine 时永久加入最小公共 capabilities 基础并让 live gap 使用其唯一 page-limit 来源，随后抽 HTTP runtime，再完成其余 capability/policy 消费迁移并通用化 registry；`binance.rs` 与 `hyperliquid.rs` 默认顺序修改。
 - 明确不适用的机制（动态 Binance subscribe、跨 provider 心跳/finality/rate-limit 语义移植、Hyperliquid 严格 over-limit 拒绝等）是约束，不是待实现功能；完整记录见 tracker 的 C-01—C-10。
+- 本文后续出现的“当前”、文件行数和 `path:line` 定位均是提交 `3f6b379` 的历史规划基线，用于解释当时的建议；重构后的权威行为、验证结果和完成状态只以 tracker 为准。
 
 ---
 

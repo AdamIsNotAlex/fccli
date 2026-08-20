@@ -1,6 +1,6 @@
 # Provider runtime refactor execution tracker
 
-This is the authoritative implementation/progress tracker for [`refactor.plan.md`](./refactor.plan.md). The plan explains *why*; this file defines dependency order, ownership, acceptance, and accounting. Implementation has not started: every implementation checkbox is intentionally unchecked.
+This is the authoritative implementation/progress tracker for [`refactor.plan.md`](./refactor.plan.md). The plan explains *why*; this file defines dependency order, ownership, acceptance, and final accounting. The refactor and all repository gates are complete; every implementation and accounting checkbox is evidenced below.
 
 ## Status legend and operating rules
 
@@ -261,7 +261,7 @@ Implementation note (verified): `runtime/http.rs` uniquely owns safe client cons
 - [x] Delete obsolete duplicate runtime code, aliases, re-exports, test-only accessors, comments, constants, and scaffolding; migrate every caller rather than leaving compatibility shims.
 - [x] Confirm constraints C-01 through C-10 remain true and no explicitly non-applicable mechanism was implemented.
 - [x] Record before/after provider file sizes as informational evidence only; do not make line count a correctness gate.
-**Implementation notes:** Review fixes restored provider-neutral, production-path `LiveEngine` coverage for capability zero/exact limits; page, distinct-key, candle-target, and accepted-watermark bounds while history is pending; prompt cancellation during a large in-bound sequence; terminal socket arbitration against ready REST/watermark work; and exact empty/short-page no-progress recovery. Integration-test-only live-runtime exports are consolidated under `provider::test_transport`; duplicate provider-root re-exports were removed. Informational provider file sizes changed from the planning baseline of `binance.rs` 3023 lines and `hyperliquid.rs` 3053 lines to 1309 and 1725 lines respectively; these counts are not correctness gates. All literal R10 gates passed after the review fixes.
+**Implementation notes:** Review fixes restored provider-neutral, production-path `LiveEngine` coverage for capability zero/exact limits; page, distinct-key, candle-target, and accepted-watermark bounds while history is pending; prompt cancellation during a large in-bound sequence; terminal socket arbitration against ready REST/watermark work; and exact empty/short-page no-progress recovery. Integration-test-only live-runtime exports are consolidated under `provider::test_transport`; duplicate provider-root re-exports were removed. Historical size evidence only: the planning baseline at `3f6b379` recorded `binance.rs` at 3023 lines and `hyperliquid.rs` at 3053 lines; the R10 gate snapshot recorded 1309 and 1725 lines respectively. These locations and counts are not current implementation evidence or correctness gates. All literal R10 gates passed with the results recorded below.
 - [x] Verify: `cargo test --locked --test provider_runtime_websocket --no-default-features --features test-transport` (26 passed).
 - [x] Verify: `cargo test --locked --test provider_runtime_live --no-default-features --features test-transport` (23 passed).
 - [x] Verify: `cargo test --locked --test provider_runtime_http --no-default-features --features test-transport` (12 passed).
@@ -275,19 +275,19 @@ Implementation note (verified): `runtime/http.rs` uniquely owns safe client cons
 
 ### R11 — Final repository gates and tracker accounting
 
-**Status:** [ ]  
+**Status:** [x]
 **Depends on:** R10  
 **Owned files:** `docs/plan/refactor.todo.md`, `docs/plan/refactor.plan.md` (only if assumptions changed), `.github/workflows/ci.yml` (only if commands genuinely changed), `Cargo.toml` (only if features genuinely changed)  
 **Parallel safety:** Final exclusive gate; no concurrent implementation edits.  
 **Commit boundary:** `chore(provider): close refactor tracker` (only if accounting changes remain after implementation commits)
 
-- [ ] Run `cargo fmt --check`.
-- [ ] Run `cargo test --locked --all-targets --no-default-features --features test-transport`.
-- [ ] Run `cargo clippy --locked --all-targets --no-default-features --features test-transport -- -D warnings`.
-- [ ] Run `cargo check --locked --all-targets --no-default-features --features production-transport`.
-- [ ] Run `cargo clippy --locked --all-targets --no-default-features --features production-transport -- -D warnings`.
-- [ ] Run `cargo test --locked --test feature_selection default_is_production_only -- --exact`.
-- [ ] Run this complete mutual-exclusion assertion (the same logic as CI), which succeeds only for Cargo exit 101, exactly one dedicated conflict error, and no additional compiler error:
+- [x] Run `cargo fmt --check` (passed).
+- [x] Run `cargo test --locked --all-targets --no-default-features --features test-transport` (420 passed across 25 suites; 3 ignored).
+- [x] Run `cargo clippy --locked --all-targets --no-default-features --features test-transport -- -D warnings` (passed).
+- [x] Run `cargo check --locked --all-targets --no-default-features --features production-transport` (passed).
+- [x] Run `cargo clippy --locked --all-targets --no-default-features --features production-transport -- -D warnings` (passed).
+- [x] Run `cargo test --locked --test feature_selection default_is_production_only -- --exact` (passed exactly).
+- [x] Run this complete mutual-exclusion assertion (the same logic as CI), which passed only for Cargo exit 101, exactly one dedicated conflict diagnostic, and no secondary compiler error:
 
   ```bash
   set -euo pipefail
@@ -314,11 +314,13 @@ Implementation note (verified): `runtime/http.rs` uniquely owns safe client cons
   fi
   ```
 
-- [ ] Run `cargo test --locked --test api_boundaries --no-default-features --features test-transport combined_production_constructors_are_unnameable -- --exact`.
-- [ ] Run `cargo test --locked --test api_boundaries --no-default-features --features production-transport combined_production_constructors_are_unnameable -- --exact`.
-- [ ] Run `cargo test --locked --test app_live_contract --no-default-features --features test-transport reconciliation_target_and_state_persistence -- --exact`.
-- [ ] Update the accounting table statuses/evidence; ensure every child checkbox is accounted for and no `[ ]`/`[-]` remains before marking R11 complete.
-- [ ] Confirm the narrative plan links here, constraints match final behavior, and no stale location/count claim is presented as current implementation evidence.
+- [x] Run `cargo test --locked --test api_boundaries --no-default-features --features test-transport combined_production_constructors_are_unnameable -- --exact` (passed exactly).
+- [x] Run `cargo test --locked --test api_boundaries --no-default-features --features production-transport combined_production_constructors_are_unnameable -- --exact` (passed exactly).
+- [x] Run `cargo test --locked --test app_live_contract --no-default-features --features test-transport reconciliation_target_and_state_persistence -- --exact` (passed exactly).
+- [x] Update the accounting table statuses/evidence; every child checkbox is accounted for and no `[ ]`/`[-]` remains.
+- [x] Confirm the narrative plan links here, constraints C-01 through C-10 match final behavior, and all source locations/counts are explicitly historical baseline evidence rather than current implementation evidence.
+
+**Final gate evidence:** `cargo fmt --check` passed; the full test-transport all-targets run passed 420 tests across 25 suites with 3 ignored; test-transport clippy with `-D warnings`, production all-target check, and production clippy with `-D warnings` passed; `feature_selection` passed exactly; the mutual-exclusion assertion observed Cargo exit 101 with exactly one dedicated diagnostic and no secondary compiler error; both feature-mode `api_boundaries` constructor tests and the `app_live_contract` state-persistence test passed exactly.
 
 ## Chunk accounting
 
@@ -334,6 +336,6 @@ Implementation note (verified): `runtime/http.rs` uniquely owns safe client cons
 | R08 | [x] | R07 | no | Complete; capability consumers validate before network/output work, preserve desired 500-row app/snapshot requests capped by provider maximum, and use the advertised maximum exactly for older history. Deterministic coverage verifies pending-switch supersession, the switch limit/rejection matrix, snapshot pre-output rejection, and real Binance/Hyperliquid capabilities. Formatted gates passed: `provider_contract` 12/12, `history_coordinator` 23/23, `snapshot_runner` 8/8, `app_live_contract` 54/54, `binance_live` 23/23, and `hyperliquid_live` 26/26. |
 | R09 | [x] | R08 | no | Complete; the generic `BTreeMap` registry rejects duplicate IDs, uses borrowed lookup, has no provider-specific accessor/injection path, and keeps canonicalization metadata independent from transport registration. Corrected ownership includes Binance/Hyperliquid xor-cfg purity and shared HTTP unreachable-arm cleanup. Compile fixtures prove `binance`, `with_hyperliquid`, and `with_test_provider` are absent and preserve the dedicated dual-feature diagnostic. Formatted gates passed: `provider_contract` 15/15, `app_live_contract` 54/54, `binance_live` 23/23, and `api_boundaries` 6/6. |
 | R10 | [x] | R09 | no | Complete; shared production-path capability zero/exact-limit, page/distinct/candle-target/accepted-watermark bounds, large-sequence cancellation, terminal arbitration, and exact no-progress coverage restored; integration-only runtime exports consolidated under `provider::test_transport`. Gates passed: `provider_runtime_websocket` 26/26, `provider_runtime_live` 23/23, `provider_runtime_http` 12/12, `binance_ws_codec` 4/4, `hyperliquid_ws_codec` 10/10, `binance_rest` 10/10, `hyperliquid_rest` 17/17, `binance_live` 11/11, `hyperliquid_live` 21/21, and `provider_contract` 15/15. |
-| R11 | [ ] | R10 | yes | Dependency-ready after R10 completion; final repository gates and tracker accounting remain. |
+| R11 | [x] | R10 | no | Complete; final repository evidence: formatting passed; test-transport all-targets passed 420 tests across 25 suites with 3 ignored; test and production clippy passed with `-D warnings`; production all-target check passed; `feature_selection`, both feature-mode `api_boundaries` constructor tests, and app state persistence passed exactly; mutual exclusion exited 101 with exactly one dedicated diagnostic and no secondary compiler error; tracker and narrative accounting are closed. |
 
-**Next dependency-ready unchecked chunk:** R11 — Final repository gates and tracker accounting.
+**Next dependency-ready unchecked chunk:** none — R01 through R11 and all accounting are complete.
