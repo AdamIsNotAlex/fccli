@@ -18,7 +18,8 @@ use fccli::{
         MarketEventStream, ProcessBlocker, ProducerCompletion, ProviderCapabilities,
         ProviderFuture, RateGateSnapshot, RateGateState, ReconcileAck, ReconcileAckPublishError,
         ReconcileAckUpdate, ReconcileExpectation, ReconcileExpectationError, WatermarkUpdate,
-        accepted_watermark_channel, reconcile_ack_channel,
+        accepted_watermark_channel, binance::BinanceProvider, hyperliquid::HyperliquidProvider,
+        reconcile_ack_channel,
     },
 };
 use futures_util::{StreamExt, stream};
@@ -143,6 +144,33 @@ fn capabilities_are_public_data_support_and_nonzero_history_maximum_only() {
     assert_eq!(timeframes, &[Timeframe::Minute1]);
     assert_ne!(history_page_limit, 0);
     drop(gate_tx);
+}
+
+#[test]
+fn real_provider_capabilities_match_public_support_contract() {
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+    let binance = BinanceProvider::new_test("http://127.0.0.1:1", Arc::clone(&clock))
+        .expect("test Binance provider");
+    let binance = binance.capabilities();
+    assert_eq!(binance.timeframes, &Timeframe::ALL);
+    assert!(!binance.markets.is_empty());
+    assert_ne!(binance.history_page_limit, 0);
+
+    let hyperliquid = HyperliquidProvider::new_test("http://127.0.0.1:1", clock)
+        .expect("test Hyperliquid provider");
+    let hyperliquid = hyperliquid.capabilities();
+    assert!(!hyperliquid.markets.is_empty());
+    assert_ne!(hyperliquid.history_page_limit, 0);
+    assert!(!hyperliquid.timeframes.contains(&Timeframe::Second1));
+    assert!(!hyperliquid.timeframes.contains(&Timeframe::Hour6));
+    for supported in [
+        Timeframe::Minute1,
+        Timeframe::Hour1,
+        Timeframe::Day1,
+        Timeframe::Month1,
+    ] {
+        assert!(hyperliquid.timeframes.contains(&supported));
+    }
 }
 
 #[tokio::test]

@@ -618,6 +618,25 @@ impl App {
         }
     }
     fn begin_switch(&mut self, target: MarketTarget, root: &CancellationToken) {
+        self.switch_generation = self.switch_generation.wrapping_add(1);
+        if let Some(pending) = self.switch.take() {
+            pending.cancellation.cancel();
+            pending.task.abort();
+            let clock = Arc::clone(&self.clock);
+            self.retired.push(tokio::spawn(async move {
+                match pending.task.await {
+                    Ok(Ok(prepared)) => {
+                        prepared.live.request_shutdown();
+                        let deadline = checked_deadline(clock.now(), PRODUCER_JOIN_TIMEOUT)
+                            .unwrap_or(clock.now());
+                        prepared.live.join(deadline).await.map_err(map_live_join)
+                    }
+                    Ok(Err(_)) => Ok(()),
+                    Err(error) if error.is_cancelled() => Ok(()),
+                    Err(_) => Err(AppError::Invariant("market preparation join failed")),
+                }
+            }));
+        }
         let provider = match self.providers.get(target.instrument.provider().clone()) {
             Ok(provider) => provider,
             Err(error) => {
@@ -643,24 +662,6 @@ impl App {
                 return;
             }
         };
-        if let Some(pending) = self.switch.take() {
-            pending.cancellation.cancel();
-            pending.task.abort();
-            let clock = Arc::clone(&self.clock);
-            self.retired.push(tokio::spawn(async move {
-                match pending.task.await {
-                    Ok(Ok(prepared)) => {
-                        prepared.live.request_shutdown();
-                        let deadline = checked_deadline(clock.now(), PRODUCER_JOIN_TIMEOUT)
-                            .unwrap_or(clock.now());
-                        prepared.live.join(deadline).await.map_err(map_live_join)
-                    }
-                    Ok(Err(_)) => Ok(()),
-                    Err(error) if error.is_cancelled() => Ok(()),
-                    Err(_) => Err(AppError::Invariant("market preparation join failed")),
-                }
-            }));
-        }
         let instrument = match provider.canonicalize(&target.instrument) {
             Ok(instrument) => instrument,
             Err(error) => {
@@ -676,7 +677,6 @@ impl App {
             self.dirty = true;
             return;
         }
-        self.switch_generation = self.switch_generation.wrapping_add(1);
         let generation = self.switch_generation;
         let cancellation = root.child_token();
         let task_cancellation = cancellation.clone();

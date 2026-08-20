@@ -89,6 +89,7 @@ pub async fn run_snapshot(
     if output_target == SnapshotOutputTarget::NonTty && render_policy != RenderPolicy::StyleFree {
         return Err(RenderError::Invariant("non-TTY snapshot output must be style-free").into());
     }
+    let history_limit = history_request_limit(provider, instrument_spec.market(), timeframe)?;
 
     let effective_size = output_target.effective_size();
     let frame = Rect::new(0, 0, effective_size.width, effective_size.height);
@@ -104,7 +105,6 @@ pub async fn run_snapshot(
         serialize_frame(&buffer, output_target, render_policy, output)?;
         return Err(RenderError::InsufficientSpace.into());
     }
-    let history_limit = history_request_limit(provider, instrument_spec.market(), timeframe)?;
     let instrument = provider.canonicalize(instrument_spec)?;
     let request = HistoryRequest::latest(history_limit)?;
     let candles = provider

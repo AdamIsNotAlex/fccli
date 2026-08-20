@@ -1,6 +1,9 @@
 use std::{
     io::{self, Write},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use fccli::{
@@ -27,6 +30,7 @@ struct FakeProvider {
     _gate_sender: RateGateSender,
     gate: RateGateSnapshot,
     capabilities: ProviderCapabilities,
+    canonicalize_calls: AtomicUsize,
 }
 
 impl FakeProvider {
@@ -44,6 +48,7 @@ impl FakeProvider {
                 timeframes: &Timeframe::ALL,
                 history_page_limit: 1000,
             },
+            canonicalize_calls: AtomicUsize::new(0),
         }
     }
 
@@ -62,6 +67,7 @@ impl MarketDataProvider for FakeProvider {
     }
 
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
+        self.canonicalize_calls.fetch_add(1, Ordering::SeqCst);
         Instrument::new(
             spec.provider().clone(),
             spec.market(),
@@ -133,7 +139,7 @@ async fn snapshot_caps_desired_500_to_provider_maximum() {
 }
 
 #[tokio::test]
-async fn snapshot_rejects_market_timeframe_and_zero_limit_before_history() {
+async fn snapshot_rejects_capabilities_before_layout_output_or_provider_io() {
     for capabilities in [
         ProviderCapabilities {
             markets: &[fccli::model::Market::Perpetual],
@@ -152,23 +158,32 @@ async fn snapshot_rejects_market_timeframe_and_zero_limit_before_history() {
         },
     ] {
         let provider = FakeProvider::new(candles(1)).with_capabilities(capabilities);
-        let mut output = Vec::new();
-        let error = run_snapshot(
-            &provider,
-            &spec(),
-            Timeframe::Minute1,
+        for output_target in [
             SnapshotOutputTarget::NonTty,
-            RenderPolicy::StyleFree,
-            CancellationToken::new(),
-            &mut output,
-        )
-        .await
-        .expect_err("unsupported capability must fail");
-        assert!(matches!(
-            error,
-            AppError::Provider(ProviderError::Configuration(_))
-        ));
+            SnapshotOutputTarget::Tty {
+                physical_size: Size::new(1, 1),
+            },
+        ] {
+            let mut output = Vec::new();
+            let error = run_snapshot(
+                &provider,
+                &spec(),
+                Timeframe::Minute1,
+                output_target,
+                RenderPolicy::StyleFree,
+                CancellationToken::new(),
+                &mut output,
+            )
+            .await
+            .expect_err("unsupported capability must fail");
+            assert!(matches!(
+                error,
+                AppError::Provider(ProviderError::Configuration(_))
+            ));
+            assert!(output.is_empty());
+        }
         assert!(provider.requests.lock().unwrap().is_empty());
+        assert_eq!(provider.canonicalize_calls.load(Ordering::SeqCst), 0);
     }
 }
 
