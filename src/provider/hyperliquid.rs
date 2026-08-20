@@ -11,15 +11,17 @@ use serde_json::Value;
 use time::{Date, Month, OffsetDateTime};
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 use tokio::sync::Notify;
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     cli::canonicalize_instrument,
     clock::{Clock, checked_deadline},
-    error::{
-        ErrorContext, ErrorOperation, PayloadError, ProviderError, SanitizedMessage, TimeoutKind,
-    },
+    error::{ErrorContext, ErrorOperation, PayloadError, ProviderError, SanitizedMessage},
     model::{
         Candle, HistoryRequest, HistoryRequestKind, Instrument, InstrumentSpec, Market, ProviderId,
         Timeframe, is_spot_index_token,
@@ -29,15 +31,25 @@ use crate::{
         RateGateSnapshot,
         runtime::{
             http::{HttpRuntime, RateLimitDecision},
-            live::{
-                ConnectionRotation, LiveAdapter, LiveConfig, LiveRateGate, LiveSocket,
-                LiveSocketEvent, LiveSupervisorConfig as SharedLiveSupervisorConfig,
-                ProcessBlockPolicy, ReconciliationLimits, ReconciliationPolicy,
-            },
-            websocket::{
-                DecodedFrame, ReadinessInput, WsCodec, WsConfig, connect_websocket_url,
-                contextualize_websocket_configuration, validate_websocket_base,
-            },
+            live::LiveSupervisorConfig as SharedLiveSupervisorConfig,
+        },
+    },
+};
+
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
+use crate::{
+    error::TimeoutKind,
+    provider::runtime::{
+        live::{
+            ConnectionRotation, LiveAdapter, LiveConfig, LiveRateGate, LiveSocket, LiveSocketEvent,
+            ProcessBlockPolicy, ReconciliationLimits, ReconciliationPolicy,
+        },
+        websocket::{
+            DecodedFrame, ReadinessInput, WsCodec, WsConfig, connect_websocket_url,
+            contextualize_websocket_configuration, validate_websocket_base,
         },
     },
 };
@@ -208,6 +220,10 @@ use crate::provider::runtime::websocket::{
     SubscribeFlushTestHook,
 };
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 impl HyperliquidWsCodec {
     #[must_use]
     pub const fn new() -> Self {
@@ -217,6 +233,10 @@ impl HyperliquidWsCodec {
     }
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 impl WsCodec for HyperliquidWsCodec {
     type Outcome = HyperliquidDecoded;
 
@@ -270,6 +290,10 @@ fn production_rest_base() -> &'static str {
 fn production_ws_base() -> &'static str {
     PRODUCTION_WS_BASE
 }
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 fn websocket_url_from_base(
     base_url: &str,
     instrument: &Instrument,
@@ -308,6 +332,10 @@ fn decode_ws_frame(
     decode_ws_frame_impl(codec, message, instrument, timeframe, config, outcomes);
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 fn decode_ws_frame_impl(
     codec: &mut HyperliquidWsCodec,
     message: Message,
@@ -343,6 +371,10 @@ fn decode_ws_frame_impl(
     }
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 fn decode_ws_payload(
     codec: &mut HyperliquidWsCodec,
     bytes: &[u8],
@@ -400,6 +432,10 @@ fn decode_ws_payload(
     }
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 fn decode_candle_payload(
     codec: &mut HyperliquidWsCodec,
     value: &Value,
@@ -861,6 +897,24 @@ impl HyperliquidProvider {
         self.http.gate_snapshot()
     }
 
+    fn history_page_limit(&self) -> u16 {
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        {
+            return self.live.advertised_history_page_limit;
+        }
+        #[cfg(any(
+            all(feature = "production-transport", not(feature = "test-transport")),
+            all(feature = "production-transport", feature = "test-transport")
+        ))]
+        {
+            1000
+        }
+    }
+
+    #[cfg(any(
+        all(feature = "production-transport", not(feature = "test-transport")),
+        all(feature = "test-transport", not(feature = "production-transport"))
+    ))]
     async fn connect_live_socket(
         &self,
         instrument: &Instrument,
@@ -889,10 +943,18 @@ impl HyperliquidProvider {
     }
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 pub(crate) struct HyperliquidLiveAdapter {
     provider: HyperliquidProvider,
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 impl HyperliquidLiveAdapter {
     fn new(provider: HyperliquidProvider) -> Self {
         Self { provider }
@@ -911,6 +973,10 @@ impl HyperliquidLiveAdapter {
     }
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 pub(crate) struct HyperliquidLiveSocket {
     raw: RawWebSocket,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -919,6 +985,10 @@ pub(crate) struct HyperliquidLiveSocket {
     stalled_write_probe_payload_size: usize,
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 impl LiveSocket for HyperliquidLiveSocket {
     async fn read(&mut self) -> Result<LiveSocketEvent, ProviderError> {
         match self.raw.read().await? {
@@ -954,6 +1024,10 @@ impl LiveSocket for HyperliquidLiveSocket {
     }
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 impl LiveAdapter for HyperliquidLiveAdapter {
     type Socket = HyperliquidLiveSocket;
 
@@ -1135,16 +1209,7 @@ impl MarketDataProvider for HyperliquidProvider {
                 Timeframe::Week1,
                 Timeframe::Month1,
             ],
-            history_page_limit: {
-                #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-                {
-                    self.live.advertised_history_page_limit
-                }
-                #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-                {
-                    1000
-                }
-            },
+            history_page_limit: self.history_page_limit(),
         }
     }
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
@@ -1166,15 +1231,28 @@ impl MarketDataProvider for HyperliquidProvider {
         ))
     }
     fn open_live<'a>(&'a self, request: LiveRequest) -> ProviderFuture<'a, LiveFeed> {
-        let adapter = HyperliquidLiveAdapter::new(self.clone());
-        let clock = Arc::clone(&self.clock);
-        let capabilities = MarketDataProvider::capabilities(self);
-        Box::pin(crate::provider::runtime::live::open_live(
-            adapter,
-            clock,
-            capabilities,
-            request,
-        ))
+        #[cfg(any(
+            all(feature = "production-transport", not(feature = "test-transport")),
+            all(feature = "test-transport", not(feature = "production-transport"))
+        ))]
+        {
+            let adapter = HyperliquidLiveAdapter::new(self.clone());
+            let clock = Arc::clone(&self.clock);
+            let capabilities = MarketDataProvider::capabilities(self);
+            return Box::pin(crate::provider::runtime::live::open_live(
+                adapter,
+                clock,
+                capabilities,
+                request,
+            ));
+        }
+        #[cfg(all(feature = "production-transport", feature = "test-transport"))]
+        {
+            let _ = request;
+            Box::pin(async {
+                unreachable!("mutually exclusive transport features are rejected by src/lib.rs")
+            })
+        }
     }
     fn rate_gate(&self) -> RateGateSnapshot {
         HyperliquidProvider::rate_gate(self)

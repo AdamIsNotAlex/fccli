@@ -86,8 +86,18 @@ fn run_valid(args: Vec<OsString>) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        let providers = match ProviderRegistry::new([
+            provider as Arc<dyn fccli::provider::MarketDataProvider>,
+            hyperliquid as Arc<dyn fccli::provider::MarketDataProvider>,
+        ]) {
+            Ok(providers) => providers,
+            Err(error) => {
+                eprintln!("fccli: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
         let dependencies = RunDependencies {
-            providers: ProviderRegistry::new(provider).with_hyperliquid(hyperliquid),
+            providers,
             clock,
             terminal: CrosstermTerminalDriver::production_driver(),
             input: Box::new(CrosstermTerminalInput::new()),

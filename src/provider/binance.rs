@@ -1,6 +1,11 @@
 //! Binance Spot and USD-M Perpetual REST history and raw WebSocket transport.
 
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
+use std::collections::VecDeque;
+use std::{sync::Arc, time::Duration};
 
 use reqwest::{StatusCode, Url, header::RETRY_AFTER};
 use serde::{
@@ -9,6 +14,10 @@ use serde::{
 };
 use serde_json::Value;
 use time::{Date, Month, OffsetDateTime};
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
@@ -25,16 +34,23 @@ use crate::{
         RateGateSnapshot,
         runtime::{
             http::{HttpRuntime, RateLimitDecision},
-            live::{
-                ConnectionRotation, LiveAdapter, LiveConfig, LiveRateGate, LiveSocket,
-                LiveSocketEvent, LiveSupervisorConfig, ProcessBlockPolicy, ReconciliationLimits,
-                ReconciliationPolicy,
-            },
-            websocket::{
-                DecodedFrame, WsCodec, WsConfig, connect_websocket_url,
-                contextualize_websocket_configuration, validate_websocket_base,
-            },
+            live::LiveSupervisorConfig,
         },
+    },
+};
+
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
+use crate::provider::runtime::{
+    live::{
+        ConnectionRotation, LiveAdapter, LiveConfig, LiveRateGate, LiveSocket, LiveSocketEvent,
+        ProcessBlockPolicy, ReconciliationLimits, ReconciliationPolicy,
+    },
+    websocket::{
+        DecodedFrame, WsCodec, WsConfig, connect_websocket_url,
+        contextualize_websocket_configuration, validate_websocket_base,
     },
 };
 
@@ -140,6 +156,10 @@ fn production_ws_base(market: Market) -> &'static str {
         Market::Perpetual => PRODUCTION_PERPETUAL_WS_BASE,
     }
 }
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 fn websocket_url_from_base(
     base_url: &str,
     instrument: &Instrument,
@@ -188,6 +208,10 @@ fn decode_ws_frame(
     decode_ws_frame_impl(message, instrument, timeframe, config)
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 fn decode_ws_frame_impl(
     message: Message,
     instrument: &Instrument,
@@ -213,6 +237,10 @@ pub struct BinanceWsCodec;
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct BinanceWsCodec;
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 impl WsCodec for BinanceWsCodec {
     type Outcome = BinanceDecoded;
 
@@ -234,6 +262,10 @@ impl WsCodec for BinanceWsCodec {
     }
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 fn decode_ws_payload(
     bytes: &[u8],
     instrument: &Instrument,
@@ -491,16 +523,28 @@ pub struct BinanceLiveTestConfig {
     pub max_gap_reconciliation_pages: usize,
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 pub(crate) struct BinanceLiveAdapter {
     provider: BinanceProvider,
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 impl BinanceLiveAdapter {
     fn new(provider: BinanceProvider) -> Self {
         Self { provider }
     }
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 pub(crate) struct BinanceLiveSocket {
     raw: RawWebSocket,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -509,6 +553,10 @@ pub(crate) struct BinanceLiveSocket {
     stalled_write_probe_payload_size: usize,
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 impl LiveSocket for BinanceLiveSocket {
     async fn read(&mut self) -> Result<LiveSocketEvent, ProviderError> {
         match self.raw.read().await? {
@@ -536,6 +584,10 @@ impl LiveSocket for BinanceLiveSocket {
     }
 }
 
+#[cfg(any(
+    all(feature = "production-transport", not(feature = "test-transport")),
+    all(feature = "test-transport", not(feature = "production-transport"))
+))]
 impl LiveAdapter for BinanceLiveAdapter {
     type Socket = BinanceLiveSocket;
 
@@ -844,6 +896,10 @@ impl BinanceProvider {
         unreachable!("rate-limit application always returns an error")
     }
 
+    #[cfg(any(
+        all(feature = "production-transport", not(feature = "test-transport")),
+        all(feature = "test-transport", not(feature = "production-transport"))
+    ))]
     async fn connect_live_socket(
         &self,
         instrument: &Instrument,
@@ -864,10 +920,7 @@ impl BinanceProvider {
             connect_test_websocket(base, instrument, timeframe, self.live.ws_config).await
         }
         #[cfg(all(feature = "production-transport", feature = "test-transport"))]
-        {
-            let _ = (instrument, timeframe);
-            unreachable!("mutually exclusive transport features are rejected by src/lib.rs")
-        }
+        unreachable!("mutually exclusive transport features are rejected by src/lib.rs")
     }
 
     pub fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
@@ -884,6 +937,20 @@ impl BinanceProvider {
     pub fn rate_gate(&self) -> RateGateSnapshot {
         self.http.gate_snapshot()
     }
+
+    fn history_page_limit(&self) -> u16 {
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        {
+            return self.advertised_history_page_limit;
+        }
+        #[cfg(any(
+            all(feature = "production-transport", not(feature = "test-transport")),
+            all(feature = "production-transport", feature = "test-transport")
+        ))]
+        {
+            1000
+        }
+    }
 }
 
 impl MarketDataProvider for BinanceProvider {
@@ -894,16 +961,7 @@ impl MarketDataProvider for BinanceProvider {
         ProviderCapabilities {
             markets: &[Market::Spot, Market::Perpetual],
             timeframes: &Timeframe::ALL,
-            history_page_limit: {
-                #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-                {
-                    self.advertised_history_page_limit
-                }
-                #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-                {
-                    1000
-                }
-            },
+            history_page_limit: self.history_page_limit(),
         }
     }
 
@@ -926,15 +984,28 @@ impl MarketDataProvider for BinanceProvider {
         ))
     }
     fn open_live<'a>(&'a self, request: LiveRequest) -> ProviderFuture<'a, LiveFeed> {
-        let adapter = BinanceLiveAdapter::new(self.clone());
-        let clock = Arc::clone(&self.clock);
-        let capabilities = MarketDataProvider::capabilities(self);
-        Box::pin(crate::provider::runtime::live::open_live(
-            adapter,
-            clock,
-            capabilities,
-            request,
-        ))
+        #[cfg(any(
+            all(feature = "production-transport", not(feature = "test-transport")),
+            all(feature = "test-transport", not(feature = "production-transport"))
+        ))]
+        {
+            let adapter = BinanceLiveAdapter::new(self.clone());
+            let clock = Arc::clone(&self.clock);
+            let capabilities = MarketDataProvider::capabilities(self);
+            return Box::pin(crate::provider::runtime::live::open_live(
+                adapter,
+                clock,
+                capabilities,
+                request,
+            ));
+        }
+        #[cfg(all(feature = "production-transport", feature = "test-transport"))]
+        {
+            let _ = request;
+            Box::pin(async {
+                unreachable!("mutually exclusive transport features are rejected by src/lib.rs")
+            })
+        }
     }
     fn rate_gate(&self) -> RateGateSnapshot {
         BinanceProvider::rate_gate(self)

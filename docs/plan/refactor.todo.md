@@ -227,22 +227,24 @@ Implementation note (verified): `runtime/http.rs` uniquely owns safe client cons
 
 ### R09 — Generalize ProviderRegistry
 
-**Status:** [ ]  
+**Status:** [x]  
 **Depends on:** R08  
 **Owned files:** `src/provider/mod.rs`, `src/main.rs`, `src/app.rs`, `tests/provider_contract.rs`, `tests/app_live_contract.rs`, `tests/binance_live.rs`, `tests/api_boundaries.rs`  
 **Parallel safety:** Parallel-safe only against work that touches none of these files; otherwise sequential. Does not touch provider implementations.  
 **Commit boundary:** `refactor(provider): use generic provider registry`
 
-- [ ] Replace hard-coded fields with `BTreeMap<ProviderId, Arc<dyn MarketDataProvider>>`; construction/registration rejects duplicate IDs and `get` borrows `&ProviderId`.
-- [ ] Remove `with_hyperliquid`, `with_test_provider`, injected-provider special case, and Binance-only accessor in the same commit.
-- [ ] Migrate `src/main.rs` to register Binance and Hyperliquid through the generic constructor/registration path; migrate both `src/app.rs` lookups to `get(provider_id_ref)` without cloning.
-- [ ] Migrate `tests/app_live_contract.rs` fake registration to the ordinary generic path. Migrate `tests/binance_live.rs` constructor calls, `.binance()` pointer assertion, and owned-ID `.get(...)` calls to generic registration, trait-object identity/behavior assertions, and borrowed lookup. Update both compile fixtures in `tests/api_boundaries.rs` to the new constructor while preserving what each fixture proves.
-- [ ] Preserve canonicalization of known-but-unregistered providers independently from registry transport lookup.
-- [ ] Test two-provider registration, borrowed lookup, duplicate rejection, unknown/unregistered failure, test-provider registration, and absence of provider-specific registry paths.
-- [ ] Verify: `cargo test --locked --test provider_contract --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test app_live_contract --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test api_boundaries --no-default-features --features test-transport`.
+**Implementation note:** Complete. `ProviderRegistry` now has one generic `BTreeMap` owner, rejects duplicate IDs on construction and registration, and provides borrowed-ID lookup. Production, app, fake-provider, Binance live, and compile-fixture callers use the ordinary generic path; provider-specific accessors/injection paths are absent. Canonicalization metadata remains independent from registered transports. The dedicated dual-feature compile fixture confirms the mutual-exclusion diagnostic is emitted without secondary Rust errors. Formatted gates passed: `provider_contract` 15/15, `app_live_contract` 54/54, `binance_live` 23/23, and `api_boundaries` 5/5.
+
+- [x] Replace hard-coded fields with `BTreeMap<ProviderId, Arc<dyn MarketDataProvider>>`; construction/registration rejects duplicate IDs and `get` borrows `&ProviderId`.
+- [x] Remove `with_hyperliquid`, `with_test_provider`, injected-provider special case, and Binance-only accessor in the same commit.
+- [x] Migrate `src/main.rs` to register Binance and Hyperliquid through the generic constructor/registration path; migrate both `src/app.rs` lookups to `get(provider_id_ref)` without cloning.
+- [x] Migrate `tests/app_live_contract.rs` fake registration to the ordinary generic path. Migrate `tests/binance_live.rs` constructor calls, `.binance()` pointer assertion, and owned-ID `.get(...)` calls to generic registration, trait-object identity/behavior assertions, and borrowed lookup. Update both compile fixtures in `tests/api_boundaries.rs` to the new constructor while preserving what each fixture proves.
+- [x] Preserve canonicalization of known-but-unregistered providers independently from registry transport lookup.
+- [x] Test two-provider registration, borrowed lookup, duplicate rejection, unknown/unregistered failure, test-provider registration, and absence of provider-specific registry paths.
+- [x] Verify: `cargo test --locked --test provider_contract --no-default-features --features test-transport` (15 passed).
+- [x] Verify: `cargo test --locked --test app_live_contract --no-default-features --features test-transport` (54 passed).
+- [x] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport` (23 passed).
+- [x] Verify: `cargo test --locked --test api_boundaries --no-default-features --features test-transport` (5 passed, including the dedicated-only dual-feature diagnostic).
 
 ### R10 — Complete protocol/shared-test migration and cleanup
 
@@ -329,8 +331,8 @@ Implementation note (verified): `runtime/http.rs` uniquely owns safe client cons
 | R06 | [x] | R05 | no | Complete; deterministic shared runtime harness owns reconciliation/concurrency, exact ack timeout and actual stale-ack gating, both control-channel closures, cancellation, saturation/emergency barrier ordering, capped backoff and maximum rate/backoff deadlines in both directions, real generation purge, first-candle timeout, and completion/error contracts; `provider_runtime_live.rs` is mode `100644`; formatted gates passed: `provider_runtime_live` 15/15, `binance_live` 23/23, `hyperliquid_live` 26/26, `app_live_contract` 51/51 |
 | R07 | [x] | R06 | no | Complete; deterministic shared-runtime coverage verifies request/body connection failures and history recoverability, exact-cap acceptance and one-byte-over rejection for declared-length and genuinely streamed bodies, cancellation/timeout mapping, safe-client behavior, common status handling, rate-gate waits, maximum timed deadlines, and absorbing process block. Formatted gates passed: `provider_runtime_http` 12/12, `binance_rest` 10/10, `hyperliquid_rest` 17/17, `binance_live` 23/23, and `hyperliquid_live` 26/26. |
 | R08 | [x] | R07 | no | Complete; capability consumers validate before network/output work, preserve desired 500-row app/snapshot requests capped by provider maximum, and use the advertised maximum exactly for older history. Deterministic coverage verifies pending-switch supersession, the switch limit/rejection matrix, snapshot pre-output rejection, and real Binance/Hyperliquid capabilities. Formatted gates passed: `provider_contract` 12/12, `history_coordinator` 23/23, `snapshot_runner` 8/8, `app_live_contract` 54/54, `binance_live` 23/23, and `hyperliquid_live` 26/26. |
-| R09 | [ ] | R08 | no | — |
+| R09 | [x] | R08 | no | Complete; the generic `BTreeMap` registry rejects duplicate IDs, uses borrowed lookup, has no provider-specific accessor/injection path, and keeps canonicalization metadata independent from transport registration. All production, app, fake, live-test, and compile-fixture callers use the generic constructor/registration path. Formatted gates passed: `provider_contract` 15/15, `app_live_contract` 54/54, `binance_live` 23/23, and `api_boundaries` 5/5 including the dedicated-only dual-feature diagnostic. |
 | R10 | [ ] | R09 | no | — |
 | R11 | [ ] | R10 | no | — |
 
-**Next dependency-ready unchecked chunk:** R09 — generalize `ProviderRegistry`.
+**Next dependency-ready unchecked chunk:** R10 — complete protocol/shared-test migration and cleanup.

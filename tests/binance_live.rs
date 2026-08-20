@@ -548,25 +548,22 @@ fn production_constants_capacity_boundaries_and_registry_are_exact() {
         let rest = MockServer::start().await;
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
         let binance = Arc::new(BinanceProvider::new_test(rest.uri(), clock).expect("provider"));
-        let registry = ProviderRegistry::new(Arc::clone(&binance));
-        assert!(Arc::ptr_eq(&registry.binance(), &binance));
-        assert_eq!(
-            registry
-                .get(ProviderId::new("binance").expect("id"))
-                .expect("registered")
-                .id()
-                .as_str(),
-            "binance"
-        );
+        let registered: Arc<dyn MarketDataProvider> = binance;
+        let registry = ProviderRegistry::new([Arc::clone(&registered)]).expect("unique provider");
+        let binance_id = ProviderId::new("binance").expect("id");
+        let selected = registry.get(&binance_id).expect("registered");
+        assert!(Arc::ptr_eq(&selected, &registered));
+        assert_eq!(selected.id().as_str(), "binance");
         let capabilities = registry
-            .get(ProviderId::new("binance").expect("id"))
+            .get(&binance_id)
             .expect("registered")
             .capabilities();
         assert_eq!(capabilities.markets, &[Market::Spot, Market::Perpetual]);
         assert_eq!(capabilities.timeframes, &Timeframe::ALL);
         assert_eq!(capabilities.history_page_limit, 1000);
+        let other_id = ProviderId::new("other").expect("id");
         assert!(matches!(
-            registry.get(ProviderId::new("other").expect("id")),
+            registry.get(&other_id),
             Err(ProviderError::Configuration(_))
         ));
     });
@@ -611,10 +608,10 @@ async fn registry_trait_object_uses_shared_history_live_and_rate_gate_state() {
         Arc::<ManualClock>::clone(&manual),
         LiveSupervisorConfig::default(),
     );
-    let registry = ProviderRegistry::new(Arc::clone(&concrete));
-    let selected = registry
-        .get(ProviderId::new("binance").expect("provider id"))
-        .expect("registered provider");
+    let registered: Arc<dyn MarketDataProvider> = concrete;
+    let registry = ProviderRegistry::new([registered]).expect("unique provider");
+    let provider_id = ProviderId::new("binance").expect("provider id");
+    let selected = registry.get(&provider_id).expect("registered provider");
     assert_eq!(selected.id().as_str(), "binance");
     assert_eq!(selected.rate_gate().current(), Ok(RateGateState::Open));
 

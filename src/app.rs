@@ -313,9 +313,7 @@ where
         )
     })?;
 
-    let provider = dependencies
-        .providers
-        .get(cli.instrument().provider().clone())?;
+    let provider = dependencies.providers.get(cli.instrument().provider())?;
     match cli.mode() {
         Mode::Snapshot => {
             let render_policy = if dependencies.stdout_is_tty {
@@ -637,7 +635,7 @@ impl App {
                 }
             }));
         }
-        let provider = match self.providers.get(target.instrument.provider().clone()) {
+        let provider = match self.providers.get(target.instrument.provider()) {
             Ok(provider) => provider,
             Err(error) => {
                 self.footer = FooterPresentation::Error {

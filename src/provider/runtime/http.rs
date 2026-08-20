@@ -215,9 +215,6 @@ impl HttpRuntime {
             RateGateState::ProcessBlocked(ProcessBlocker::InvalidBanExpiry) => {
                 Err(ProviderError::InvalidBanExpiry)
             }
-            RateGateState::ProcessBlocked(_) => {
-                Err(ProviderError::Invariant("unsupported process block"))
-            }
             _ => Err(ProviderError::RateLimited {
                 context,
                 status: status.as_u16(),

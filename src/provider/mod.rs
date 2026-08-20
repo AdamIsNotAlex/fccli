@@ -20,6 +20,7 @@ pub use runtime::live::{
 
 use futures_util::Stream;
 use std::{
+    collections::{BTreeMap, btree_map::Entry},
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -67,67 +68,41 @@ pub trait MarketDataProvider: Send + Sync {
 
 #[derive(Clone)]
 pub struct ProviderRegistry {
-    binance: Arc<binance::BinanceProvider>,
-    hyperliquid: Option<Arc<hyperliquid::HyperliquidProvider>>,
-    #[cfg(feature = "test-transport")]
-    injected: Option<Arc<dyn MarketDataProvider>>,
+    providers: BTreeMap<ProviderId, Arc<dyn MarketDataProvider>>,
 }
 
 impl ProviderRegistry {
-    #[must_use]
-    pub fn new(binance: Arc<binance::BinanceProvider>) -> Self {
-        Self {
-            binance,
-            hyperliquid: None,
-            #[cfg(feature = "test-transport")]
-            injected: None,
+    pub fn new(
+        providers: impl IntoIterator<Item = Arc<dyn MarketDataProvider>>,
+    ) -> Result<Self, ProviderError> {
+        let mut registry = Self {
+            providers: BTreeMap::new(),
+        };
+        for provider in providers {
+            registry.register(provider)?;
         }
+        Ok(registry)
     }
 
-    #[must_use]
-    pub fn with_hyperliquid(mut self, provider: Arc<hyperliquid::HyperliquidProvider>) -> Self {
-        self.hyperliquid = Some(provider);
-        self
-    }
-
-    #[cfg(feature = "test-transport")]
-    #[must_use]
-    pub fn with_test_provider(
-        binance: Arc<binance::BinanceProvider>,
-        provider: Arc<dyn MarketDataProvider>,
-    ) -> Self {
-        Self {
-            binance,
-            hyperliquid: None,
-            injected: Some(provider),
-        }
-    }
-
-    pub fn get(&self, id: ProviderId) -> Result<Arc<dyn MarketDataProvider>, ProviderError> {
-        #[cfg(feature = "test-transport")]
-        if id.as_str() == "binance"
-            && let Some(provider) = &self.injected
-        {
-            return Ok(Arc::clone(provider));
-        }
-        match id.as_str() {
-            "binance" => Ok(self.binance.clone()),
-            "hyperliquid" => self
-                .hyperliquid
-                .clone()
-                .map(|provider| provider as _)
-                .ok_or(ProviderError::Configuration(
-                    "unsupported market-data provider",
-                )),
-            _ => Err(ProviderError::Configuration(
-                "unsupported market-data provider",
+    pub fn register(&mut self, provider: Arc<dyn MarketDataProvider>) -> Result<(), ProviderError> {
+        match self.providers.entry(provider.id()) {
+            Entry::Vacant(entry) => {
+                entry.insert(provider);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(ProviderError::Configuration(
+                "duplicate market-data provider",
             )),
         }
     }
 
-    #[must_use]
-    pub fn binance(&self) -> Arc<binance::BinanceProvider> {
-        Arc::clone(&self.binance)
+    pub fn get(&self, id: &ProviderId) -> Result<Arc<dyn MarketDataProvider>, ProviderError> {
+        self.providers
+            .get(id)
+            .cloned()
+            .ok_or(ProviderError::Configuration(
+                "unsupported market-data provider",
+            ))
     }
 }
 

@@ -32,7 +32,7 @@ use fccli::{
     provider::{
         CancellationToken, LiveFeed, LiveRequest, MarketDataProvider, MarketEventStream,
         ProviderFuture, ProviderRegistry, RateGateSender, RateGateSnapshot, ReconcileAck,
-        binance::BinanceProvider, rate_gate_channel,
+        rate_gate_channel,
     },
     terminal::TerminalDriver,
 };
@@ -1052,10 +1052,9 @@ fn dependencies(
     output: SharedWriter,
     clock: Arc<dyn Clock>,
 ) -> RunDependencies {
-    let concrete =
-        Arc::new(BinanceProvider::new_test("http://127.0.0.1:1", Arc::clone(&clock)).unwrap());
+    let provider: Arc<dyn MarketDataProvider> = provider;
     RunDependencies {
-        providers: ProviderRegistry::with_test_provider(concrete, provider),
+        providers: ProviderRegistry::new([provider]).expect("unique fake provider"),
         clock,
         terminal,
 
