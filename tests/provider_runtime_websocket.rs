@@ -1261,6 +1261,63 @@ mod emitter_contracts {
     }
 
     #[tokio::test]
+    async fn control_saturation_coalesces_identical_status_and_preserves_distinct_order() {
+        let mut facade = EventEmitterTestFacade::new(1);
+        let first = MarketEvent::Status {
+            generation: Some(GapGeneration(1)),
+            status: ConnectionStatus::Connecting,
+        };
+        facade
+            .send(first.clone())
+            .await
+            .expect("occupy control permit");
+
+        timeout(Duration::from_secs(1), facade.send(first.clone()))
+            .await
+            .expect("identical pending status must coalesce without blocking")
+            .expect("identical pending status");
+
+        let sender = facade.clone_emitter();
+        let blocked_sender = sender.clone();
+        let distinct = tokio::spawn(async move {
+            blocked_sender
+                .send(MarketEvent::Status {
+                    generation: Some(GapGeneration(1)),
+                    status: ConnectionStatus::Connected,
+                })
+                .await
+        });
+        timeout(
+            Duration::from_secs(1),
+            sender.wait_control_saturation_attempts(1),
+        )
+        .await
+        .expect("distinct status must reach the occupied control permit");
+        assert!(
+            !distinct.is_finished(),
+            "distinct status must remain blocked while the sole permit is occupied"
+        );
+
+        assert_eq!(recv(&mut facade).await, first);
+        timeout(Duration::from_secs(1), distinct)
+            .await
+            .expect("distinct status producer must resume after dequeue")
+            .expect("distinct status producer task")
+            .expect("distinct status send");
+        assert!(matches!(
+            recv(&mut facade).await,
+            MarketEvent::Status {
+                generation: Some(GapGeneration(1)),
+                status: ConnectionStatus::Connected,
+            }
+        ));
+        assert!(
+            facade.try_recv().is_none(),
+            "coalesced duplicate must not occupy a second queue slot"
+        );
+    }
+
+    #[tokio::test]
     async fn emergency_pair_uses_reserved_capacity_and_preserves_order() {
         let mut facade = EventEmitterTestFacade::new(1);
         facade

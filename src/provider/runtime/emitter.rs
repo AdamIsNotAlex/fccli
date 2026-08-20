@@ -6,6 +6,8 @@ use std::{
     },
 };
 
+#[cfg(feature = "test-transport")]
+use std::sync::atomic::AtomicUsize;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::{
@@ -148,6 +150,10 @@ pub(crate) struct EventEmitter {
     connected_delivered: Arc<AtomicU64>,
     pending_controls: Arc<Mutex<Vec<StatusKey>>>,
     pub(crate) emergency_barrier: Arc<EmergencyBarrier>,
+    #[cfg(feature = "test-transport")]
+    control_saturation_attempts: Arc<AtomicUsize>,
+    #[cfg(feature = "test-transport")]
+    control_saturation_notify: Arc<Notify>,
     shutdown: Arc<AtomicBool>,
 }
 pub(crate) struct KeyedCandleBuffer {
@@ -248,6 +254,16 @@ impl EventEmitterTestSender {
     pub async fn wait_emergency_suppressed(&self, slot: u8) {
         self.0.emergency_barrier.wait_suppressed(slot).await;
     }
+
+    pub async fn wait_control_saturation_attempts(&self, expected: usize) {
+        while self.0.control_saturation_attempts.load(Ordering::Acquire) < expected {
+            let notified = self.0.control_saturation_notify.notified();
+            if self.0.control_saturation_attempts.load(Ordering::Acquire) >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 #[cfg(feature = "test-transport")]
@@ -313,6 +329,21 @@ impl EventEmitterTestFacade {
         }
     }
 
+    pub fn try_recv(&mut self) -> Option<Result<MarketEvent, ProviderError>> {
+        loop {
+            let envelope = self.receiver.try_recv().ok()?;
+            let suppressed = envelope.emergency_slot.is_some_and(|slot| {
+                envelope
+                    .emergency_barrier
+                    .as_ref()
+                    .is_some_and(|barrier| barrier.is_suppressed(slot))
+            });
+            if !suppressed {
+                return Some(envelope.into_item());
+            }
+        }
+    }
+
     pub fn close_receiver(&mut self) {
         let (_sender, receiver) = mpsc::channel(1);
         let previous = std::mem::replace(&mut self.receiver, receiver);
@@ -339,6 +370,10 @@ impl EventEmitter {
             pending_controls: Arc::new(Mutex::new(Vec::new())),
             emergency_barrier: Arc::new(EmergencyBarrier::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "test-transport")]
+            control_saturation_attempts: Arc::new(AtomicUsize::new(0)),
+            #[cfg(feature = "test-transport")]
+            control_saturation_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -398,6 +433,12 @@ impl EventEmitter {
             return Ok(());
         }
         let control_permit = if is_control_event(&event) {
+            #[cfg(feature = "test-transport")]
+            if self.control_permits.available_permits() == 0 {
+                self.control_saturation_attempts
+                    .fetch_add(1, Ordering::AcqRel);
+                self.control_saturation_notify.notify_waiters();
+            }
             Some(
                 Arc::clone(&self.control_permits)
                     .acquire_owned()
