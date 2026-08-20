@@ -479,10 +479,24 @@ fn reconciliation_span_arithmetic_covers_exact_limit_and_overflow() {
         START,
         i64::MAX,
     ));
+
+    const JANUARY_1970: i64 = 0;
+    const MONTH_SUCCESSOR_64_000: i64 = 168_303_571_200_000; // 7303-05-01T00:00:00Z
+    const MONTH_SUCCESSOR_64_001: i64 = 168_306_249_600_000; // 7303-06-01T00:00:00Z
     assert!(gap_target_within_generation_span_for_test(
         Timeframe::Month1,
-        1_704_067_200_000,
-        1_709_251_200_000,
+        JANUARY_1970,
+        MONTH_SUCCESSOR_64_000,
+    ));
+    assert!(!gap_target_within_generation_span_for_test(
+        Timeframe::Month1,
+        JANUARY_1970,
+        MONTH_SUCCESSOR_64_001,
+    ));
+    assert!(!gap_target_within_generation_span_for_test(
+        Timeframe::Month1,
+        JANUARY_1970,
+        i64::MAX,
     ));
 }
 #[tokio::test]
