@@ -130,6 +130,21 @@ impl MarketDataProvider for FakeProvider {
 
 fn assert_object_safe(_: Arc<dyn MarketDataProvider>) {}
 
+#[test]
+fn capabilities_are_public_data_support_and_nonzero_history_maximum_only() {
+    let (gate_tx, gate) = fccli::provider::rate_gate_channel(RateGateState::Open);
+    let provider = FakeProvider { gate };
+    let ProviderCapabilities {
+        markets,
+        timeframes,
+        history_page_limit,
+    } = provider.capabilities();
+    assert_eq!(markets, &[Market::Spot]);
+    assert_eq!(timeframes, &[Timeframe::Minute1]);
+    assert_ne!(history_page_limit, 0);
+    drop(gate_tx);
+}
+
 #[tokio::test]
 async fn fake_provider_is_object_safe_and_constructs_exact_event_payloads() {
     let (gate_tx, gate) = fccli::provider::rate_gate_channel(RateGateState::Open);

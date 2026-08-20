@@ -15,8 +15,6 @@ use crate::{
     provider::{CancellationToken, MarketDataProvider, RateGateSnapshot},
 };
 
-pub const HISTORY_PAGE_LIMIT: u16 = 1_000;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HistoryBoundary {
     Outside,
@@ -383,6 +381,22 @@ impl HistoryCoordinator {
         let Some(oldest) = self.oldest_open_time else {
             return HistoryProgress::Idle;
         };
+        let capabilities = self.provider.capabilities();
+        if !capabilities.markets.contains(&self.instrument.market()) {
+            return self.terminal_failure(ProviderError::Configuration(
+                "provider does not support market",
+            ));
+        }
+        if !capabilities.timeframes.contains(&self.timeframe) {
+            return self.terminal_failure(ProviderError::Configuration(
+                "provider does not support timeframe",
+            ));
+        }
+        if capabilities.history_page_limit == 0 {
+            return self.terminal_failure(ProviderError::Configuration(
+                "provider history page limit must be non-zero",
+            ));
+        }
         match self.observe_gate() {
             Ok(RateGateState::Open) => {}
             Ok(RateGateState::TimedUntil(deadline)) if deadline > self.clock.now() => {
@@ -398,7 +412,7 @@ impl HistoryCoordinator {
             }
             Err(error) => return self.terminal_failure(error),
         }
-        let request = match HistoryRequest::older(oldest, HISTORY_PAGE_LIMIT) {
+        let request = match HistoryRequest::older(oldest, capabilities.history_page_limit) {
             Ok(request) => request,
             Err(_) => {
                 return self

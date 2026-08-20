@@ -614,6 +614,7 @@ struct FakeProvider {
     hung: bool,
     close_stream: bool,
     complete_producer: bool,
+    capabilities: fccli::provider::ProviderCapabilities,
 }
 
 impl FakeProvider {
@@ -646,9 +647,18 @@ impl FakeProvider {
             hung: false,
             close_stream: false,
             complete_producer: false,
+            capabilities: fccli::provider::ProviderCapabilities {
+                markets: &[Market::Spot, Market::Perpetual],
+                timeframes: &Timeframe::ALL,
+                history_page_limit: 1000,
+            },
         }
     }
 
+    fn with_capabilities(mut self, capabilities: fccli::provider::ProviderCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
     fn hung(mut self) -> Self {
         self.hung = true;
         self
@@ -723,11 +733,7 @@ impl MarketDataProvider for FakeProvider {
         ProviderId::new("binance").unwrap()
     }
     fn capabilities(&self) -> fccli::provider::ProviderCapabilities {
-        fccli::provider::ProviderCapabilities {
-            markets: &[Market::Spot, Market::Perpetual],
-            timeframes: &Timeframe::ALL,
-            history_page_limit: 1000,
-        }
+        self.capabilities
     }
 
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
@@ -982,6 +988,7 @@ fn dependencies(
         providers: ProviderRegistry::with_test_provider(concrete, provider),
         clock,
         terminal,
+
         input,
         stdout: Box::new(output),
         stderr: Box::new(SharedWriter::default()),
@@ -990,6 +997,123 @@ fn dependencies(
         render_policy: fccli::chart::RenderPolicy::StyleFree,
         epoch_observer: None,
     }
+}
+#[tokio::test]
+async fn initial_app_caps_desired_500_and_rejects_before_network_io() {
+    for (maximum, expected) in [(1_000, 500), (7, 7)] {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+        let provider = Arc::new(
+            FakeProvider::new(vec![candle(0, 59_999)], vec![], Arc::clone(&clock))
+                .with_capabilities(fccli::provider::ProviderCapabilities {
+                    markets: &[Market::Spot, Market::Perpetual],
+                    timeframes: &Timeframe::ALL,
+                    history_page_limit: maximum,
+                }),
+        );
+        let terminal = Arc::new(TerminalLog::default());
+        let result = run_with_dependencies(
+            ["fccli", "btc", "1m", "--interactive"],
+            dependencies(
+                Arc::clone(&provider),
+                delayed_key(Duration::from_millis(10), 'q'),
+                terminal,
+                SharedWriter::default(),
+                clock,
+            ),
+        )
+        .await;
+        assert_eq!(result, Ok(ExitCode::SUCCESS));
+        assert_eq!(provider.requests.acquire()[0].limit(), expected);
+    }
+
+    for (arguments, capabilities) in [
+        (
+            ["fccli", "btc.p", "1m", "--interactive"],
+            fccli::provider::ProviderCapabilities {
+                markets: &[Market::Spot],
+                timeframes: &Timeframe::ALL,
+                history_page_limit: 500,
+            },
+        ),
+        (
+            ["fccli", "btc", "1s", "--interactive"],
+            fccli::provider::ProviderCapabilities {
+                markets: &[Market::Spot, Market::Perpetual],
+                timeframes: &[Timeframe::Minute1],
+                history_page_limit: 500,
+            },
+        ),
+        (
+            ["fccli", "btc", "6h", "--interactive"],
+            fccli::provider::ProviderCapabilities {
+                markets: &[Market::Spot, Market::Perpetual],
+                timeframes: &[Timeframe::Minute1],
+                history_page_limit: 500,
+            },
+        ),
+        (
+            ["fccli", "btc", "1m", "--interactive"],
+            fccli::provider::ProviderCapabilities {
+                markets: &[Market::Spot, Market::Perpetual],
+                timeframes: &Timeframe::ALL,
+                history_page_limit: 0,
+            },
+        ),
+    ] {
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+        let provider = Arc::new(
+            FakeProvider::new(vec![candle(0, 59_999)], vec![], Arc::clone(&clock))
+                .with_capabilities(capabilities),
+        );
+        let error = run_with_dependencies(
+            arguments,
+            dependencies(
+                Arc::clone(&provider),
+                Box::new(ScriptedTerminalInput::new([])),
+                Arc::new(TerminalLog::default()),
+                SharedWriter::default(),
+                clock,
+            ),
+        )
+        .await
+        .expect_err("unsupported capability must fail initial startup");
+        assert!(error.to_string().contains("provider"));
+        assert!(provider.requests.acquire().is_empty());
+        assert_eq!(provider.canonicalize_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn switch_preflight_rejects_unsupported_timeframe_without_second_request() {
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+    let provider = Arc::new(
+        FakeProvider::new(
+            (0..100)
+                .map(|index| candle(index * 60_000, index * 60_000 + 59_999))
+                .collect(),
+            vec![],
+            Arc::clone(&clock),
+        )
+        .with_capabilities(fccli::provider::ProviderCapabilities {
+            markets: &[Market::Spot, Market::Perpetual],
+            timeframes: &[Timeframe::Minute1],
+            history_page_limit: 500,
+        }),
+    );
+    let observations = Arc::new(Mutex::new(Vec::<EpochObservation>::new()));
+    let result = run_with_observations(
+        Arc::clone(&provider),
+        switch_then_quit_input(&["eth 1h"]),
+        clock,
+        Arc::clone(&observations),
+    )
+    .await;
+    assert_eq!(result, Ok(ExitCode::SUCCESS));
+    assert_eq!(provider.requests.acquire().len(), 1);
+    assert_eq!(provider.open_live_calls.load(Ordering::SeqCst), 1);
+    assert!(observations.acquire().iter().any(|observation| {
+        matches!(&observation.snapshot.footer, FooterPresentation::Error { message } if message.contains("provider does not support timeframe"))
+    }));
 }
 
 #[tokio::test]

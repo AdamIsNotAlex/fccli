@@ -26,6 +26,7 @@ struct FakeProvider {
     wait_for_cancellation: bool,
     _gate_sender: RateGateSender,
     gate: RateGateSnapshot,
+    capabilities: ProviderCapabilities,
 }
 
 impl FakeProvider {
@@ -38,7 +39,17 @@ impl FakeProvider {
             wait_for_cancellation: false,
             _gate_sender: gate_sender,
             gate,
+            capabilities: ProviderCapabilities {
+                markets: &[fccli::model::Market::Spot, fccli::model::Market::Perpetual],
+                timeframes: &Timeframe::ALL,
+                history_page_limit: 1000,
+            },
         }
+    }
+
+    fn with_capabilities(mut self, capabilities: ProviderCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 }
 
@@ -47,11 +58,7 @@ impl MarketDataProvider for FakeProvider {
         ProviderId::new("fake").expect("valid provider")
     }
     fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            markets: &[fccli::model::Market::Spot],
-            timeframes: &[Timeframe::Minute1],
-            history_page_limit: 1000,
-        }
+        self.capabilities
     }
 
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
@@ -98,6 +105,70 @@ impl MarketDataProvider for FakeProvider {
 
     fn rate_gate(&self) -> RateGateSnapshot {
         self.gate.clone()
+    }
+}
+
+#[tokio::test]
+async fn snapshot_caps_desired_500_to_provider_maximum() {
+    for (maximum, expected) in [(1_000, 500), (7, 7)] {
+        let provider = FakeProvider::new(candles(1)).with_capabilities(ProviderCapabilities {
+            markets: &[fccli::model::Market::Spot],
+            timeframes: &[Timeframe::Minute1],
+            history_page_limit: maximum,
+        });
+        let mut output = Vec::new();
+        run_snapshot(
+            &provider,
+            &spec(),
+            Timeframe::Minute1,
+            SnapshotOutputTarget::NonTty,
+            RenderPolicy::StyleFree,
+            CancellationToken::new(),
+            &mut output,
+        )
+        .await
+        .expect("supported snapshot");
+        assert_eq!(provider.requests.lock().unwrap()[0].limit(), expected);
+    }
+}
+
+#[tokio::test]
+async fn snapshot_rejects_market_timeframe_and_zero_limit_before_history() {
+    for capabilities in [
+        ProviderCapabilities {
+            markets: &[fccli::model::Market::Perpetual],
+            timeframes: &[Timeframe::Minute1],
+            history_page_limit: 500,
+        },
+        ProviderCapabilities {
+            markets: &[fccli::model::Market::Spot],
+            timeframes: &[Timeframe::Hour1],
+            history_page_limit: 500,
+        },
+        ProviderCapabilities {
+            markets: &[fccli::model::Market::Spot],
+            timeframes: &[Timeframe::Minute1],
+            history_page_limit: 0,
+        },
+    ] {
+        let provider = FakeProvider::new(candles(1)).with_capabilities(capabilities);
+        let mut output = Vec::new();
+        let error = run_snapshot(
+            &provider,
+            &spec(),
+            Timeframe::Minute1,
+            SnapshotOutputTarget::NonTty,
+            RenderPolicy::StyleFree,
+            CancellationToken::new(),
+            &mut output,
+        )
+        .await
+        .expect_err("unsupported capability must fail");
+        assert!(matches!(
+            error,
+            AppError::Provider(ProviderError::Configuration(_))
+        ));
+        assert!(provider.requests.lock().unwrap().is_empty());
     }
 }
 

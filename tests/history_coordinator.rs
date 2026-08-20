@@ -7,7 +7,7 @@ use fccli::{
     chart::ChartViewState,
     clock::ManualClock,
     error::{ErrorContext, ErrorOperation, ProviderError, SanitizedCause, TimeoutKind},
-    history::{HISTORY_PAGE_LIMIT, HistoryCoordinator, HistoryJoinError, HistoryProgress},
+    history::{HistoryCoordinator, HistoryJoinError, HistoryProgress},
     model::{
         Candle, CandleSeries, HistoryRequest, Instrument, InstrumentSpec, Market, MonoInstant,
         ProcessBlocker, ProviderId, RateGateState, Timeframe,
@@ -36,6 +36,7 @@ struct FakeProvider {
     requests: Arc<Mutex<Vec<HistoryRequest>>>,
     gate_sender: Arc<Mutex<Option<RateGateSender>>>,
     gate: RateGateSnapshot,
+    capabilities: ProviderCapabilities,
 }
 
 impl FakeProvider {
@@ -46,7 +47,17 @@ impl FakeProvider {
             requests: Arc::new(Mutex::new(Vec::new())),
             gate_sender: Arc::new(Mutex::new(Some(sender))),
             gate,
+            capabilities: ProviderCapabilities {
+                markets: &[Market::Spot, Market::Perpetual],
+                timeframes: &Timeframe::ALL,
+                history_page_limit: 1_000,
+            },
         }
+    }
+
+    fn with_capabilities(mut self, capabilities: ProviderCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     fn publish(&self, state: RateGateState) {
@@ -72,11 +83,7 @@ impl MarketDataProvider for FakeProvider {
         ProviderId::new("binance").unwrap()
     }
     fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            markets: &[Market::Spot, Market::Perpetual],
-            timeframes: &Timeframe::ALL,
-            history_page_limit: HISTORY_PAGE_LIMIT,
-        }
+        self.capabilities
     }
 
     fn canonicalize(&self, _spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
@@ -190,6 +197,82 @@ fn harness(responses: impl IntoIterator<Item = Response>, len: usize) -> Harness
     }
 }
 
+fn harness_with_capabilities(
+    responses: impl IntoIterator<Item = Response>,
+    len: usize,
+    capabilities: ProviderCapabilities,
+) -> Harness {
+    let provider = Arc::new(FakeProvider::new(responses).with_capabilities(capabilities));
+    let clock = Arc::new(ManualClock::new(MonoInstant::ZERO));
+    let cancellation = CancellationToken::new();
+    let series = initial_series(len);
+    let view = ChartViewState::interactive(&series, 20);
+    let coordinator = HistoryCoordinator::new(
+        provider.clone(),
+        instrument(),
+        Timeframe::Minute1,
+        clock.clone(),
+        cancellation.clone(),
+    );
+    Harness {
+        provider,
+        clock,
+        cancellation,
+        coordinator,
+        series,
+        view,
+    }
+}
+
+#[tokio::test]
+async fn older_history_uses_advertised_maximum_exactly() {
+    let mut h = harness_with_capabilities(
+        [Response::Ready(Ok(Vec::new()))],
+        10,
+        ProviderCapabilities {
+            markets: &[Market::Spot],
+            timeframes: &[Timeframe::Minute1],
+            history_page_limit: 7,
+        },
+    );
+    assert_eq!(
+        h.coordinator.update_boundary(0, &h.series),
+        HistoryProgress::RequestStarted
+    );
+    tokio::task::yield_now().await;
+    let requests = h.provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].limit(), 7);
+}
+
+#[tokio::test]
+async fn older_history_rejects_unsupported_capabilities_before_network_io() {
+    for capabilities in [
+        ProviderCapabilities {
+            markets: &[Market::Perpetual],
+            timeframes: &[Timeframe::Minute1],
+            history_page_limit: 7,
+        },
+        ProviderCapabilities {
+            markets: &[Market::Spot],
+            timeframes: &[Timeframe::Second1],
+            history_page_limit: 7,
+        },
+        ProviderCapabilities {
+            markets: &[Market::Spot],
+            timeframes: &[Timeframe::Minute1],
+            history_page_limit: 0,
+        },
+    ] {
+        let mut h = harness_with_capabilities([], 10, capabilities);
+        assert!(matches!(
+            h.coordinator.update_boundary(0, &h.series),
+            HistoryProgress::TerminalFailure(ProviderError::Configuration(_))
+        ));
+        assert!(h.provider.requests().is_empty());
+    }
+}
+
 #[test]
 fn threshold_is_exact_ceiling_ten_percent_and_empty_never_triggers() {
     assert_eq!(HistoryCoordinator::threshold(0), 0);
@@ -242,7 +325,7 @@ async fn crossing_boundary_requests_checked_oldest_minus_one_limit_1000_and_appl
     let requests = h.provider.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].end_time(), Some(999_999));
-    assert_eq!(requests[0].limit(), HISTORY_PAGE_LIMIT);
+    assert_eq!(requests[0].limit(), 1_000);
     assert_eq!(h.series.oldest_open_time(), Some(940_000));
 }
 
