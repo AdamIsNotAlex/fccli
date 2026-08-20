@@ -17,13 +17,43 @@ use crate::{
 
 pub(crate) type StatusKey = (Option<GapGeneration>, ConnectionStatus);
 
+struct PendingControlReservation {
+    key: StatusKey,
+    pending_controls: Arc<Mutex<Vec<StatusKey>>>,
+}
+
+impl PendingControlReservation {
+    fn try_reserve(key: StatusKey, pending_controls: &Arc<Mutex<Vec<StatusKey>>>) -> Option<Self> {
+        let mut pending = pending_controls.lock().expect("control mutex poisoned");
+        if pending.contains(&key) {
+            return None;
+        }
+        pending.push(key);
+        Some(Self {
+            key,
+            pending_controls: Arc::clone(pending_controls),
+        })
+    }
+}
+
+impl Drop for PendingControlReservation {
+    fn drop(&mut self) {
+        let mut pending = self
+            .pending_controls
+            .lock()
+            .expect("control mutex poisoned");
+        if let Some(index) = pending.iter().position(|key| *key == self.key) {
+            pending.swap_remove(index);
+        }
+    }
+}
+
 pub(crate) struct EventEnvelope {
     item: Option<Result<MarketEvent, ProviderError>>,
     pub(crate) generation: Option<GapGeneration>,
     pub(crate) purge_on_invalidate: bool,
     connected_delivered: Arc<AtomicU64>,
-    control_key: Option<StatusKey>,
-    pending_controls: Arc<Mutex<Vec<StatusKey>>>,
+    control_reservation: Option<PendingControlReservation>,
     _regular_permit: Option<OwnedSemaphorePermit>,
     _control_permit: Option<OwnedSemaphorePermit>,
     pub(crate) emergency_slot: Option<u8>,
@@ -57,15 +87,7 @@ impl EventEnvelope {
 
 impl Drop for EventEnvelope {
     fn drop(&mut self) {
-        if let Some(key) = self.control_key {
-            let mut pending = self
-                .pending_controls
-                .lock()
-                .expect("control mutex poisoned");
-            if let Some(index) = pending.iter().position(|pending_key| *pending_key == key) {
-                pending.swap_remove(index);
-            }
-        }
+        drop(self.control_reservation.take());
         if let (Some(slot), Some(barrier)) = (self.emergency_slot, &self.emergency_barrier) {
             barrier.dequeued(slot);
         }
@@ -269,12 +291,16 @@ impl EventEmitterTestSender {
 #[cfg(feature = "test-transport")]
 impl EventEmitterTestFacade {
     pub fn new(keyed_capacity: usize) -> Self {
+        Self::with_control_capacity(keyed_capacity, 1)
+    }
+
+    pub fn with_control_capacity(keyed_capacity: usize, control_capacity: usize) -> Self {
         let physical_capacity = keyed_capacity
             .checked_add(2)
             .expect("test emitter capacity overflow");
         let (sender, receiver) = mpsc::channel(physical_capacity);
         Self {
-            emitter: EventEmitter::new(sender, keyed_capacity, 1),
+            emitter: EventEmitter::new(sender, keyed_capacity, control_capacity),
             receiver,
             keyed: KeyedCandleBuffer::bounded(keyed_capacity),
             generation: GapGeneration(1),
@@ -403,8 +429,7 @@ impl EventEmitter {
                 generation,
                 purge_on_invalidate,
                 connected_delivered: Arc::clone(&self.connected_delivered),
-                control_key: None,
-                pending_controls: Arc::clone(&self.pending_controls),
+                control_reservation: None,
                 _regular_permit: Some(permit),
                 _control_permit: None,
                 emergency_slot: None,
@@ -452,12 +477,16 @@ impl EventEmitter {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(live_channel_closed());
         }
-        if let Some(key) = control_key {
-            self.pending_controls
-                .lock()
-                .expect("control mutex poisoned")
-                .push(key);
-        }
+        let control_reservation = if let Some(key) = control_key {
+            let Some(reservation) =
+                PendingControlReservation::try_reserve(key, &self.pending_controls)
+            else {
+                return Ok(());
+            };
+            Some(reservation)
+        } else {
+            None
+        };
         let generation = event_generation(&event);
         let purge_on_invalidate = event_purges_with_generation(&event);
         self.sender
@@ -466,8 +495,7 @@ impl EventEmitter {
                 generation,
                 purge_on_invalidate,
                 connected_delivered: Arc::clone(&self.connected_delivered),
-                control_key,
-                pending_controls: Arc::clone(&self.pending_controls),
+                control_reservation,
                 _regular_permit: Some(permit),
                 _control_permit: control_permit,
                 emergency_slot: None,
@@ -503,8 +531,7 @@ impl EventEmitter {
                     generation: None,
                     purge_on_invalidate: false,
                     connected_delivered: Arc::clone(&self.connected_delivered),
-                    control_key: None,
-                    pending_controls: Arc::clone(&self.pending_controls),
+                    control_reservation: None,
                     _regular_permit: None,
                     _control_permit: None,
                     emergency_slot: Some(slot as u8),
@@ -551,8 +578,7 @@ impl EventEmitter {
             generation: None,
             purge_on_invalidate: false,
             connected_delivered: Arc::clone(&self.connected_delivered),
-            control_key: None,
-            pending_controls: Arc::clone(&self.pending_controls),
+            control_reservation: None,
             _regular_permit: None,
             _control_permit: None,
             emergency_slot: Some(0),

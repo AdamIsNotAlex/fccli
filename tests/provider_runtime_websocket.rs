@@ -1178,14 +1178,14 @@ async fn stalled_drain_flushes_automatic_close_reply_before_close_outcome_and_er
 }
 
 mod emitter_contracts {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use fccli::{
         error::ProviderError,
         model::{Candle, ConnectionStatus, GapGeneration, MarketEvent},
         provider::test_transport::EventEmitterTestFacade,
     };
-    use tokio::time::timeout;
+    use tokio::{sync::Barrier, time::timeout};
 
     const OPEN_TIME: i64 = 1_700_000_040_000;
 
@@ -1314,6 +1314,42 @@ mod emitter_contracts {
         assert!(
             facade.try_recv().is_none(),
             "coalesced duplicate must not occupy a second queue slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_control_status_is_atomically_coalesced() {
+        let mut facade = EventEmitterTestFacade::with_control_capacity(2, 2);
+        let sender = facade.clone_emitter();
+        let start = Arc::new(Barrier::new(3));
+        let event = MarketEvent::Status {
+            generation: Some(GapGeneration(1)),
+            status: ConnectionStatus::Connecting,
+        };
+
+        let mut sends = Vec::new();
+        for _ in 0..2 {
+            let sender = sender.clone();
+            let start = Arc::clone(&start);
+            let event = event.clone();
+            sends.push(tokio::spawn(async move {
+                start.wait().await;
+                sender.send(event).await
+            }));
+        }
+        start.wait().await;
+
+        for send in sends {
+            timeout(Duration::from_secs(1), send)
+                .await
+                .expect("same-key producer must complete")
+                .expect("same-key producer task")
+                .expect("same-key send");
+        }
+        assert_eq!(recv(&mut facade).await, event);
+        assert!(
+            facade.try_recv().is_none(),
+            "concurrent same-key producers must enqueue exactly one envelope"
         );
     }
 
