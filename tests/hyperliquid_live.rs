@@ -1,27 +1,23 @@
 #![cfg(feature = "test-transport")]
 
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use fccli::{
     clock::ManualClock,
-    error::{
-        ErrorContext, ErrorOperation, PayloadError, ProviderError, SanitizedCause, TimeoutKind,
-    },
+    error::{ErrorContext, ErrorOperation, ProviderError, TimeoutKind},
     model::{
         ConnectionStatus, Instrument, Market, MarketEvent, MonoInstant, ProviderId, Timeframe,
     },
     provider::{
         LiveRequest, MarketDataProvider, accepted_watermark_channel,
         hyperliquid::{
-            APPLICATION_HEARTBEAT_INTERVAL, DecodedFrame, HyperliquidProvider,
-            HyperliquidTestConfig, LiveSupervisorConfig, ReadinessArbitrationForTest, WsConfig,
-            arbitrate_queued_readiness_for_test, arbitrate_readiness_step_for_test,
-            connect_test_websocket,
+            APPLICATION_HEARTBEAT_INTERVAL, HeartbeatTestHook, HyperliquidProvider,
+            HyperliquidTestConfig, LiveSupervisorConfig, WsConfig, connect_test_websocket,
         },
         reconcile_ack_channel,
     },
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::json;
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -283,106 +279,168 @@ async fn subscribe_ack_expiry_is_recoverable_and_never_first_kline() {
     server.abort();
 }
 
-#[test]
-fn queued_readiness_inputs_follow_declared_precedence() {
-    let context = ErrorContext::operation(ErrorOperation::WebSocket)
-        .with_market(&instrument(), Timeframe::Minute1);
-    let malformed = DecodedFrame::ProviderError(ProviderError::Payload {
-        context: context.clone(),
-        source: PayloadError::MalformedProtocol,
-    });
-    let transport = ProviderError::Transport {
-        context: context.clone(),
-        cause: SanitizedCause::Closed,
-    };
-    let stalled = ProviderError::Timeout {
-        context,
-        kind: TimeoutKind::StalledWrite,
-    };
+fn malformed_subscribe_ack() -> String {
+    json!({
+        "channel": "subscriptionResponse",
+        "data": {
+            "method": "unsubscribe",
+            "subscription": {"type": "candle", "coin": "@142", "interval": "1m"}
+        }
+    })
+    .to_string()
+}
 
+async fn readiness_terminal_after_malformed_flood(close_cleanly: bool) -> MarketEvent {
+    let (listener, ws_uri) = websocket_listener().await;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut websocket = accept_async(stream).await.expect("upgrade");
+        let _ = websocket
+            .next()
+            .await
+            .expect("subscribe")
+            .expect("subscribe");
+        for _ in 0..80 {
+            websocket
+                .send(Message::Text(malformed_subscribe_ack().into()))
+                .await
+                .expect("malformed ack");
+        }
+        if close_cleanly {
+            websocket.close(None).await.expect("close");
+        }
+    });
+    let provider = provider(&ws_uri, clock(), LiveSupervisorConfig::default());
+    let cancellation = CancellationToken::new();
+    let mut feed = provider
+        .open_live(request(cancellation.clone()))
+        .await
+        .expect("feed");
+    let _ = next_event(&mut feed).await;
+    let event = next_event(&mut feed).await;
+    cancellation.cancel();
+    await_server(server).await;
+    event
+}
+
+#[tokio::test]
+async fn buffered_close_wins_after_more_than_readiness_retention_limit_malformed_acks() {
     assert!(matches!(
-        arbitrate_queued_readiness_for_test(
-            VecDeque::from([malformed.clone(), DecodedFrame::Close(None)]),
-            None,
-            None,
-        ),
-        Ok(DecodedFrame::Close(None))
+        readiness_terminal_after_malformed_flood(true).await,
+        MarketEvent::RecoverableError {
+            error: ProviderError::Protocol {
+                detail: "WebSocket peer requested reconnect",
+                ..
+            },
+            ..
+        }
     ));
-    assert_eq!(
-        arbitrate_queued_readiness_for_test(
-            VecDeque::from([malformed.clone()]),
-            Some(transport.clone()),
-            None,
-        ),
-        Err(transport)
-    );
-    assert_eq!(
-        arbitrate_queued_readiness_for_test(
-            VecDeque::from([malformed.clone()]),
-            None,
-            Some(stalled.clone()),
-        ),
-        Err(stalled)
-    );
-    assert_eq!(
-        arbitrate_queued_readiness_for_test(
-            VecDeque::from([DecodedFrame::SubscribeAccepted, malformed.clone()]),
-            None,
-            None,
-        ),
-        Ok(malformed)
-    );
-    assert_eq!(
-        arbitrate_queued_readiness_for_test(
-            VecDeque::from([DecodedFrame::Ignored, DecodedFrame::SubscribeAccepted]),
-            None,
-            None,
-        ),
-        Ok(DecodedFrame::SubscribeAccepted)
-    );
-    assert_eq!(
-        arbitrate_readiness_step_for_test(
-            false,
-            VecDeque::from([DecodedFrame::SubscribeAccepted]),
-            None,
-            None,
-            true,
-            true,
-        ),
-        ReadinessArbitrationForTest::Input(Ok(DecodedFrame::SubscribeAccepted))
-    );
-    assert_eq!(
-        arbitrate_readiness_step_for_test(
-            false,
-            VecDeque::new(),
-            None,
-            Some(ProviderError::Timeout {
-                context: ErrorContext::operation(ErrorOperation::WebSocket),
-                kind: TimeoutKind::StalledWrite,
-            }),
-            true,
-            true,
-        ),
-        ReadinessArbitrationForTest::Input(Err(ProviderError::Timeout {
-            context: ErrorContext::operation(ErrorOperation::WebSocket),
-            kind: TimeoutKind::StalledWrite,
-        }))
-    );
-    assert_eq!(
-        arbitrate_readiness_step_for_test(false, VecDeque::new(), None, None, true, true),
-        ReadinessArbitrationForTest::SubscribeAckDeadline
-    );
-    assert_eq!(
-        arbitrate_readiness_step_for_test(
-            true,
-            VecDeque::from([DecodedFrame::SubscribeAccepted]),
-            None,
-            None,
-            true,
-            true,
-        ),
-        ReadinessArbitrationForTest::Cancelled
-    );
+}
+
+#[tokio::test]
+async fn buffered_eof_or_read_error_wins_after_more_than_readiness_retention_limit_malformed_acks()
+{
+    assert!(matches!(
+        readiness_terminal_after_malformed_flood(false).await,
+        MarketEvent::RecoverableError {
+            error: ProviderError::Transport { .. } | ProviderError::Protocol { .. },
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn buffered_ack_wins_actual_readiness_loop_tie_with_ack_deadline() {
+    let (listener, ws_uri) = websocket_listener().await;
+    let (sent_tx, sent_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut websocket = accept_async(stream).await.expect("upgrade");
+        let _ = websocket
+            .next()
+            .await
+            .expect("subscribe")
+            .expect("subscribe");
+        websocket
+            .send(Message::Text(subscribe_ack().into()))
+            .await
+            .expect("ack");
+        sent_tx.send(()).expect("ack sent");
+        std::future::pending::<()>().await;
+    });
+    let manual = clock();
+    let live = LiveSupervisorConfig {
+        subscribe_ack_timeout: Duration::from_millis(1),
+        ..LiveSupervisorConfig::default()
+    };
+    let provider = provider(&ws_uri, Arc::clone(&manual), live);
+    let cancellation = CancellationToken::new();
+    let mut feed = provider
+        .open_live(request(cancellation.clone()))
+        .await
+        .expect("feed");
+    let _ = next_event(&mut feed).await;
+    await_signal(sent_rx, "ack buffered").await;
+    manual
+        .advance_by(Duration::from_millis(1))
+        .expect("advance to deadline");
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::Status {
+            status: ConnectionStatus::GapSync,
+            ..
+        }
+    ));
+    cancellation.cancel();
+    server.abort();
+}
+
+#[tokio::test]
+async fn ack_deadline_wins_actual_readiness_loop_tie_with_inactivity() {
+    let (listener, ws_uri) = websocket_listener().await;
+    let (subscribed_tx, subscribed_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut websocket = accept_async(stream).await.expect("upgrade");
+        let _ = websocket
+            .next()
+            .await
+            .expect("subscribe")
+            .expect("subscribe");
+        subscribed_tx.send(()).expect("subscribed");
+        std::future::pending::<()>().await;
+    });
+    let inactivity = Arc::new(tokio::sync::Notify::new());
+    let manual = clock();
+    let live = LiveSupervisorConfig {
+        subscribe_ack_timeout: Duration::from_millis(1),
+        readiness_inactivity_test_hook: Some(Arc::clone(&inactivity)),
+        ..LiveSupervisorConfig::default()
+    };
+    let provider = provider(&ws_uri, Arc::clone(&manual), live);
+    let cancellation = CancellationToken::new();
+    let mut feed = provider
+        .open_live(request(cancellation.clone()))
+        .await
+        .expect("feed");
+    let _ = next_event(&mut feed).await;
+    await_signal(subscribed_rx, "subscribe received").await;
+    inactivity.notify_one();
+    manual
+        .advance_by(Duration::from_millis(1))
+        .expect("advance to ack deadline");
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::RecoverableError {
+            error: ProviderError::Timeout {
+                kind: TimeoutKind::SubscribeAck,
+                ..
+            },
+            ..
+        }
+    ));
+    cancellation.cancel();
+    server.abort();
 }
 
 #[tokio::test]
@@ -487,6 +545,8 @@ async fn application_heartbeat_schedule_begins_only_after_ack() {
     let (listener, ws_uri) = websocket_listener().await;
     let (subscribed_tx, subscribed_rx) = oneshot::channel();
     let (ack_tx, ack_rx) = oneshot::channel();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let due = Arc::new(tokio::sync::Notify::new());
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept");
         let mut websocket = accept_async(stream).await.expect("upgrade");
@@ -496,36 +556,28 @@ async fn application_heartbeat_schedule_begins_only_after_ack() {
             .expect("subscribe")
             .expect("subscribe");
         subscribed_tx.send(()).ok();
-        assert!(
-            timeout(Duration::from_millis(30), websocket.next())
-                .await
-                .is_err()
-        );
         ack_rx.await.expect("release ack");
         websocket
             .send(Message::Text(subscribe_ack().into()))
             .await
             .expect("ack");
-        assert!(
-            timeout(Duration::from_millis(15), websocket.next())
-                .await
-                .is_err()
-        );
         assert_eq!(
-            timeout(Duration::from_millis(30), websocket.next())
+            websocket
+                .next()
                 .await
-                .expect("heartbeat timeout")
                 .expect("heartbeat stream")
                 .expect("heartbeat"),
             Message::Text(r#"{"method":"ping"}"#.into())
         );
     });
-    let manual = clock();
     let live = LiveSupervisorConfig {
-        application_heartbeat_interval_for_test: Duration::from_millis(20),
+        heartbeat_test_hook: Some(HeartbeatTestHook {
+            started: Arc::clone(&started),
+            due: Arc::clone(&due),
+        }),
         ..LiveSupervisorConfig::default()
     };
-    let provider = provider(&ws_uri, manual, live);
+    let provider = provider(&ws_uri, clock(), live);
     let cancellation = CancellationToken::new();
     let mut feed = provider
         .open_live(request(cancellation.clone()))
@@ -533,7 +585,10 @@ async fn application_heartbeat_schedule_begins_only_after_ack() {
         .expect("feed");
     let _ = next_event(&mut feed).await;
     await_signal(subscribed_rx, "subscribe received").await;
+    due.notify_one();
+    assert!(started.notified().now_or_never().is_none());
     ack_tx.send(()).expect("release ack");
+    started.notified().await;
     assert!(matches!(
         next_event(&mut feed).await,
         MarketEvent::Status {

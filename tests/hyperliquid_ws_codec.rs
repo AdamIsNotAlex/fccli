@@ -23,17 +23,25 @@ fn instrument() -> Instrument {
     .expect("instrument")
 }
 
-fn decode(codec: &mut HyperliquidWsCodec, value: Value) -> Vec<DecodedFrame> {
+fn decode_for(
+    codec: &mut HyperliquidWsCodec,
+    timeframe: Timeframe,
+    value: Value,
+) -> Vec<DecodedFrame> {
     let mut outcomes = VecDeque::new();
     decode_ws_frame(
         codec,
         Message::Text(value.to_string().into()),
         &instrument(),
-        Timeframe::Minute1,
+        timeframe,
         &WsConfig::production(),
         &mut outcomes,
     );
     outcomes.into_iter().collect()
+}
+
+fn decode(codec: &mut HyperliquidWsCodec, value: Value) -> Vec<DecodedFrame> {
+    decode_for(codec, Timeframe::Minute1, value)
 }
 
 fn candle(open_time: i64, close: &str) -> Value {
@@ -174,6 +182,64 @@ fn successor_finality_state_machine_is_exact() {
     assert_eq!(closed.authority(), FinalityAuthority::WsAuthoritativeClosed);
     assert_eq!(open.open_time(), 1_704_067_440_000);
     assert_eq!(open.authority(), FinalityAuthority::WsAuthoritativeOpen);
+}
+#[test]
+fn invalid_temporal_frames_do_not_finalize_or_poison_retained_state() {
+    const CURRENT: i64 = 1_704_067_200_000;
+    let mut codec = HyperliquidWsCodec::new();
+    let _ = decode(&mut codec, candle(CURRENT, "42075.75"));
+
+    for invalid in [
+        candle(CURRENT + 1, "42080.00"),
+        {
+            let mut value = candle(CURRENT + 60_000, "42080.00");
+            value["data"]["T"] = json!(CURRENT + 60_001);
+            value
+        },
+        candle(CURRENT + 30_000, "42080.00"),
+    ] {
+        assert!(matches!(
+            decode(&mut codec, invalid).as_slice(),
+            [DecodedFrame::ProviderError(ProviderError::Payload {
+                source: PayloadError::MalformedProtocol,
+                ..
+            })]
+        ));
+    }
+
+    let legitimate = decode(&mut codec, candle(CURRENT + 60_000, "42090.00"));
+    let [DecodedFrame::Candle(closed), DecodedFrame::Candle(open)] = legitimate.as_slice() else {
+        panic!("expected unpoisoned retained close then legitimate successor: {legitimate:?}");
+    };
+    assert_eq!(closed.open_time(), CURRENT);
+    assert_eq!(open.open_time(), CURRENT + 60_000);
+}
+
+#[test]
+fn monthly_temporal_grid_uses_calendar_boundaries() {
+    const JAN_2024: i64 = 1_704_067_200_000;
+    const FEB_2024: i64 = 1_706_745_600_000;
+    const MAR_2024: i64 = 1_709_251_200_000;
+    let monthly = |open_time: i64, next_open: i64| {
+        let mut value = candle(open_time, "42075.75");
+        value["data"]["T"] = json!(next_open - 1);
+        value["data"]["i"] = json!("1M");
+        value
+    };
+    let mut codec = HyperliquidWsCodec::new();
+    assert!(matches!(
+        decode_for(&mut codec, Timeframe::Month1, monthly(JAN_2024, FEB_2024)).as_slice(),
+        [DecodedFrame::Candle(_)]
+    ));
+    assert!(matches!(
+        decode_for(&mut codec, Timeframe::Month1, monthly(FEB_2024, MAR_2024)).as_slice(),
+        [DecodedFrame::Candle(_), DecodedFrame::Candle(_)]
+    ));
+    let forged_mid_month = monthly(FEB_2024 + 86_400_000, MAR_2024);
+    assert!(matches!(
+        decode_for(&mut codec, Timeframe::Month1, forged_mid_month).as_slice(),
+        [DecodedFrame::ProviderError(_)]
+    ));
 }
 
 #[test]

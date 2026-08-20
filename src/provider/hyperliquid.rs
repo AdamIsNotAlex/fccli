@@ -15,6 +15,7 @@ use futures_util::{FutureExt, Sink, Stream, stream};
 use reqwest::{Client, StatusCode, Url, header::RETRY_AFTER};
 use serde::Deserialize;
 use serde_json::Value;
+use time::{Date, Month, OffsetDateTime};
 use tokio::{
     net::TcpStream,
     sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc},
@@ -97,6 +98,10 @@ pub struct LiveSupervisorConfig {
     pub ws_config: WsConfig,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub stalled_write_probe_frames: usize,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    pub heartbeat_test_hook: Option<HeartbeatTestHook>,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    pub readiness_inactivity_test_hook: Option<Arc<Notify>>,
 }
 
 impl Default for LiveSupervisorConfig {
@@ -114,6 +119,10 @@ impl Default for LiveSupervisorConfig {
             ws_config: WsConfig::default(),
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             stalled_write_probe_frames: 0,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            heartbeat_test_hook: None,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            readiness_inactivity_test_hook: None,
         }
     }
 }
@@ -164,6 +173,12 @@ impl LiveSupervisorConfig {
         self.ws_config.validate()?;
         Ok(())
     }
+}
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+#[derive(Clone, Debug)]
+pub struct HeartbeatTestHook {
+    pub started: Arc<Notify>,
+    pub due: Arc<Notify>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -498,6 +513,10 @@ fn decode_candle_payload(
         outcomes.push_back(DecodedFrame::ProviderError(error));
         return;
     }
+    if let Err(error) = validate_candle_time_window(&kline, timeframe, context) {
+        outcomes.push_back(DecodedFrame::ProviderError(error));
+        return;
+    }
     let (open, high, low, close, volume) = match candle_ohlcv(&kline, context) {
         Ok(ohlcv) => ohlcv,
         Err(error) => {
@@ -552,8 +571,8 @@ fn decode_candle_payload(
     outcomes.push_back(DecodedFrame::Candle(closed));
     outcomes.push_back(DecodedFrame::Candle(candidate));
 }
-const MAX_RETAINED_DECODED_OUTCOMES: usize = 64;
-const MAX_DECODED_OUTCOMES_PER_FRAME: usize = 2;
+// Yield after this many continuously-ready frames so cancellation and deadline branches are polled.
+const READINESS_DRAIN_POLL_BUDGET: usize = 256;
 
 pub struct RawWebSocket {
     stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -573,6 +592,11 @@ pub struct RawWebSocket {
     stalled_write_error: Option<ProviderError>,
     next_application_ping: Option<tokio::time::Instant>,
     peer_close_outcome: Option<DecodedFrame>,
+    readiness_drain_yielded: bool,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    heartbeat_test_hook: Option<HeartbeatTestHook>,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    readiness_inactivity_test_hook: Option<Arc<Notify>>,
 }
 
 impl RawWebSocket {
@@ -583,11 +607,24 @@ impl RawWebSocket {
 
     pub fn start_application_heartbeat(&mut self, interval: Duration) {
         self.application_heartbeat_interval = interval;
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        if let Some(hook) = &self.heartbeat_test_hook {
+            hook.started.notify_one();
+            return;
+        }
         self.next_application_ping = tokio::time::Instant::now().checked_add(interval);
     }
 
     #[must_use]
     pub const fn application_heartbeat_started(&self) -> bool {
+        self.next_application_ping.is_some()
+    }
+
+    fn application_heartbeat_enabled(&self) -> bool {
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        if self.heartbeat_test_hook.is_some() {
+            return true;
+        }
         self.next_application_ping.is_some()
     }
 
@@ -602,7 +639,11 @@ impl RawWebSocket {
     async fn read_readiness(&mut self) -> ReadinessInput {
         let inactivity_deadline = self.last_data_message + self.config.message_inactivity_timeout;
         futures_util::future::poll_fn(|cx| {
-            let io = self.poll_io(cx, inactivity_deadline, false);
+            self.readiness_drain_yielded = false;
+            let io = self.poll_io(cx, inactivity_deadline, false, true);
+            if self.readiness_drain_yielded {
+                return Poll::Pending;
+            }
             if let Some(input) = take_prioritized_readiness(
                 &mut self.decoded,
                 self.pending_terminal_error.take(),
@@ -755,7 +796,13 @@ impl RawWebSocket {
         }
         let inactivity_deadline = self.last_data_message + self.config.message_inactivity_timeout;
         let heartbeat_deadline = self.next_application_ping;
+        let heartbeat_enabled = self.application_heartbeat_enabled();
         let write_stall_deadline = self.write_stall_deadline;
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        let heartbeat_test_due = self
+            .heartbeat_test_hook
+            .as_ref()
+            .map(|hook| Arc::clone(&hook.due));
         if write_stall_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             let error = ProviderError::Timeout {
                 context: self.context.clone(),
@@ -768,7 +815,7 @@ impl RawWebSocket {
         let stalled_write_context = self.context.clone();
         tokio::select! {
             biased;
-            result = futures_util::future::poll_fn(|cx| self.poll_io(cx, inactivity_deadline, writing)) => result,
+            result = futures_util::future::poll_fn(|cx| self.poll_io(cx, inactivity_deadline, writing, false)) => result,
             () = tokio::time::sleep_until(inactivity_deadline) => {
                 let error = ProviderError::Timeout {
                     context: inactivity_context,
@@ -783,7 +830,14 @@ impl RawWebSocket {
                 };
                 self.fail_write_and_drain(error)
             },
-            () = tokio::time::sleep_until(heartbeat_deadline.unwrap_or(inactivity_deadline)), if heartbeat_deadline.is_some() => {
+            () = async move {
+                #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+                if let Some(due) = heartbeat_test_due {
+                    due.notified().await;
+                    return;
+                }
+                tokio::time::sleep_until(heartbeat_deadline.unwrap_or(inactivity_deadline)).await;
+            }, if heartbeat_enabled => {
                 self.outbound.push_back(Message::Text(r#"{"method":"ping"}"#.into()));
                 self.next_application_ping = tokio::time::Instant::now().checked_add(self.application_heartbeat_interval);
                 self.ensure_write_stall_deadline();
@@ -797,6 +851,7 @@ impl RawWebSocket {
         cx: &mut Context<'_>,
         inactivity_deadline: tokio::time::Instant,
         writing: bool,
+        readiness: bool,
     ) -> Poll<Result<(), ProviderError>> {
         if self
             .write_stall_deadline
@@ -809,7 +864,16 @@ impl RawWebSocket {
             return Poll::Ready(self.fail_write_and_drain(error));
         }
         let mut made_progress = false;
-        while self.decoded.len() <= MAX_RETAINED_DECODED_OUTCOMES - MAX_DECODED_OUTCOMES_PER_FRAME {
+        let mut readiness_frames = 0;
+        loop {
+            if readiness && readiness_frames == READINESS_DRAIN_POLL_BUDGET {
+                self.readiness_drain_yielded = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if !readiness && self.decoded.len() > 62 {
+                break;
+            }
             match Stream::poll_next(Pin::new(&mut self.stream), cx) {
                 Poll::Ready(Some(Ok(message))) => {
                     let is_data = matches!(message, Message::Text(_) | Message::Binary(_));
@@ -843,6 +907,10 @@ impl RawWebSocket {
                         self.peer_close_outcome = self.decoded.remove(close_index);
                     }
                     made_progress = true;
+                    if readiness {
+                        coalesce_readiness_outcomes(&mut self.decoded);
+                        readiness_frames += 1;
+                    }
                 }
                 Poll::Ready(Some(Err(error))) => {
                     let error = map_websocket_error(error, &self.context);
@@ -975,11 +1043,39 @@ async fn connect_websocket_url(
         last_data_message: tokio::time::Instant::now(),
         terminal_io: false,
         application_heartbeat_interval: APPLICATION_HEARTBEAT_INTERVAL,
+        readiness_drain_yielded: false,
         pending_terminal_error: None,
         stalled_write_error: None,
         next_application_ping: None,
         peer_close_outcome: None,
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        heartbeat_test_hook: None,
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        readiness_inactivity_test_hook: None,
     })
+}
+fn coalesce_readiness_outcomes(decoded: &mut VecDeque<DecodedFrame>) {
+    let mut best: Option<DecodedFrame> = None;
+    while let Some(frame) = decoded.pop_front() {
+        if best
+            .as_ref()
+            .is_none_or(|retained| readiness_priority(&frame) < readiness_priority(retained))
+        {
+            best = Some(frame);
+        }
+    }
+    if let Some(frame) = best {
+        decoded.push_back(frame);
+    }
+}
+
+fn readiness_priority(frame: &DecodedFrame) -> u8 {
+    match frame {
+        DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => 0,
+        DecodedFrame::ProviderError(_) | DecodedFrame::Candle(_) => 1,
+        DecodedFrame::SubscribeAccepted => 2,
+        DecodedFrame::Ignored | DecodedFrame::ApplicationPong => 3,
+    }
 }
 
 pub async fn read_raw_websocket(socket: &mut RawWebSocket) -> Result<DecodedFrame, ProviderError> {
@@ -1066,6 +1162,16 @@ fn take_prioritized_readiness(
     terminal_error: Option<ProviderError>,
     stalled_write_error: Option<ProviderError>,
 ) -> Option<ReadinessInput> {
+    if let Some(index) = decoded
+        .iter()
+        .position(|frame| matches!(frame, DecodedFrame::Close(_) | DecodedFrame::ServerShutdown))
+    {
+        return Some(ReadinessInput::Frame(
+            decoded
+                .remove(index)
+                .expect("readiness terminal frame index"),
+        ));
+    }
     if let Some(error) = stalled_write_error.or(terminal_error) {
         return Some(ReadinessInput::Error(error));
     }
@@ -1082,58 +1188,6 @@ fn take_prioritized_readiness(
     Some(ReadinessInput::Frame(
         decoded.remove(index).expect("readiness frame index"),
     ))
-}
-
-#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-pub fn arbitrate_queued_readiness_for_test(
-    mut decoded: VecDeque<DecodedFrame>,
-    terminal_error: Option<ProviderError>,
-    stalled_write_error: Option<ProviderError>,
-) -> Result<DecodedFrame, ProviderError> {
-    match take_prioritized_readiness(&mut decoded, terminal_error, stalled_write_error)
-        .expect("queued readiness input")
-    {
-        ReadinessInput::Frame(frame) => Ok(frame),
-        ReadinessInput::Error(error) => Err(error),
-    }
-}
-
-#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-#[derive(Clone, Debug, PartialEq)]
-pub enum ReadinessArbitrationForTest {
-    Cancelled,
-    Input(Result<DecodedFrame, ProviderError>),
-    SubscribeAckDeadline,
-    WebSocketInactivity,
-    Pending,
-}
-
-#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-pub fn arbitrate_readiness_step_for_test(
-    cancelled: bool,
-    decoded: VecDeque<DecodedFrame>,
-    terminal_error: Option<ProviderError>,
-    stalled_write_error: Option<ProviderError>,
-    subscribe_ack_deadline_ready: bool,
-    inactivity_ready: bool,
-) -> ReadinessArbitrationForTest {
-    if cancelled {
-        return ReadinessArbitrationForTest::Cancelled;
-    }
-    if !decoded.is_empty() || terminal_error.is_some() || stalled_write_error.is_some() {
-        return ReadinessArbitrationForTest::Input(arbitrate_queued_readiness_for_test(
-            decoded,
-            terminal_error,
-            stalled_write_error,
-        ));
-    }
-    if subscribe_ack_deadline_ready {
-        ReadinessArbitrationForTest::SubscribeAckDeadline
-    } else if inactivity_ready {
-        ReadinessArbitrationForTest::WebSocketInactivity
-    } else {
-        ReadinessArbitrationForTest::Pending
-    }
 }
 
 enum ReadinessInput {
@@ -1693,8 +1747,15 @@ impl HyperliquidProvider {
         }
         let ack_deadline = checked_deadline(self.clock.now(), self.live.subscribe_ack_timeout)
             .map_err(|_| ProviderError::Invariant("subscribe-ack deadline overflow"))?;
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        {
+            socket.readiness_inactivity_test_hook =
+                self.live.readiness_inactivity_test_hook.clone();
+        }
         loop {
             let inactivity_deadline = socket.inactivity_deadline();
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            let readiness_inactivity_test_hook = socket.readiness_inactivity_test_hook.clone();
             tokio::select! {
                 biased;
                 () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
@@ -1713,7 +1774,14 @@ impl HyperliquidProvider {
                 () = self.clock.sleep_until(ack_deadline) => {
                     return Ok(GenerationOutcome::Reconnect(Self::subscribe_ack_timeout(request)));
                 },
-                () = tokio::time::sleep_until(inactivity_deadline) => {
+                () = async move {
+                    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+                    if let Some(hook) = readiness_inactivity_test_hook {
+                        hook.notified().await;
+                        return;
+                    }
+                    tokio::time::sleep_until(inactivity_deadline).await;
+                } => {
                     return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout {
                         context: ErrorContext::operation(ErrorOperation::WebSocket)
                             .with_market(&request.instrument, request.timeframe),
@@ -1721,6 +1789,10 @@ impl HyperliquidProvider {
                     }));
                 }
             }
+        }
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        {
+            socket.heartbeat_test_hook = self.live.heartbeat_test_hook.clone();
         }
         #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
         socket.start_application_heartbeat(APPLICATION_HEARTBEAT_INTERVAL);
@@ -1740,31 +1812,31 @@ impl HyperliquidProvider {
             .map_err(|_| ProviderError::Invariant("first-kline deadline overflow"))?;
         let first = loop {
             tokio::select! {
-                biased;
-                () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
-                changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
-                ack = request.reconcile_ack_rx.changed() => { ack.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
-                changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::InvalidBanExpiry); },
-                frame = socket.read() => match frame? {
-                    DecodedFrame::Candle(candle) => break candle,
-                    DecodedFrame::Ignored | DecodedFrame::ApplicationPong => {
-                        let now = self.clock.now();
-                        if now >= first_deadline {
-                            return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), kind: TimeoutKind::FirstKline }));
+                    biased;
+                    () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
+                    changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
+                    ack = request.reconcile_ack_rx.changed() => { ack.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
+                    changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::InvalidBanExpiry); },
+                    frame = socket.read() => match frame? {
+                        DecodedFrame::Candle(candle) => break candle,
+                        DecodedFrame::Ignored | DecodedFrame::ApplicationPong => {
+                            let now = self.clock.now();
+                            if now >= first_deadline {
+                                return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), kind: TimeoutKind::FirstKline }));
+                            }
+                            if now >= age_deadline {
+                                return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached")));
+                            }
                         }
-                        if now >= age_deadline {
-                            return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached")));
-                        }
+                        DecodedFrame::SubscribeAccepted => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))),
+                        DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => return Ok(GenerationOutcome::Reconnect(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" })),
+                        DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
+                        DecodedFrame::ProviderError(error) => return Ok(GenerationOutcome::Reconnect(error)),
+                    },
+                    () = self.clock.sleep_until(age_deadline) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached"))),
+                    () = self.clock.sleep_until(first_deadline) => {
+                        return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), kind: TimeoutKind::FirstKline }));
                     }
-                    DecodedFrame::SubscribeAccepted => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))),
-                    DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => return Ok(GenerationOutcome::Reconnect(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" })),
-                    DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
-                    DecodedFrame::ProviderError(error) => return Ok(GenerationOutcome::Reconnect(error)),
-                },
-                () = self.clock.sleep_until(age_deadline) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached"))),
-                () = self.clock.sleep_until(first_deadline) => {
-                    return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), kind: TimeoutKind::FirstKline }));
-                }
             }
         };
         let confirmed = request
@@ -3136,6 +3208,62 @@ fn decode_candles(
         }
     }
     Ok(candles)
+}
+
+fn validate_candle_time_window(
+    candle: &HlCandle,
+    timeframe: Timeframe,
+    context: &ErrorContext,
+) -> Result<(), ProviderError> {
+    let expected_close = timeframe_successor_open(timeframe, candle.open_time)
+        .and_then(|successor| successor.checked_sub(1));
+    if expected_close != Some(candle.close_time) {
+        return Err(payload(context, PayloadError::MalformedProtocol));
+    }
+    Ok(())
+}
+
+fn timeframe_successor_open(timeframe: Timeframe, open_time: i64) -> Option<i64> {
+    let fixed_milliseconds = match timeframe {
+        Timeframe::Second1 => Some(1_000),
+        Timeframe::Minute1 => Some(60_000),
+        Timeframe::Minute3 => Some(180_000),
+        Timeframe::Minute5 => Some(300_000),
+        Timeframe::Minute15 => Some(900_000),
+        Timeframe::Minute30 => Some(1_800_000),
+        Timeframe::Hour1 => Some(3_600_000),
+        Timeframe::Hour2 => Some(7_200_000),
+        Timeframe::Hour4 => Some(14_400_000),
+        Timeframe::Hour6 => Some(21_600_000),
+        Timeframe::Hour8 => Some(28_800_000),
+        Timeframe::Hour12 => Some(43_200_000),
+        Timeframe::Day1 => Some(86_400_000),
+        Timeframe::Day3 => Some(259_200_000),
+        Timeframe::Week1 => Some(604_800_000),
+        Timeframe::Month1 => None,
+    };
+    if let Some(milliseconds) = fixed_milliseconds {
+        if open_time.rem_euclid(milliseconds) != 0 {
+            return None;
+        }
+        return open_time.checked_add(milliseconds);
+    }
+    let timestamp =
+        OffsetDateTime::from_unix_timestamp_nanos(i128::from(open_time) * 1_000_000).ok()?;
+    if timestamp.time() != time::Time::MIDNIGHT || timestamp.day() != 1 {
+        return None;
+    }
+    let (year, month) = match timestamp.month() {
+        Month::December => (timestamp.year().checked_add(1)?, Month::January),
+        month => (timestamp.year(), month.next()),
+    };
+    let successor = Date::from_calendar_date(year, month, 1)
+        .ok()?
+        .midnight()
+        .assume_utc()
+        .unix_timestamp_nanos()
+        / 1_000_000;
+    i64::try_from(successor).ok()
 }
 
 fn candle_market_matches(
