@@ -555,8 +555,114 @@ async fn shared_runtime_reconciles_while_ws_runs_and_acknowledgement_gates_conne
     cancellation.cancel();
 }
 
+async fn assert_no_ready_event(feed: &mut LiveFeed) {
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert!(feed.events.next().now_or_never().is_none());
+}
+
+async fn assert_terminal_channel_closure(feed: &mut LiveFeed) {
+    assert!(matches!(
+        event(feed).await,
+        MarketEvent::TerminalError(ProviderError::ChannelClosed { .. })
+    ));
+    assert!(
+        timeout(Duration::from_secs(2), feed.events.next())
+            .await
+            .expect("bounded terminal stream closure")
+            .is_none()
+    );
+    assert!(matches!(
+        timeout(Duration::from_secs(2), feed.producer_completion.changed())
+            .await
+            .expect("bounded terminal completion")
+            .expect("completion"),
+        ProducerCompletion::Finished(Err(ProviderError::ChannelClosed { .. }))
+    ));
+}
+
+async fn establish_connected(
+    harness: &mut Harness,
+    feed: &mut LiveFeed,
+    ack: &fccli::provider::ReconcileAckSender,
+) -> GapGeneration {
+    harness.socket_senders[0]
+        .send(Ok(LiveSocketEvent::Candle(candle(OPEN, true))))
+        .expect("first candle");
+    harness
+        .history_started
+        .remove(0)
+        .await
+        .expect("history started");
+    harness
+        .history_responses
+        .remove(0)
+        .send(Ok(vec![rest_candle(OPEN)]))
+        .expect("history response");
+    let (generation, revision, target, _) = reconcile_batch(feed).await;
+    ack.publish(ReconcileAck {
+        generation,
+        revision,
+        through: target,
+    })
+    .expect("matching acknowledgement");
+    assert_eq!(
+        event(feed).await,
+        MarketEvent::Status {
+            generation: Some(generation),
+            status: ConnectionStatus::Connected,
+        }
+    );
+    generation
+}
+
 #[tokio::test]
-async fn stale_ack_is_ignored_and_accepted_watermark_grows_revision_and_suffix() {
+async fn stale_and_insufficient_acknowledgements_reach_runtime_but_only_current_ack_connects() {
+    let mut harness = Harness::new(1, 1, LiveSupervisorConfig::default());
+    let (mut feed, _watermark, ack, cancellation) = harness.open(Some(OPEN)).await;
+    harness.socket_senders[0]
+        .send(Ok(LiveSocketEvent::Candle(candle(OPEN, true))))
+        .expect("first");
+    harness.history_started.remove(0).await.expect("history");
+    harness
+        .history_responses
+        .remove(0)
+        .send(Ok(vec![rest_candle(OPEN)]))
+        .expect("page");
+    let (generation, revision, target, _) = reconcile_batch(&mut feed).await;
+
+    ack.inject_unchecked_for_test(ReconcileAck {
+        generation,
+        revision: ReplayRevision(revision.0.saturating_sub(1)),
+        through: target,
+    })
+    .expect("inject stale acknowledgement");
+    assert_no_ready_event(&mut feed).await;
+    ack.inject_unchecked_for_test(ReconcileAck {
+        generation,
+        revision,
+        through: target - 1,
+    })
+    .expect("inject insufficient acknowledgement");
+    assert_no_ready_event(&mut feed).await;
+    ack.inject_unchecked_for_test(ReconcileAck {
+        generation,
+        revision,
+        through: target,
+    })
+    .expect("inject matching acknowledgement");
+    assert_eq!(
+        event(&mut feed).await,
+        MarketEvent::Status {
+            generation: Some(generation),
+            status: ConnectionStatus::Connected,
+        }
+    );
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn accepted_watermark_growth_requests_only_the_new_suffix_and_new_revision() {
     let mut harness = Harness::new(1, 2, LiveSupervisorConfig::default());
     let (mut feed, watermark, ack, cancellation) = harness.open(Some(OPEN)).await;
     harness.socket_senders[0]
@@ -573,12 +679,6 @@ async fn stale_ack_is_ignored_and_accepted_watermark_grows_revision_and_suffix()
         .send(Ok(vec![rest_candle(OPEN)]))
         .expect("first page");
     let (generation, revision, target, _) = reconcile_batch(&mut feed).await;
-    ack.publish(ReconcileAck {
-        generation,
-        revision: ReplayRevision(revision.0.saturating_sub(1)),
-        through: target,
-    })
-    .expect_err("stale ack rejected by control channel");
     watermark
         .publish(Some(OPEN + 60_000))
         .expect("advance watermark");
@@ -595,22 +695,18 @@ async fn stale_ack_is_ignored_and_accepted_watermark_grows_revision_and_suffix()
         .history_responses
         .remove(0)
         .send(Ok(vec![rest_candle(OPEN + 60_000)]))
-        .expect("suffix response");
+        .expect("suffix page");
     let (_, next_revision, next_target, _) = reconcile_batch(&mut feed).await;
     assert!(next_revision > revision);
-    assert_eq!(next_target, OPEN + 60_000);
+    assert!(next_target > target);
     ack.publish(ReconcileAck {
         generation,
         revision: next_revision,
         through: next_target,
     })
     .expect("latest ack");
-    assert_eq!(
-        event(&mut feed).await,
-        MarketEvent::Status {
-            generation: Some(generation),
-            status: ConnectionStatus::Connected
-        }
+    assert!(
+        matches!(event(&mut feed).await, MarketEvent::Status { generation: Some(actual), status: ConnectionStatus::Connected } if actual == generation)
     );
     cancellation.cancel();
 }
@@ -682,72 +778,294 @@ async fn cancellation_precedes_ready_history_and_first_candle_timeout_uses_manua
 }
 
 #[tokio::test]
-async fn recoverable_generations_back_off_exponentially_purge_stale_events_and_honor_rate_gate() {
-    let harness = Harness::new(4, 0, LiveSupervisorConfig::default());
+async fn acknowledgement_timeout_fires_at_exact_boundary_purges_backs_off_and_retries() {
+    let mut supervisor = LiveSupervisorConfig::default();
+    supervisor.reconcile_ack_timeout = Duration::from_secs(5);
+    let mut harness = Harness::new(2, 1, supervisor);
+    let (mut feed, _watermark, _ack, cancellation) = harness.open(Some(OPEN)).await;
+    harness.socket_senders[0]
+        .send(Ok(LiveSocketEvent::Candle(candle(OPEN, true))))
+        .expect("first");
+    harness.history_started.remove(0).await.expect("history");
+    harness
+        .history_responses
+        .remove(0)
+        .send(Ok(vec![rest_candle(OPEN)]))
+        .expect("page");
+    let (generation, revision, target, _) = reconcile_batch(&mut feed).await;
+    harness
+        .clock
+        .advance_to(MonoInstant::from_nanos(4_999_999_999))
+        .expect("before ack deadline");
+    assert_no_ready_event(&mut feed).await;
+    harness
+        .clock
+        .advance_to(MonoInstant::from_nanos(5_000_000_000))
+        .expect("ack deadline");
+    assert_eq!(
+        event(&mut feed).await,
+        MarketEvent::RecoverableError {
+            generation: Some(generation),
+            error: ProviderError::ReconcileAckTimeout {
+                generation,
+                revision,
+                target_open_time: target,
+            },
+            rate_gate_deadline: None,
+        }
+    );
+    assert_eq!(
+        event(&mut feed).await,
+        MarketEvent::Status {
+            generation: Some(generation),
+            status: ConnectionStatus::Backoff,
+        }
+    );
+    harness
+        .clock
+        .advance_by(Duration::from_millis(999))
+        .expect("before retry");
+    assert_no_ready_event(&mut feed).await;
+    harness
+        .clock
+        .advance_by(Duration::from_millis(1))
+        .expect("retry");
+    assert_eq!(
+        event(&mut feed).await,
+        MarketEvent::Status {
+            generation: Some(GapGeneration(2)),
+            status: ConnectionStatus::Connecting,
+        }
+    );
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn closed_control_channels_are_terminal_in_reconciliation_and_connected_states() {
+    for close_ack in [false, true] {
+        let mut harness = Harness::new(1, 1, LiveSupervisorConfig::default());
+        let (mut feed, watermark, ack, _cancellation) = harness.open(Some(OPEN)).await;
+        assert_eq!(
+            event(&mut feed).await,
+            MarketEvent::Status {
+                generation: Some(GapGeneration(1)),
+                status: ConnectionStatus::Connecting,
+            }
+        );
+        assert_eq!(
+            event(&mut feed).await,
+            MarketEvent::Status {
+                generation: Some(GapGeneration(1)),
+                status: ConnectionStatus::GapSync,
+            }
+        );
+        harness.socket_senders[0]
+            .send(Ok(LiveSocketEvent::Candle(candle(OPEN, true))))
+            .expect("first");
+        timeout(Duration::from_secs(2), harness.history_started.remove(0))
+            .await
+            .expect("bounded history start")
+            .expect("history pending");
+        if close_ack {
+            drop(ack);
+        } else {
+            drop(watermark);
+        }
+        assert_terminal_channel_closure(&mut feed).await;
+    }
+
+    for close_ack in [false, true] {
+        let mut harness = Harness::new(1, 1, LiveSupervisorConfig::default());
+        let (mut feed, watermark, ack, _cancellation) = harness.open(Some(OPEN)).await;
+        establish_connected(&mut harness, &mut feed, &ack).await;
+        if close_ack {
+            drop(ack);
+        } else {
+            drop(watermark);
+        }
+        assert_terminal_channel_closure(&mut feed).await;
+    }
+}
+
+#[tokio::test]
+async fn capped_exponential_backoff_sequence_is_exact_and_never_early() {
+    let harness = Harness::new(8, 0, LiveSupervisorConfig::default());
     let (mut feed, _watermark, _ack, cancellation) = harness.open(None).await;
-    for (index, seconds) in [1_u64, 2, 4].into_iter().enumerate() {
+    for (index, seconds) in [1_u64, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {
         let generation = GapGeneration(u64::try_from(index + 1).expect("generation"));
+        while !matches!(
+            event(&mut feed).await,
+            MarketEvent::Status { generation: Some(actual), status: ConnectionStatus::GapSync } if actual == generation
+        ) {}
         harness.socket_senders[index]
             .send(Ok(LiveSocketEvent::ReconnectRequested))
             .expect("reconnect");
-        loop {
-            match event(&mut feed).await {
-                MarketEvent::RecoverableError {
-                    generation: Some(actual),
-                    ..
-                } => assert_eq!(actual, generation),
-                MarketEvent::Status {
-                    generation: Some(actual),
-                    status: ConnectionStatus::Backoff,
-                } => {
-                    assert_eq!(actual, generation);
-                    break;
-                }
-                MarketEvent::ReconcileBatch {
-                    generation: actual, ..
-                }
-                | MarketEvent::Candle {
-                    generation: actual, ..
-                } => panic!("stale generation event escaped purge: {actual:?}"),
-                _ => {}
-            }
-        }
-        if index == 1 {
-            harness
-                .gate_sender
-                .publish(RateGateState::TimedUntil(MonoInstant::from_nanos(
-                    10_000_000_000,
-                )))
-                .expect("rate gate");
-            harness
-                .clock
-                .advance_to(MonoInstant::from_nanos(7_000_000_000))
-                .expect("before gate");
-        } else {
-            harness
-                .clock
-                .advance_by(Duration::from_secs(seconds))
-                .expect("backoff");
-        }
-        if index == 1 {
-            harness
-                .clock
-                .advance_to(MonoInstant::from_nanos(10_000_000_000))
-                .expect("gate deadline");
-            harness
-                .gate_sender
-                .publish(RateGateState::Open)
-                .expect("open gate observation");
-        }
         assert!(
-            matches!(event(&mut feed).await, MarketEvent::Status { generation: Some(next), status: ConnectionStatus::Connecting } if next.0 == generation.0 + 1)
+            matches!(event(&mut feed).await, MarketEvent::RecoverableError { generation: Some(actual), .. } if actual == generation)
         );
+        assert_eq!(
+            event(&mut feed).await,
+            MarketEvent::Status {
+                generation: Some(generation),
+                status: ConnectionStatus::Backoff
+            }
+        );
+        harness
+            .clock
+            .advance_by(Duration::from_secs(seconds) - Duration::from_nanos(1))
+            .expect("before deadline");
+        assert_no_ready_event(&mut feed).await;
+        harness
+            .clock
+            .advance_by(Duration::from_nanos(1))
+            .expect("deadline");
+        assert!(matches!(
+            event(&mut feed).await,
+            MarketEvent::Status {
+                generation: Some(next),
+                status: ConnectionStatus::Connecting,
+            } if next.0 == generation.0 + 1
+        ));
     }
     cancellation.cancel();
 }
 
 #[tokio::test]
-async fn saturation_emits_unscoped_emergency_pair_before_retry() {
+async fn retry_deadline_is_maximum_of_rate_gate_and_backoff_in_both_directions() {
+    let harness = Harness::new(3, 0, LiveSupervisorConfig::default());
+    let (mut feed, _watermark, _ack, cancellation) = harness.open(None).await;
+    while !matches!(
+        event(&mut feed).await,
+        MarketEvent::Status {
+            generation: Some(GapGeneration(1)),
+            status: ConnectionStatus::GapSync
+        }
+    ) {}
+    harness
+        .gate_sender
+        .publish(RateGateState::TimedUntil(MonoInstant::from_nanos(
+            10_000_000_000,
+        )))
+        .expect("long gate");
+    harness.socket_senders[0]
+        .send(Ok(LiveSocketEvent::ReconnectRequested))
+        .expect("reconnect");
+    assert!(matches!(
+        event(&mut feed).await,
+        MarketEvent::RecoverableError { .. }
+    ));
+    assert!(matches!(
+        event(&mut feed).await,
+        MarketEvent::Status {
+            status: ConnectionStatus::Backoff,
+            ..
+        }
+    ));
+    harness
+        .clock
+        .advance_to(MonoInstant::from_nanos(9_999_999_999))
+        .expect("before gate");
+    assert_no_ready_event(&mut feed).await;
+    harness
+        .clock
+        .advance_to(MonoInstant::from_nanos(10_000_000_000))
+        .expect("gate");
+    assert!(matches!(
+        event(&mut feed).await,
+        MarketEvent::Status {
+            generation: Some(GapGeneration(2)),
+            status: ConnectionStatus::Connecting
+        }
+    ));
+    while !matches!(
+        event(&mut feed).await,
+        MarketEvent::Status {
+            generation: Some(GapGeneration(2)),
+            status: ConnectionStatus::GapSync
+        }
+    ) {}
+
+    harness
+        .gate_sender
+        .publish(RateGateState::TimedUntil(MonoInstant::from_nanos(
+            11_000_000_000,
+        )))
+        .expect("short gate");
+    harness.socket_senders[1]
+        .send(Ok(LiveSocketEvent::ReconnectRequested))
+        .expect("reconnect");
+    assert!(matches!(
+        event(&mut feed).await,
+        MarketEvent::RecoverableError { .. }
+    ));
+    assert!(matches!(
+        event(&mut feed).await,
+        MarketEvent::Status {
+            status: ConnectionStatus::Backoff,
+            ..
+        }
+    ));
+    harness
+        .clock
+        .advance_to(MonoInstant::from_nanos(11_999_999_999))
+        .expect("before backoff");
+    assert_no_ready_event(&mut feed).await;
+    harness
+        .clock
+        .advance_to(MonoInstant::from_nanos(12_000_000_000))
+        .expect("backoff");
+    assert!(matches!(
+        event(&mut feed).await,
+        MarketEvent::Status {
+            generation: Some(GapGeneration(3)),
+            status: ConnectionStatus::Connecting
+        }
+    ));
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn reconnect_invalidates_an_actually_queued_generation_event() {
+    let invalidated = Arc::new(tokio::sync::Notify::new());
+    let mut supervisor = LiveSupervisorConfig::default();
+    supervisor.generation_invalidated_test_hook = Some(Arc::clone(&invalidated));
+    let mut harness = Harness::new(2, 1, supervisor);
+    let (mut feed, _watermark, ack, cancellation) = harness.open(Some(OPEN)).await;
+    let generation = establish_connected(&mut harness, &mut feed, &ack).await;
+    harness.socket_senders[0]
+        .send(Ok(LiveSocketEvent::Candle(candle(OPEN + 60_000, true))))
+        .expect("queued candle");
+    tokio::task::yield_now().await;
+    harness.socket_senders[0]
+        .send(Ok(LiveSocketEvent::ReconnectRequested))
+        .expect("reconnect");
+    invalidated.notified().await;
+    assert!(
+        matches!(event(&mut feed).await, MarketEvent::RecoverableError { generation: Some(actual), .. } if actual == generation)
+    );
+    assert_eq!(
+        event(&mut feed).await,
+        MarketEvent::Status {
+            generation: Some(generation),
+            status: ConnectionStatus::Backoff
+        }
+    );
+    harness
+        .clock
+        .advance_by(Duration::from_secs(1))
+        .expect("retry");
+    assert!(matches!(
+        event(&mut feed).await,
+        MarketEvent::Status {
+            generation: Some(GapGeneration(2)),
+            status: ConnectionStatus::Connecting
+        }
+    ));
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn saturation_emergency_barrier_blocks_retry_until_both_envelopes_are_dequeued() {
     let mut supervisor = LiveSupervisorConfig::default();
     supervisor.keyed_candle_capacity = 1;
     supervisor.market_event_capacity = 1;
@@ -755,23 +1073,23 @@ async fn saturation_emits_unscoped_emergency_pair_before_retry() {
     supervisor.saturation_test_hook = Some(Arc::clone(&saturation));
     let mut harness = Harness::new(2, 1, supervisor);
     let (mut feed, _watermark, ack, cancellation) = harness.open(Some(OPEN)).await;
-    assert!(matches!(
+    assert_eq!(
         event(&mut feed).await,
         MarketEvent::Status {
             generation: Some(GapGeneration(1)),
             status: ConnectionStatus::Connecting,
         }
-    ));
-    assert!(matches!(
+    );
+    assert_eq!(
         event(&mut feed).await,
         MarketEvent::Status {
             generation: Some(GapGeneration(1)),
             status: ConnectionStatus::GapSync,
         }
-    ));
+    );
     harness.socket_senders[0]
         .send(Ok(LiveSocketEvent::Candle(candle(OPEN, true))))
-        .expect("first");
+        .expect("first candle");
     timeout(Duration::from_secs(2), harness.history_started.remove(0))
         .await
         .expect("bounded history start")
@@ -787,14 +1105,14 @@ async fn saturation_emits_unscoped_emergency_pair_before_retry() {
         revision,
         through: target,
     })
-    .expect("ack");
-    assert!(matches!(
+    .expect("matching acknowledgement");
+    assert_eq!(
         event(&mut feed).await,
         MarketEvent::Status {
+            generation: Some(generation),
             status: ConnectionStatus::Connected,
-            ..
         }
-    ));
+    );
     for offset in [60_000, 120_000, 180_000] {
         harness.socket_senders[0]
             .send(Ok(LiveSocketEvent::Candle(candle(OPEN + offset, true))))
@@ -802,7 +1120,7 @@ async fn saturation_emits_unscoped_emergency_pair_before_retry() {
     }
     timeout(Duration::from_secs(2), saturation.notified())
         .await
-        .expect("saturation hook");
+        .expect("bounded saturation transition");
     assert!(matches!(
         event(&mut feed).await,
         MarketEvent::RecoverableError {
@@ -811,6 +1129,15 @@ async fn saturation_emits_unscoped_emergency_pair_before_retry() {
             ..
         }
     ));
+    harness
+        .clock
+        .advance_by(Duration::from_secs(1))
+        .expect("retry deadline");
+    assert_eq!(
+        feed.producer_completion.current().expect("completion"),
+        ProducerCompletion::Running
+    );
+    assert_eq!(harness.adapter.sockets.lock().expect("sockets").len(), 1);
     assert_eq!(
         event(&mut feed).await,
         MarketEvent::Status {
@@ -818,10 +1145,6 @@ async fn saturation_emits_unscoped_emergency_pair_before_retry() {
             status: ConnectionStatus::Backoff
         }
     );
-    harness
-        .clock
-        .advance_by(Duration::from_secs(1))
-        .expect("backoff");
     assert!(matches!(
         event(&mut feed).await,
         MarketEvent::Status {

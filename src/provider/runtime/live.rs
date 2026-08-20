@@ -48,6 +48,8 @@ pub struct LiveSupervisorConfig {
     pub stalled_write_probe_frames: usize,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub saturation_test_hook: Option<Arc<Notify>>,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    pub generation_invalidated_test_hook: Option<Arc<Notify>>,
 }
 
 impl Default for LiveSupervisorConfig {
@@ -63,6 +65,8 @@ impl Default for LiveSupervisorConfig {
             stalled_write_probe_frames: 0,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             saturation_test_hook: None,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            generation_invalidated_test_hook: None,
         }
     }
 }
@@ -814,6 +818,10 @@ impl<A: LiveAdapter> LiveEngine<A> {
             drop(socket);
             if !matches!(&outcome, Ok(GenerationOutcome::Cancelled)) {
                 sender.invalidate_generation(generation);
+                #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+                if let Some(hook) = &self.config.generation_invalidated_test_hook {
+                    hook.notify_one();
+                }
             }
             match outcome {
                 Ok(GenerationOutcome::Cancelled) => {

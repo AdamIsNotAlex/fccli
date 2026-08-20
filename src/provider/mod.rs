@@ -322,6 +322,22 @@ impl ReconcileAckSender {
         self.0.notify.notify_waiters();
         Ok(ReconcileAckUpdate::Published)
     }
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    #[doc(hidden)]
+    pub fn inject_unchecked_for_test(
+        &self,
+        value: ReconcileAck,
+    ) -> Result<(), ReconcileAckPublishError> {
+        let mut state = self.0.state.lock().expect("ack mutex poisoned");
+        if !state.receiver_open {
+            return Err(ReconcileAckPublishError::Closed);
+        }
+        state.ack = Some(value);
+        state.ack_version = state.ack_version.wrapping_add(1);
+        drop(state);
+        self.0.notify.notify_waiters();
+        Ok(())
+    }
 }
 
 impl ReconcileAckReceiver {
