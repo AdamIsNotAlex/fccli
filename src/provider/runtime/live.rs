@@ -6,7 +6,7 @@ use std::{
 };
 
 use futures_util::{FutureExt, stream};
-use time::{Date, Month, OffsetDateTime};
+use time::OffsetDateTime;
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
@@ -107,7 +107,7 @@ pub enum LiveSocketEvent {
     ProtocolViolation(&'static str),
 }
 
-pub(crate) trait LiveSocket: Send {
+pub trait LiveSocket: Send {
     fn read(&mut self) -> impl Future<Output = Result<LiveSocketEvent, ProviderError>> + Send + '_;
 
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -116,7 +116,7 @@ pub(crate) trait LiveSocket: Send {
     ) -> impl Future<Output = Result<(), ProviderError>> + Send + '_;
 }
 
-pub(crate) trait LiveAdapter: Send + Sync + 'static {
+pub trait LiveAdapter: Send + Sync + 'static {
     type Socket: LiveSocket + 'static;
 
     fn validate_request(
@@ -145,7 +145,7 @@ pub(crate) trait LiveAdapter: Send + Sync + 'static {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ConnectionRotation {
+pub enum ConnectionRotation {
     Never,
     After {
         max_age: Duration,
@@ -154,25 +154,25 @@ pub(crate) enum ConnectionRotation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProcessBlockPolicy {
+pub enum ProcessBlockPolicy {
     InvalidBanExpiry,
     Forbidden(&'static str),
 }
 
 #[derive(Clone)]
-pub(crate) struct LiveRateGate {
-    pub(crate) snapshot: RateGateSnapshot,
-    pub(crate) process_block: ProcessBlockPolicy,
+pub struct LiveRateGate {
+    pub snapshot: RateGateSnapshot,
+    pub process_block: ProcessBlockPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReconciliationPolicy {
+pub enum ReconciliationPolicy {
     Unbounded,
     Bounded(ReconciliationLimits),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ReconciliationLimits {
+pub struct ReconciliationLimits {
     pub max_successors: usize,
     pub max_pages: usize,
     pub span_exceeded: &'static str,
@@ -180,7 +180,7 @@ pub(crate) struct ReconciliationLimits {
     pub distinct_exceeded: &'static str,
 }
 
-pub(crate) struct LiveConfig<'a> {
+pub struct LiveConfig<'a> {
     pub supervisor: &'a LiveSupervisorConfig,
     pub reconciliation: ReconciliationPolicy,
 }
@@ -510,13 +510,6 @@ pub(crate) fn process_block_error(policy: ProcessBlockPolicy) -> ProviderError {
     }
 }
 
-pub(crate) fn gate_state_deadline(state: RateGateState) -> Option<crate::model::MonoInstant> {
-    match state {
-        RateGateState::TimedUntil(deadline) => Some(deadline),
-        RateGateState::Open | RateGateState::ProcessBlocked(_) => None,
-    }
-}
-
 #[derive(Clone, Copy)]
 struct ActiveRotation {
     deadline: Option<MonoInstant>,
@@ -629,7 +622,7 @@ fn is_process_block_error(error: &ProviderError, policy: ProcessBlockPolicy) -> 
     error == &process_block_error(policy)
 }
 
-pub(crate) async fn open_live<A: LiveAdapter>(
+pub async fn open_live<A: LiveAdapter>(
     adapter: A,
     clock: Arc<dyn Clock>,
     capabilities: ProviderCapabilities,

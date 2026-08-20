@@ -164,20 +164,22 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 
 ### R06 — Migrate shared live contract tests
 
-**Status:** [ ]  
+**Status:** [x]  
 **Depends on:** R05  
 **Owned files:** `tests/provider_runtime_live.rs` (new), `tests/binance_live.rs`, `tests/hyperliquid_live.rs`, `src/provider/runtime/live.rs`  
 **Parallel safety:** Sequential with R05/R07; overlaps shared runtime and Binance live suite.  
 **Commit boundary:** `test(provider): centralize live runtime contracts`
 
-- [ ] Migrate reconciliation, ack gate, accepted-watermark changes, REST-during-WS concurrency, cancellation precedence, queue saturation/emergency pair, exponential backoff sequence, reconnect generation purge, first-candle timeout, rate-gate/backoff deadline, and completion/error classification to provider-neutral shared tests.
-- [ ] Build a minimal deterministic runtime harness rather than a fake third provider abstraction.
-- [ ] Preserve provider live suites only for connection readiness and protocol-policy differences.
-- [ ] Confirm migrated tests fail against plausible runtime regressions and do not assert implementation-only text or type locations.
-- [ ] Verify: `cargo test --locked --test provider_runtime_live --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test app_live_contract --no-default-features --features test-transport`.
+- [x] Migrate reconciliation, ack gate, accepted-watermark changes, REST-during-WS concurrency, cancellation precedence, queue saturation/emergency pair, exponential backoff sequence, reconnect generation purge, first-candle timeout, rate-gate/backoff deadline, and completion/error classification to provider-neutral shared tests.
+- [x] Build a minimal deterministic runtime harness rather than a fake third provider abstraction.
+- [x] Preserve provider live suites only for connection readiness and protocol-policy differences.
+- [x] Confirm migrated tests fail against plausible runtime regressions and do not assert implementation-only text or type locations.
+**Implementation notes:** Complete. `tests/provider_runtime_live.rs` drives the actual shared `open_live`/`LiveEngine` through a minimal channel-scripted `LiveAdapter`/`LiveSocket` seam, `ManualClock`, one-shot history release points, rate-gate sender, reconciliation controls, and the production event/completion stream. Its six end-to-end runtime tests cover REST reconciliation concurrent with WS target growth, revision and matching/stale acknowledgement gating, accepted-watermark suffix requests, cancellation over a simultaneously ready history page, first-candle timeout, exponential retry progression, rate-gate/backoff maximum deadline, generation-scoped purge, queue saturation with the emergency recoverable/backoff pair, and terminal in-band/completion classification; four focused shared tests retain configuration, reconciliation-bound, span-arithmetic, and semantic-classification contracts. The observable event, request, deadline, revision, generation, queue, and completion assertions would fail under plausible regressions such as premature `Connected`, stale-ack acceptance, serialized WS/history work, lost cancellation precedence, incorrect retry deadlines, stale-generation leakage, or missing emergency ordering; no test asserts source text or type locations. Provider suites retain provider readiness, wire/codec, heartbeat, transport, malformed-input, temporal/window validation, connection rotation, rate/status policy, and necessary adapter integrations; the migrated provider-neutral cases have a single shared owner. Formatted gates passed: `provider_runtime_live` 10/10, `binance_live` 23/23, `hyperliquid_live` 26/26, and `app_live_contract` 51/51.
+
+- [x] Verify: `cargo test --locked --test provider_runtime_live --no-default-features --features test-transport` (10 passed).
+- [x] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport` (23 passed).
+- [x] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport` (26 passed).
+- [x] Verify: `cargo test --locked --test app_live_contract --no-default-features --features test-transport` (51 passed).
 
 ### R07 — Extract shared HTTP runtime and rate-limit decision policy
 
@@ -320,11 +322,11 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 | R03 | [x] | R02 | no | Complete; warning-free `cargo check` and formatted exact gates passed: `binance_ws_codec` 23/23, `hyperliquid_ws_codec` 11/11, `binance_live` 42/42, and `hyperliquid_live` 26/26; cancellation-aware close finalization and production-private codec outcomes verified |
 | R04 | [x] | R03 | no | Complete; formatted exact gates passed: `provider_runtime_websocket` 26/26, `binance_ws_codec` 4/4, `hyperliquid_ws_codec` 11/11, `binance_live` 40/40, and `hyperliquid_live` 27/27; identical-control coalescing, distinct-control blocking/resume/order, real provider saturation integrations, deterministic synchronization hooks, and queued-emergency shutdown suppression verified |
 | R05 | [x] | R04 | no | Complete; Binance REST temporal/grid, exact-close, request-window, and strict-order validation rejects malformed gap pages before shared state mutation; formatted gates passed: `binance_live` 45/45, `hyperliquid_live` 29/29, `app_live_contract` 51/51, with `provider_contract` 10/10, `history_coordinator` 21/21, `snapshot_runner` 6/6, plus supplemental `binance_rest` 23/23 |
-| R06 | [ ] | R05 | no | Ready; R05 dependency complete |
-| R07 | [ ] | R06 | no | — |
+| R06 | [x] | R05 | no | Complete; deterministic shared runtime harness owns reconciliation/concurrency, ack/watermark, cancellation, saturation/emergency ordering, backoff/rate deadline, generation purge, first-candle timeout, and completion/error contracts; formatted gates passed: `provider_runtime_live` 10/10, `binance_live` 23/23, `hyperliquid_live` 26/26, `app_live_contract` 51/51 |
+| R07 | [ ] | R06 | yes | — |
 | R08 | [ ] | R07 | no | Completes app/snapshot/older-history and market/timeframe capability consumption after the R05 interface foundation; no second capability or live-limit source |
 | R09 | [ ] | R08 | no | — |
 | R10 | [ ] | R09 | no | — |
 | R11 | [ ] | R10 | no | — |
 
-**Next dependency-ready unchecked chunk:** R06 — migrate the shared live contract tests into the provider-neutral runtime suite.
+**Next dependency-ready unchecked chunk:** R07 — extract the shared HTTP runtime and rate-limit decision policy.
