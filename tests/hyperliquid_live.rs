@@ -6,10 +6,12 @@ use fccli::{
     clock::ManualClock,
     error::{ErrorContext, ErrorOperation, ProviderError, TimeoutKind},
     model::{
-        ConnectionStatus, Instrument, Market, MarketEvent, MonoInstant, ProviderId, Timeframe,
+        ConnectionStatus, GapGeneration, Instrument, Market, MarketEvent, MonoInstant, ProviderId,
+        Timeframe,
     },
     provider::{
-        LiveRequest, MarketDataProvider, accepted_watermark_channel,
+        LiveRequest, MarketDataProvider, ProducerCompletion, ReconcileAck,
+        accepted_watermark_channel,
         hyperliquid::{
             APPLICATION_HEARTBEAT_INTERVAL, HyperliquidProvider, HyperliquidTestConfig,
             LiveSupervisorConfig, connect_test_websocket,
@@ -29,6 +31,7 @@ use serde_json::json;
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 fn clock() -> Arc<ManualClock> {
     Arc::new(ManualClock::new(MonoInstant::ZERO))
@@ -210,6 +213,181 @@ fn subscribe_ack_timeout_configuration_bounds_are_enforced() {
         };
         live.validate().expect("boundary is valid");
     }
+}
+
+#[tokio::test]
+async fn decoded_candle_saturation_invalidates_generation_and_blocks_retry_until_pair_dequeue() {
+    const OPEN: i64 = 1_700_000_040_000;
+    let rest = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "T": OPEN + 59_999,
+            "c": "42075.75",
+            "h": "42125.50",
+            "i": "1m",
+            "l": "41950.25",
+            "n": 12,
+            "o": "42000.10",
+            "s": "@142",
+            "t": OPEN,
+            "v": "123.456"
+        }])))
+        .mount(&rest)
+        .await;
+    let (listener, ws_uri) = websocket_listener().await;
+    let (release_candles_tx, release_candles_rx) = oneshot::channel();
+    let saturation = Arc::new(tokio::sync::Notify::new());
+    let (retry_accepted_tx, mut retry_accepted_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("first accept");
+        let mut websocket = accept_async(stream).await.expect("first upgrade");
+        assert!(matches!(websocket.next().await, Some(Ok(Message::Text(_)))));
+        websocket
+            .send(Message::Text(subscribe_ack().into()))
+            .await
+            .expect("subscribe ack");
+        websocket
+            .send(Message::Text(candle_message(OPEN).into()))
+            .await
+            .expect("startup candle");
+        release_candles_rx
+            .await
+            .expect("release saturation candles");
+        for successor in 1..=3_i64 {
+            websocket
+                .feed(Message::Text(
+                    candle_message(OPEN + successor * 60_000).into(),
+                ))
+                .await
+                .expect("decoded saturation candle");
+        }
+        websocket.flush().await.expect("saturation candle batch");
+        let (retry, _) = listener.accept().await.expect("retry accept");
+        retry_accepted_tx.send(()).expect("retry accepted");
+        let mut retry = accept_async(retry).await.expect("retry upgrade");
+        let _ = retry.next().await;
+        std::future::pending::<()>().await;
+    });
+
+    let manual = clock();
+    let live = LiveSupervisorConfig {
+        keyed_candle_capacity: 1,
+        market_event_capacity: 1,
+        saturation_test_hook: Some(Arc::clone(&saturation)),
+        ..LiveSupervisorConfig::default()
+    };
+    let provider = provider_with_http(&rest.uri(), &ws_uri, Arc::clone(&manual), live);
+    let cancellation = CancellationToken::new();
+    let (watermark_tx, watermark_rx) = accepted_watermark_channel(Some(OPEN));
+    let (ack_tx, ack_rx) = reconcile_ack_channel();
+    let mut feed = provider
+        .open_live(LiveRequest {
+            instrument: instrument(),
+            timeframe: Timeframe::Minute1,
+            startup_watermark: Some(OPEN),
+            accepted_watermark_rx: watermark_rx,
+            reconcile_ack_rx: ack_rx,
+            cancellation: cancellation.clone(),
+        })
+        .await
+        .expect("feed");
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::Status {
+            generation: Some(GapGeneration(1)),
+            status: ConnectionStatus::Connecting
+        }
+    ));
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::Status {
+            generation: Some(GapGeneration(1)),
+            status: ConnectionStatus::GapSync
+        }
+    ));
+    let (generation, revision, target) = match next_event(&mut feed).await {
+        MarketEvent::ReconcileBatch {
+            generation,
+            revision,
+            target_open_time,
+            ..
+        } => (generation, revision, target_open_time),
+        other => panic!("expected reconcile batch, got {other:?}"),
+    };
+    ack_tx
+        .publish(ReconcileAck {
+            generation,
+            revision,
+            through: target,
+        })
+        .expect("reconcile ack");
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::Status {
+            generation: Some(GapGeneration(1)),
+            status: ConnectionStatus::Connected
+        }
+    ));
+
+    release_candles_tx
+        .send(())
+        .expect("release saturation candles");
+    timeout(Duration::from_secs(2), saturation.notified())
+        .await
+        .expect("production saturation transition timeout");
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::RecoverableError {
+            generation: None,
+            error: ProviderError::QueueSaturated,
+            ..
+        }
+    ));
+    manual
+        .advance_by(Duration::from_secs(1))
+        .expect("backoff deadline");
+    assert_eq!(
+        feed.producer_completion.current(),
+        Ok(ProducerCompletion::Running)
+    );
+    assert!(
+        timeout(Duration::ZERO, &mut retry_accepted_rx)
+            .await
+            .is_err(),
+        "retry must remain blocked until the emergency pair is dequeued"
+    );
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::Status {
+            generation: None,
+            status: ConnectionStatus::Backoff
+        }
+    ));
+    timeout(Duration::from_secs(2), &mut retry_accepted_rx)
+        .await
+        .expect("retry accept timeout")
+        .expect("retry accept sender");
+
+    cancellation.cancel();
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::Status {
+            generation: None,
+            status: ConnectionStatus::Stopped
+        }
+    ));
+    assert!(matches!(
+        feed.producer_completion.changed().await,
+        Ok(ProducerCompletion::Finished(Ok(())))
+    ));
+    assert_eq!(
+        timeout(Duration::from_secs(2), feed.events.next())
+            .await
+            .expect("receiver completion timeout"),
+        None
+    );
+    drop(watermark_tx);
+    server.abort();
 }
 
 #[tokio::test]

@@ -101,6 +101,7 @@ impl EmergencyBarrier {
     fn suppress_pending(&self) {
         self.suppressed
             .fetch_or(self.pending.load(Ordering::Acquire), Ordering::AcqRel);
+        self.notify.notify_waiters();
     }
 
     fn begin_shutdown(&self) {
@@ -110,6 +111,17 @@ impl EmergencyBarrier {
 
     pub(crate) fn is_suppressed(&self, slot: u8) -> bool {
         self.suppressed.load(Ordering::Acquire) & (1 << slot) != 0
+    }
+
+    #[cfg(feature = "test-transport")]
+    async fn wait_suppressed(&self, slot: u8) {
+        while !self.is_suppressed(slot) {
+            let notified = self.notify.notified();
+            if self.is_suppressed(slot) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub(crate) fn is_dequeued(&self) -> bool {
@@ -228,6 +240,14 @@ impl EventEmitterTestSender {
     pub async fn send(&self, event: MarketEvent) -> Result<(), ProviderError> {
         self.0.send_regular(event).await
     }
+
+    pub async fn shutdown(&self) {
+        self.0.shutdown().await;
+    }
+
+    pub async fn wait_emergency_suppressed(&self, slot: u8) {
+        self.0.emergency_barrier.wait_suppressed(slot).await;
+    }
 }
 
 #[cfg(feature = "test-transport")]
@@ -279,7 +299,18 @@ impl EventEmitterTestFacade {
     }
 
     pub async fn recv(&mut self) -> Option<Result<MarketEvent, ProviderError>> {
-        self.receiver.recv().await.map(EventEnvelope::into_item)
+        loop {
+            let envelope = self.receiver.recv().await?;
+            let suppressed = envelope.emergency_slot.is_some_and(|slot| {
+                envelope
+                    .emergency_barrier
+                    .as_ref()
+                    .is_some_and(|barrier| barrier.is_suppressed(slot))
+            });
+            if !suppressed {
+                return Some(envelope.into_item());
+            }
+        }
     }
 
     pub fn close_receiver(&mut self) {

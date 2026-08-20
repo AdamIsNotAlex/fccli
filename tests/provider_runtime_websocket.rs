@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use fccli::{
-    error::{PayloadError, ProviderError, SanitizedCause, SanitizedMessage, TimeoutKind},
-    model::{FinalityAuthority, Instrument, Market, ProviderId, Timeframe},
+    error::{PayloadError, ProviderError, SanitizedCause, TimeoutKind},
+    model::{Instrument, Market, ProviderId, Timeframe},
     provider::{
         binance::decode_ws_frame,
         test_transport::{
@@ -1322,24 +1322,31 @@ mod emitter_contracts {
                 },
             )
             .expect("emergency pair");
-        let first = recv(&mut facade).await;
-        assert!(matches!(first, MarketEvent::RecoverableError { .. }));
-        let second = recv(&mut facade).await;
-        assert!(matches!(
-            second,
-            MarketEvent::Status {
-                status: ConnectionStatus::Backoff,
-                ..
-            }
-        ));
-        facade.shutdown().await;
         assert!(matches!(
             recv(&mut facade).await,
+            MarketEvent::RecoverableError { .. }
+        ));
+
+        let emitter = facade.clone_emitter();
+        let shutdown_emitter = emitter.clone();
+        let shutdown = tokio::spawn(async move { shutdown_emitter.shutdown().await });
+        timeout(Duration::from_secs(1), emitter.wait_emergency_suppressed(1))
+            .await
+            .expect("shutdown must mark the queued second emergency stale");
+        let stopped = timeout(Duration::from_secs(1), recv(&mut facade))
+            .await
+            .expect("shutdown must suppress the queued stale emergency and deliver Stopped");
+        assert!(matches!(
+            stopped,
             MarketEvent::Status {
                 generation: None,
                 status: ConnectionStatus::Stopped
             }
         ));
+        timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown must not wait indefinitely for emergency capacity")
+            .expect("shutdown task");
     }
 
     #[tokio::test]

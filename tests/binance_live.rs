@@ -612,6 +612,116 @@ async fn empty_startup_waits_for_first_ws_then_ack_gates_connected_and_live_cand
 }
 
 #[tokio::test]
+async fn decoded_candle_saturation_invalidates_generation_and_blocks_retry_until_pair_dequeue() {
+    let rest =
+        rest_server(ResponseTemplate::new(200).set_body_json(json!([rest_row(OPEN_TIME)]))).await;
+    let (listener, ws_uri) = websocket_listener().await;
+    let (release_candles_tx, release_candles_rx) = oneshot::channel();
+    let saturation = Arc::new(tokio::sync::Notify::new());
+    let (retry_accepted_tx, mut retry_accepted_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("first accept");
+        let mut websocket = accept_async(stream).await.expect("first upgrade");
+        websocket
+            .send(Message::Text(ws_kline(OPEN_TIME, false, "37025.50").into()))
+            .await
+            .expect("startup candle");
+        release_candles_rx
+            .await
+            .expect("release saturation candles");
+        for successor in 1..=3_i64 {
+            websocket
+                .feed(Message::Text(
+                    ws_kline(OPEN_TIME + successor * 60_000, true, "37030.00").into(),
+                ))
+                .await
+                .expect("decoded saturation candle");
+        }
+        websocket.flush().await.expect("saturation candle batch");
+        let (retry, _) = listener.accept().await.expect("retry accept");
+        retry_accepted_tx.send(()).expect("retry accepted");
+        let _retry = accept_async(retry).await.expect("retry upgrade");
+        std::future::pending::<()>().await;
+    });
+
+    let manual = Arc::new(ManualClock::new(MonoInstant::ZERO));
+    let live = LiveSupervisorConfig {
+        keyed_candle_capacity: 1,
+        market_event_capacity: 1,
+        saturation_test_hook: Some(Arc::clone(&saturation)),
+        ..LiveSupervisorConfig::default()
+    };
+    let provider = provider(&rest.uri(), &ws_uri, manual.clone(), live);
+    let (request, _watermark_tx, ack_tx) = request(Some(OPEN_TIME));
+    let mut feed = provider.open_live(request).await.expect("live feed");
+    assert_status(
+        next_event(&mut feed).await,
+        Some(1),
+        ConnectionStatus::Connecting,
+    );
+    assert_status(
+        next_event(&mut feed).await,
+        Some(1),
+        ConnectionStatus::GapSync,
+    );
+    let (generation, revision, target, _) = next_batch(&mut feed).await;
+    acknowledge(&ack_tx, generation, revision, target);
+    assert_status(
+        next_event(&mut feed).await,
+        Some(1),
+        ConnectionStatus::Connected,
+    );
+
+    release_candles_tx
+        .send(())
+        .expect("release saturation candles");
+    timeout(Duration::from_secs(2), saturation.notified())
+        .await
+        .expect("production saturation transition timeout");
+
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::RecoverableError {
+            generation: None,
+            error: ProviderError::QueueSaturated,
+            ..
+        }
+    ));
+    manual
+        .advance_by(Duration::from_secs(1))
+        .expect("first backoff deadline");
+    assert_eq!(
+        feed.producer_completion.current(),
+        Ok(ProducerCompletion::Running)
+    );
+    assert!(
+        timeout(Duration::ZERO, &mut retry_accepted_rx)
+            .await
+            .is_err(),
+        "retry must remain blocked until the emergency pair is dequeued"
+    );
+    assert_status(next_event(&mut feed).await, None, ConnectionStatus::Backoff);
+    timeout(Duration::from_secs(2), &mut retry_accepted_rx)
+        .await
+        .expect("retry accept timeout")
+        .expect("retry accept sender");
+
+    feed.request_shutdown();
+    assert_status(next_event(&mut feed).await, None, ConnectionStatus::Stopped);
+    assert!(matches!(
+        feed.producer_completion.changed().await,
+        Ok(ProducerCompletion::Finished(Ok(())))
+    ));
+    assert_eq!(
+        timeout(Duration::from_secs(2), feed.events.next())
+            .await
+            .expect("receiver completion timeout"),
+        None
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn acknowledgement_timeout_emits_exact_error_then_backoff_before_second_generation() {
     let rest =
         rest_server(ResponseTemplate::new(200).set_body_json(json!([rest_row(OPEN_TIME)]))).await;

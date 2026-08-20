@@ -13,6 +13,8 @@ use serde::{
     de::{IgnoredAny, SeqAccess, Visitor},
 };
 use serde_json::Value;
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
@@ -80,6 +82,8 @@ pub struct LiveSupervisorConfig {
     pub ws_config: WsConfig,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub stalled_write_probe_frames: usize,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    pub saturation_test_hook: Option<Arc<Notify>>,
 }
 
 impl Default for LiveSupervisorConfig {
@@ -94,6 +98,8 @@ impl Default for LiveSupervisorConfig {
             ws_config: WsConfig::default(),
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             stalled_write_probe_frames: 0,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            saturation_test_hook: None,
         }
     }
 }
@@ -1375,6 +1381,10 @@ impl BinanceProvider {
                     match frame {
                         Ok(DecodedFrame::Provider(BinanceDecoded::Candle(candle))) => {
                             if let Err(outcome) = pending.push(candle) {
+                                #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+                                if let Some(hook) = &self.live.saturation_test_hook {
+                                    hook.notify_one();
+                                }
                                 return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(outcome) } else { GenerationOutcome::Reconnect(outcome) });
                             }
                         }

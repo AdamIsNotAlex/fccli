@@ -107,6 +107,8 @@ pub struct LiveSupervisorConfig {
     pub force_stalled_write_after_readiness_frame: bool,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub max_gap_reconciliation_candles_for_test: usize,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    pub saturation_test_hook: Option<Arc<Notify>>,
 }
 
 impl Default for LiveSupervisorConfig {
@@ -140,6 +142,8 @@ impl Default for LiveSupervisorConfig {
             force_stalled_write_after_readiness_frame: false,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             max_gap_reconciliation_candles_for_test: MAX_GAP_RECONCILIATION_CANDLES,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            saturation_test_hook: None,
         }
     }
 }
@@ -1712,6 +1716,10 @@ impl HyperliquidProvider {
                     match frame {
                         Ok(DecodedFrame::Provider(HyperliquidDecoded::Candle(candle))) => {
                             if let Err(outcome) = pending.push(candle) {
+                                #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+                                if let Some(hook) = &self.live.saturation_test_hook {
+                                    hook.notify_one();
+                                }
                                 return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(outcome) } else { GenerationOutcome::Reconnect(outcome) });
                             }
                         }
