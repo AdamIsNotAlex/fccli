@@ -1,3 +1,12 @@
+## 执行状态与假设
+
+- 权威实施清单与进度记录：[`refactor.todo.md`](./refactor.todo.md)。后续会话应按其中的依赖和 accounting 表选择第一个 ready chunk；本文保留论证和协议背景，不作为完成状态来源。
+- 规划基线：分支 `feat/abstration`，提交 `3f6b379`；基线工作树干净，provider runtime 重构尚未开始。这里记录的是恢复实施时的假设，不应在实现后继续当作当前状态证据。
+- 实施约束：先锁定 provider 协议契约，再依次抽取 WebSocket/EventEmitter、live engine、HTTP runtime，之后加入 capabilities/policy 并通用化 registry；`binance.rs` 与 `hyperliquid.rs` 默认顺序修改。
+- 明确不适用的机制（动态 Binance subscribe、跨 provider 心跳/finality/rate-limit 语义移植、Hyperliquid 严格 over-limit 拒绝等）是约束，不是待实现功能；完整记录见 tracker 的 C-01—C-10。
+
+---
+
 ## 结论
 
 这两个 provider 当前最大的结构问题，不是“彼此缺少机制”，而是**公共运行时被复制了两份**。
@@ -58,6 +67,12 @@ Connecting
 - `interval == timeframe`
 
 这样订阅失败不会退化成含糊的 `FirstKline` timeout。
+
+建立阶段的可执行协议固定如下（权威 checklist 见 R01）：
+
+- Hyperliquid provider-specific connection policy owns `subscribe_ack_timeout = 10s`; validate it in `1ms..=60s` and measure it with the injected monotonic `Clock`, starting only after the subscribe frame has successfully flushed.
+- Expiry is `ProviderError::Timeout { kind: TimeoutKind::SubscribeAck, context: WebSocket + market/timeframe }`, classified as recoverable connection setup failure. It is never `FirstKline`.
+- Pending-readiness precedence is cancellation, then Close/transport/read/write failure, malformed or mismatched ack, ack deadline, then message inactivity. A matching ack already received at the deadline wins the tie. Transport Ping/Pong is serviced while waiting; the 50-second JSON heartbeat starts only after ack acceptance.
 
 实际主网探测确认有效订阅依次返回：
 
@@ -136,6 +151,14 @@ Hyperliquid 当前：
 
 最后一点很重要：主网实际探测中，1000 个 interval 的时间窗口返回了 **1001 条**，因为边界 candle 会重叠。因此不能复制 Binance 的“超过 requested limit 即协议错误”。
 
+资源边界不是“无限截断”：`requested_limit` 仍为 `1..=1000`，另设绝对行数上限 `HYPERLIQUID_MAX_RESPONSE_ROWS = 1001`，现有 2 MiB capped body 是独立的字节上限。对 `N = requested_limit`：
+
+- `0..=N` 行原样接受。
+- `N+1..=1001` 行全部流式校验后接受并截断；`Latest/Older` 用 N 槽 ring/deque 保留最新 N 行，`Gap` 保留最早 N 行但仍校验后续行。
+- 第 1002 行立即产生 oversized payload/protocol error，不返回部分结果。
+
+因此 1001 行边界重叠是合法协议输入，1002 行则是明确的绝对上限违规。
+
 ---
 
 ## 1.4 补齐 Hyperliquid live/runtime 契约测试
@@ -195,13 +218,18 @@ let closed = kline.close_time < unix_now_ms().unwrap_or(kline.close_time);
 - 本机时钟落后：可能延迟标记 closed。
 - 一旦标为 `WsAuthoritativeClosed`，REST 不会覆盖它。
 
-更稳妥的策略：
+确定策略不是仅有原则，而是以下状态机：
 
-- 当前 candle 一律视为 authoritative open。
-- 收到更晚 `open_time` 的 candle 后，才把上一根升级为 authoritative closed。
-- 可选：服务器时间证据作为补充，不能只依赖本机时间。
+| 输入相对 retained current `T` | 输出顺序 | 新状态 | 处理 |
+|---|---|---|---|
+| 首根 `U` | `U` authoritative open | retain `U` latest payload | 接受 |
+| `open_time == T` 且 payload 改变 | updated `T` authoritative open | replace retained `T` | 接受 |
+| `open_time == T` 且 payload 完全相同 | 无 | retained `T` 不变 | 丢弃 exact duplicate |
+| immediate successor `U == T + interval` | retained latest `T` authoritative closed；随后 `U` authoritative open | retain `U` | 接受 |
+| skipped successor `U > T + interval` | retained latest `T` authoritative closed；随后 `U` authoritative open | retain `U`；不合成缺失 candle | 接受，由 gap reconciliation 补缺口 |
+| regressive/out-of-order `U < T` | 无 | retained `T` 不变 | 作为 stale 丢弃，不报 protocol error、不触发 reconnect |
 
-这要求 Hyperliquid codec 是**有状态的**；也是为什么 shared `WsCodec` 应接收 `&mut self`。
+本机墙上时钟永远不是 finality 证据；codec 必须有状态、接收 `&mut self`，并能按“前根 closed → 新根 open”顺序向 caller-owned queue 输出两个 outcome。
 
 ---
 
@@ -282,8 +310,8 @@ Binance 当前支持 `Timeframe::ALL`，所以不需要额外拒绝；但公共�
 struct ProviderCapabilities {
     markets: &'static [Market],
     timeframes: &'static [Timeframe],
+    /// Maximum history rows accepted by one provider request; must be non-zero.
     history_page_limit: u16,
-    connection_rotation: Option<Duration>,
 }
 ```
 
@@ -292,6 +320,8 @@ struct ProviderCapabilities {
 - UI 在发起网络请求前就能过滤不支持的周期。
 - live gap engine 不再硬编码 `GAP_PAGE_LIMIT = 1000`。
 - 第三个 provider 不需要在不同调用入口重复做 capability check。
+
+能力切换的公共接口决定也固定下来：`MarketDataProvider::capabilities()` 是**无默认实现的必需方法**。实现范围包括 Binance、Hyperliquid，以及 `tests/provider_contract.rs`、`tests/app_live_contract.rs`、`tests/history_coordinator.rs`、`tests/snapshot_runner.rs` 中全部 fake provider。`history_page_limit` 的语义是 provider 单次 history 请求所允许的**非零最大行数**，不是所有调用入口都必须请求的精确行数。消费范围包括 `src/app.rs` 的初始启动和交互切换、`src/snapshot.rs`、`src/history.rs` 的 older-page 请求，以及 shared live gap engine；这些入口必须在网络前验证 market/timeframe 和非零上限。初始 app/交互切换继续以 `INITIAL_HISTORY_LIMIT = 500` 为期望行数，snapshot 继续以 `SNAPSHOT_HISTORY_LIMIT = 500` 为期望行数，但实际请求量必须在网络 I/O 前计算为 `min(desired_limit, capabilities.history_page_limit)`；保留这两个表达产品意图的常量及其调用入口测试。older-history 与 shared live gap 没有独立的产品期望值，直接使用 advertised maximum。删除 provider-local `GAP_PAGE_LIMIT` 和 `history::HISTORY_PAGE_LIMIT`，不能保留第二套 provider maximum 来源；provider decoder/request validation 继续作为 defense in depth。
 
 Binance 实现简单返回全部周期即可。
 
@@ -430,7 +460,7 @@ trait WsCodec: Send {
 - Binance：`src/provider/binance.rs:1276-2606`
 - Hyperliquid：`src/provider/hyperliquid.rs:1228-2607`
 
-shared engine 只需要几个内部 hook：
+shared engine 只需要几个内部 hook；公开 capability 由 `MarketDataProvider::capabilities()` 提供，不在内部 policy contract 中重复定义：
 
 ```text
 validate_request()
@@ -438,9 +468,10 @@ connect_ready_socket()
 history()
 rate_gate()
 live_config()
-history_page_limit()
 connection_rotation()
 ```
+
+`connection_rotation()` 只属于 live runtime 的内部 provider policy/hook，不出现在公共 `ProviderCapabilities` 中。shared live gap 从公共 capabilities 读取并验证非零 `history_page_limit`，再将它作为单次 history 请求的最大行数。
 
 其中 `connect_ready_socket()` 的语义必须是：
 
@@ -504,10 +535,10 @@ struct HttpRuntime {
 ```text
 supported markets
 supported timeframes
-history page size
+non-zero maximum history rows per request
 ```
 
-供 UI、history coordinator 和 live engine 使用。
+供 UI、app/snapshot preflight 与 request capping、history coordinator 和 live engine 使用；它不承载 connection rotation 等 protocol policy。
 
 ### 仅内部 protocol policy
 
@@ -617,6 +648,8 @@ Hyperliquid 保留：
 5. **加入 ProviderCapabilities**。
 6. **最后通用化 Registry**。
 7. 新增第三个 provider 时，只实现 endpoint、codec、canonicalization 和 protocol policy。
+
+实施恢复规则同样属于设计契约：每个 chunk commit 必须独立可编译并通过该 chunk 的 literal commands；失败的 partial cutover 不得提交或成为后续依赖。失败发生在 commit 前时，只修正或恢复该 chunk owned edits；发生在本地 commit 后时，优先 amend，若原假设无效则完整 revert。设计假设变化必须先以 planning-only change 更新本文、tracker ownership/dependencies/accounting 和 blocker evidence，再从第一个 ready chunk 恢复；在 amend/revert 完成前，失败 chunk 持续独占其文件。
 
 不要第一步就做一个巨大的 `ProviderAdapter` trait；先移动字节级相同的代码，再让真实差异决定最小 hook 集合。
 
