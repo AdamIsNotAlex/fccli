@@ -51,6 +51,26 @@ fn candle(open_time: i64, closed: bool) -> Candle {
     .expect("valid candle")
 }
 
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+fn binance_provider(clock: Arc<dyn Clock>) -> Result<BinanceProvider, ProviderError> {
+    BinanceProvider::new(clock)
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+fn binance_provider(clock: Arc<dyn Clock>) -> Result<BinanceProvider, ProviderError> {
+    BinanceProvider::new_test("http://127.0.0.1:1", clock)
+}
+
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+fn hyperliquid_provider(clock: Arc<dyn Clock>) -> Result<HyperliquidProvider, ProviderError> {
+    HyperliquidProvider::new(clock)
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+fn hyperliquid_provider(clock: Arc<dyn Clock>) -> Result<HyperliquidProvider, ProviderError> {
+    HyperliquidProvider::new_test("http://127.0.0.1:1", clock)
+}
+
 #[derive(Clone)]
 struct FakeProvider {
     gate: RateGateSnapshot,
@@ -150,15 +170,13 @@ fn capabilities_are_public_data_support_and_nonzero_history_maximum_only() {
 #[test]
 fn real_provider_capabilities_match_public_support_contract() {
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
-    let binance = BinanceProvider::new_test("http://127.0.0.1:1", Arc::clone(&clock))
-        .expect("test Binance provider");
+    let binance = binance_provider(Arc::clone(&clock)).expect("Binance provider");
     let binance = binance.capabilities();
     assert_eq!(binance.timeframes, &Timeframe::ALL);
     assert!(!binance.markets.is_empty());
     assert_ne!(binance.history_page_limit, 0);
 
-    let hyperliquid = HyperliquidProvider::new_test("http://127.0.0.1:1", clock)
-        .expect("test Hyperliquid provider");
+    let hyperliquid = hyperliquid_provider(clock).expect("Hyperliquid provider");
     let hyperliquid = hyperliquid.capabilities();
     assert!(!hyperliquid.markets.is_empty());
     assert_ne!(hyperliquid.history_page_limit, 0);
@@ -177,14 +195,10 @@ fn real_provider_capabilities_match_public_support_contract() {
 #[test]
 fn registry_registers_two_providers_and_supports_borrowed_lookup() {
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
-    let binance: Arc<dyn MarketDataProvider> = Arc::new(
-        BinanceProvider::new_test("http://127.0.0.1:1", Arc::clone(&clock))
-            .expect("test Binance provider"),
-    );
-    let hyperliquid: Arc<dyn MarketDataProvider> = Arc::new(
-        HyperliquidProvider::new_test("http://127.0.0.1:1", clock)
-            .expect("test Hyperliquid provider"),
-    );
+    let binance: Arc<dyn MarketDataProvider> =
+        Arc::new(binance_provider(Arc::clone(&clock)).expect("Binance provider"));
+    let hyperliquid: Arc<dyn MarketDataProvider> =
+        Arc::new(hyperliquid_provider(clock).expect("Hyperliquid provider"));
     let registry = ProviderRegistry::new([Arc::clone(&binance), Arc::clone(&hyperliquid)])
         .expect("unique providers");
 

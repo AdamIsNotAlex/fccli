@@ -46,7 +46,7 @@ use crate::{
 use crate::provider::runtime::{
     live::{
         ConnectionRotation, LiveAdapter, LiveConfig, LiveRateGate, LiveSocket, LiveSocketEvent,
-        ProcessBlockPolicy, ReconciliationLimits, ReconciliationPolicy,
+        ProcessBlockPolicy, ReconciliationLimits,
     },
     websocket::{
         DecodedFrame, WsCodec, WsConfig, connect_websocket_url,
@@ -476,6 +476,23 @@ pub struct BinanceProvider {
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     ws_base_url: Option<String>,
 }
+struct BinanceBuildConfig {
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    base_url: Url,
+    request_timeout: Duration,
+    body_limit: usize,
+    rate_limit_fallback: Duration,
+    live: LiveSupervisorConfig,
+    max_connection_age: Duration,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    advertised_history_page_limit: u16,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    max_gap_reconciliation_candles: usize,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    max_gap_reconciliation_pages: usize,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    ws_base_url: Option<String>,
+}
 
 #[derive(Clone, Debug)]
 pub struct BinanceTestConfig {
@@ -654,13 +671,13 @@ impl LiveAdapter for BinanceLiveAdapter {
             (MAX_GAP_RECONCILIATION_CANDLES, MAX_GAP_RECONCILIATION_PAGES);
         LiveConfig {
             supervisor: &self.provider.live,
-            reconciliation: ReconciliationPolicy::Bounded(ReconciliationLimits {
+            reconciliation: ReconciliationLimits {
                 max_successors,
                 max_pages,
                 span_exceeded: "Binance gap reconciliation target exceeds the per-generation span limit",
                 page_exceeded: "Binance gap reconciliation exceeded the per-generation page limit",
                 distinct_exceeded: "Binance gap reconciliation exceeded the distinct buffered-candle limit",
-            }),
+            },
         }
     }
 
@@ -677,11 +694,13 @@ impl BinanceProvider {
     pub fn new(clock: Arc<dyn Clock>) -> Result<Self, ProviderError> {
         Self::build(
             clock,
-            REST_REQUEST_TIMEOUT,
-            REST_BODY_LIMIT,
-            RATE_LIMIT_FALLBACK,
-            LiveSupervisorConfig::default(),
-            MAX_CONNECTION_AGE,
+            BinanceBuildConfig {
+                request_timeout: REST_REQUEST_TIMEOUT,
+                body_limit: REST_BODY_LIMIT,
+                rate_limit_fallback: RATE_LIMIT_FALLBACK,
+                live: LiveSupervisorConfig::default(),
+                max_connection_age: MAX_CONNECTION_AGE,
+            },
         )
     }
 
@@ -700,17 +719,19 @@ impl BinanceProvider {
     ) -> Result<Self, ProviderError> {
         let base_url = validate_loopback_base(&config.base_url)?;
         Self::build(
-            base_url,
             clock,
-            config.request_timeout,
-            config.body_limit,
-            config.rate_limit_fallback,
-            LiveSupervisorConfig::default(),
-            MAX_CONNECTION_AGE,
-            1000,
-            MAX_GAP_RECONCILIATION_CANDLES,
-            MAX_GAP_RECONCILIATION_PAGES,
-            None,
+            BinanceBuildConfig {
+                base_url,
+                request_timeout: config.request_timeout,
+                body_limit: config.body_limit,
+                rate_limit_fallback: config.rate_limit_fallback,
+                live: LiveSupervisorConfig::default(),
+                max_connection_age: MAX_CONNECTION_AGE,
+                advertised_history_page_limit: 1000,
+                max_gap_reconciliation_candles: MAX_GAP_RECONCILIATION_CANDLES,
+                max_gap_reconciliation_pages: MAX_GAP_RECONCILIATION_PAGES,
+                ws_base_url: None,
+            },
         )
     }
 
@@ -722,75 +743,64 @@ impl BinanceProvider {
         let base_url = validate_loopback_base(&config.rest.base_url)?;
         validate_loopback_ws_base(&config.ws_base_url)?;
         Self::build(
-            base_url,
             clock,
-            config.rest.request_timeout,
-            config.rest.body_limit,
-            config.rest.rate_limit_fallback,
-            config.live,
-            config.max_connection_age,
-            config.advertised_history_page_limit,
-            config.max_gap_reconciliation_candles,
-            config.max_gap_reconciliation_pages,
-            Some(config.ws_base_url),
+            BinanceBuildConfig {
+                base_url,
+                request_timeout: config.rest.request_timeout,
+                body_limit: config.rest.body_limit,
+                rate_limit_fallback: config.rest.rate_limit_fallback,
+                live: config.live,
+                max_connection_age: config.max_connection_age,
+                advertised_history_page_limit: config.advertised_history_page_limit,
+                max_gap_reconciliation_candles: config.max_gap_reconciliation_candles,
+                max_gap_reconciliation_pages: config.max_gap_reconciliation_pages,
+                ws_base_url: Some(config.ws_base_url),
+            },
         )
     }
 
-    fn build(
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        base_url: Url,
-        clock: Arc<dyn Clock>,
-        request_timeout: Duration,
-        body_limit: usize,
-        rate_limit_fallback: Duration,
-        live: LiveSupervisorConfig,
-        max_connection_age: Duration,
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        advertised_history_page_limit: u16,
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        max_gap_reconciliation_candles: usize,
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        max_gap_reconciliation_pages: usize,
-        #[cfg(all(
-            feature = "test-transport",
-            not(feature = "production-transport")
-        ))]
-        ws_base_url: Option<String>,
-    ) -> Result<Self, ProviderError> {
-        if request_timeout.is_zero() || body_limit == 0 || rate_limit_fallback.is_zero() {
+    fn build(clock: Arc<dyn Clock>, config: BinanceBuildConfig) -> Result<Self, ProviderError> {
+        if config.request_timeout.is_zero()
+            || config.body_limit == 0
+            || config.rate_limit_fallback.is_zero()
+        {
             return Err(ProviderError::Configuration(
                 "REST timeout, body limit, and fallback must be positive",
             ));
         }
-        live.validate()?;
-        if max_connection_age.is_zero() {
+        config.live.validate()?;
+        if config.max_connection_age.is_zero() {
             return Err(ProviderError::Configuration(
                 "live connection max age must be positive",
             ));
         }
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        if max_gap_reconciliation_candles == 0 || max_gap_reconciliation_pages == 0 {
+        if config.max_gap_reconciliation_candles == 0 || config.max_gap_reconciliation_pages == 0 {
             return Err(ProviderError::Configuration(
                 "live reconciliation limits must be positive",
             ));
         }
-        let http = HttpRuntime::new(Arc::clone(&clock), request_timeout, body_limit)?;
+        let http = HttpRuntime::new(
+            Arc::clone(&clock),
+            config.request_timeout,
+            config.body_limit,
+        )?;
         Ok(Self {
             http,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            base_url,
+            base_url: config.base_url,
             clock,
-            rate_limit_fallback,
-            live,
-            max_connection_age,
+            rate_limit_fallback: config.rate_limit_fallback,
+            live: config.live,
+            max_connection_age: config.max_connection_age,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            advertised_history_page_limit,
+            advertised_history_page_limit: config.advertised_history_page_limit,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            max_gap_reconciliation_candles,
+            max_gap_reconciliation_candles: config.max_gap_reconciliation_candles,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            max_gap_reconciliation_pages,
+            max_gap_reconciliation_pages: config.max_gap_reconciliation_pages,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            ws_base_url,
+            ws_base_url: config.ws_base_url,
         })
     }
 
@@ -941,7 +951,7 @@ impl BinanceProvider {
     fn history_page_limit(&self) -> u16 {
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         {
-            return self.advertised_history_page_limit;
+            self.advertised_history_page_limit
         }
         #[cfg(any(
             all(feature = "production-transport", not(feature = "test-transport")),
@@ -992,12 +1002,12 @@ impl MarketDataProvider for BinanceProvider {
             let adapter = BinanceLiveAdapter::new(self.clone());
             let clock = Arc::clone(&self.clock);
             let capabilities = MarketDataProvider::capabilities(self);
-            return Box::pin(crate::provider::runtime::live::open_live(
+            Box::pin(crate::provider::runtime::live::open_live(
                 adapter,
                 clock,
                 capabilities,
                 request,
-            ));
+            ))
         }
         #[cfg(all(feature = "production-transport", feature = "test-transport"))]
         {

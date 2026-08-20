@@ -10,7 +10,7 @@ pub use super::runtime::live::{
     LiveConfig, LiveErrorClassification, LiveErrorDisposition, LiveInBandEventDisposition,
     LiveInputClassification, LiveRateGate, LiveSocket, LiveSocketEvent, LiveSupervisorConfig,
     MARKET_EVENT_CHANNEL_CAPACITY, ProcessBlockPolicy, RECONCILE_ACK_TIMEOUT, ReconciliationLimits,
-    ReconciliationPolicy, classify_live_error_for_test, classify_live_input_for_test,
+    classify_live_error_for_test, classify_live_input_for_test,
     gap_target_within_generation_span_for_test, open_live,
     reconciliation_distinct_key_allowed_for_test, reconciliation_page_guard_for_test,
 };

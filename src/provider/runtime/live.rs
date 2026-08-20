@@ -170,12 +170,6 @@ pub struct LiveRateGate {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReconciliationPolicy {
-    Unbounded,
-    Bounded(ReconciliationLimits),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReconciliationLimits {
     pub max_successors: usize,
     pub max_pages: usize,
@@ -186,7 +180,7 @@ pub struct ReconciliationLimits {
 
 pub struct LiveConfig<'a> {
     pub supervisor: &'a LiveSupervisorConfig,
-    pub reconciliation: ReconciliationPolicy,
+    pub reconciliation: ReconciliationLimits,
 }
 
 pub(crate) fn validate_runtime_contract(
@@ -195,15 +189,14 @@ pub(crate) fn validate_runtime_contract(
     rotation: ConnectionRotation,
 ) -> Result<u16, ProviderError> {
     config.supervisor.validate()?;
-    if let ReconciliationPolicy::Bounded(limits) = config.reconciliation {
-        if limits.max_successors == 0
-            || limits.max_pages == 0
-            || limits.max_successors.checked_add(1).is_none()
-        {
-            return Err(ProviderError::Configuration(
-                "live reconciliation limits must be positive and representable",
-            ));
-        }
+    let limits = config.reconciliation;
+    if limits.max_successors == 0
+        || limits.max_pages == 0
+        || limits.max_successors.checked_add(1).is_none()
+    {
+        return Err(ProviderError::Configuration(
+            "live reconciliation limits must be positive and representable",
+        ));
     }
     if matches!(rotation, ConnectionRotation::After { max_age, .. } if max_age.is_zero()) {
         return Err(ProviderError::Configuration(
@@ -223,17 +216,15 @@ pub(crate) fn advance_reconciliation_target(
     candidate: i64,
     generation_start: i64,
     timeframe: Timeframe,
-    policy: ReconciliationPolicy,
+    limits: ReconciliationLimits,
 ) -> Result<(), ProviderError> {
     let candidate_target = (*target_open_time).max(candidate);
-    if let ReconciliationPolicy::Bounded(limits) = policy
-        && !gap_target_within_generation_span(
-            timeframe,
-            generation_start,
-            candidate_target,
-            limits.max_successors,
-        )
-    {
+    if !gap_target_within_generation_span(
+        timeframe,
+        generation_start,
+        candidate_target,
+        limits.max_successors,
+    ) {
         return Err(ProviderError::Protocol {
             context: ErrorContext::operation(ErrorOperation::Reconciliation),
             detail: limits.span_exceeded,
@@ -249,45 +240,40 @@ pub(crate) fn apply_reconciliation_candle(
     target_open_time: &mut i64,
     generation_start: i64,
     timeframe: Timeframe,
-    policy: ReconciliationPolicy,
+    limits: ReconciliationLimits,
 ) -> Result<bool, ProviderError> {
     let open_time = candidate.open_time();
-    if let ReconciliationPolicy::Bounded(limits) = policy {
-        let distinct_limit =
-            limits
-                .max_successors
-                .checked_add(1)
-                .ok_or(ProviderError::Invariant(
-                    "reconciliation buffer bound overflow",
-                ))?;
-        if !pending.contains_key(open_time) && pending.len() >= distinct_limit {
-            return Err(ProviderError::Protocol {
-                context: ErrorContext::operation(ErrorOperation::Reconciliation),
-                detail: limits.distinct_exceeded,
-            });
-        }
+    let distinct_limit = limits
+        .max_successors
+        .checked_add(1)
+        .ok_or(ProviderError::Invariant(
+            "reconciliation buffer bound overflow",
+        ))?;
+    if !pending.contains_key(open_time) && pending.len() >= distinct_limit {
+        return Err(ProviderError::Protocol {
+            context: ErrorContext::operation(ErrorOperation::Reconciliation),
+            detail: limits.distinct_exceeded,
+        });
     }
     advance_reconciliation_target(
         target_open_time,
         open_time,
         generation_start,
         timeframe,
-        policy,
+        limits,
     )?;
     pending.push(candidate)
 }
 
 pub(crate) fn advance_reconciliation_page(
     pages: &mut usize,
-    policy: ReconciliationPolicy,
+    limits: ReconciliationLimits,
     context: ErrorContext,
 ) -> Result<(), ProviderError> {
     *pages = pages.checked_add(1).ok_or(ProviderError::Invariant(
         "reconciliation page count overflow",
     ))?;
-    if let ReconciliationPolicy::Bounded(limits) = policy
-        && *pages > limits.max_pages
-    {
+    if *pages > limits.max_pages {
         return Err(ProviderError::Protocol {
             context,
             detail: limits.page_exceeded,
@@ -378,18 +364,18 @@ pub fn reconciliation_page_guard_for_test(
     pages: usize,
     maximum_pages: usize,
 ) -> Result<(), ProviderError> {
-    let policy = ReconciliationPolicy::Bounded(ReconciliationLimits {
+    let limits = ReconciliationLimits {
         max_successors: 1,
         max_pages: maximum_pages,
         span_exceeded: "span",
         page_exceeded: "Hyperliquid gap reconciliation exceeded the per-generation page limit",
         distinct_exceeded: "distinct",
-    });
+    };
     let mut observed = 0;
     for _ in 0..pages {
         advance_reconciliation_page(
             &mut observed,
-            policy,
+            limits,
             ErrorContext::operation(ErrorOperation::Reconciliation),
         )?;
     }
@@ -560,7 +546,7 @@ struct LiveEngine<A: LiveAdapter> {
     config: LiveSupervisorConfig,
     gate_snapshot: RateGateSnapshot,
     process_block: ProcessBlockPolicy,
-    reconciliation: ReconciliationPolicy,
+    reconciliation: ReconciliationLimits,
     rotation: ConnectionRotation,
     gap_page_limit: NonZeroU16,
 }
@@ -605,7 +591,7 @@ fn buffer_reconciliation_candle(
     target_open_time: &mut i64,
     generation_start: i64,
     timeframe: Timeframe,
-    policy: ReconciliationPolicy,
+    limits: ReconciliationLimits,
 ) -> Result<(), ProviderError> {
     let _ = apply_reconciliation_candle(
         pending,
@@ -613,7 +599,7 @@ fn buffer_reconciliation_candle(
         target_open_time,
         generation_start,
         timeframe,
-        policy,
+        limits,
     )?;
     revision.0 = revision
         .0

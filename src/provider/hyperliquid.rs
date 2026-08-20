@@ -45,7 +45,7 @@ use crate::{
     provider::runtime::{
         live::{
             ConnectionRotation, LiveAdapter, LiveConfig, LiveRateGate, LiveSocket, LiveSocketEvent,
-            ProcessBlockPolicy, ReconciliationLimits, ReconciliationPolicy,
+            ProcessBlockPolicy, ReconciliationLimits,
         },
         websocket::{
             DecodedFrame, ReadinessInput, WsCodec, WsConfig, connect_websocket_url,
@@ -587,6 +587,18 @@ pub struct HyperliquidProvider {
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     now_ms: Option<i64>,
 }
+struct HyperliquidBuildConfig {
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    base_url: Url,
+    request_timeout: Duration,
+    body_limit: usize,
+    rate_limit_fallback: Duration,
+    live: HyperliquidLiveConfig,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    ws_base_url: Option<String>,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    now_ms: Option<i64>,
+}
 
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[derive(Clone, Debug)]
@@ -634,10 +646,12 @@ impl HyperliquidProvider {
     pub fn new(clock: Arc<dyn Clock>) -> Result<Self, ProviderError> {
         Self::build(
             clock,
-            REST_REQUEST_TIMEOUT,
-            REST_BODY_LIMIT,
-            RATE_LIMIT_FALLBACK,
-            HyperliquidLiveConfig::default(),
+            HyperliquidBuildConfig {
+                request_timeout: REST_REQUEST_TIMEOUT,
+                body_limit: REST_BODY_LIMIT,
+                rate_limit_fallback: RATE_LIMIT_FALLBACK,
+                live: HyperliquidLiveConfig::default(),
+            },
         )
     }
 
@@ -659,14 +673,16 @@ impl HyperliquidProvider {
     ) -> Result<Self, ProviderError> {
         let base_url = validate_loopback_base(&config.base_url)?;
         Self::build(
-            base_url,
             clock,
-            config.request_timeout,
-            config.body_limit,
-            config.rate_limit_fallback,
-            HyperliquidLiveConfig::default(),
-            None,
-            config.now_ms,
+            HyperliquidBuildConfig {
+                base_url,
+                request_timeout: config.request_timeout,
+                body_limit: config.body_limit,
+                rate_limit_fallback: config.rate_limit_fallback,
+                live: HyperliquidLiveConfig::default(),
+                ws_base_url: None,
+                now_ms: config.now_ms,
+            },
         )
     }
 
@@ -678,51 +694,45 @@ impl HyperliquidProvider {
         let base_url = validate_loopback_base(&config.rest.base_url)?;
         validate_loopback_ws_base(&config.ws_base_url)?;
         Self::build(
-            base_url,
             clock,
-            config.rest.request_timeout,
-            config.rest.body_limit,
-            config.rest.rate_limit_fallback,
-            config.live,
-            Some(config.ws_base_url),
-            config.rest.now_ms,
+            HyperliquidBuildConfig {
+                base_url,
+                request_timeout: config.rest.request_timeout,
+                body_limit: config.rest.body_limit,
+                rate_limit_fallback: config.rest.rate_limit_fallback,
+                live: config.live,
+                ws_base_url: Some(config.ws_base_url),
+                now_ms: config.rest.now_ms,
+            },
         )
     }
 
-    fn build(
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        base_url: Url,
-        clock: Arc<dyn Clock>,
-        request_timeout: Duration,
-        body_limit: usize,
-        rate_limit_fallback: Duration,
-        live: HyperliquidLiveConfig,
-        #[cfg(all(
-            feature = "test-transport",
-            not(feature = "production-transport")
-        ))]
-        ws_base_url: Option<String>,
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        now_ms: Option<i64>,
-    ) -> Result<Self, ProviderError> {
-        if request_timeout.is_zero() || body_limit == 0 || rate_limit_fallback.is_zero() {
+    fn build(clock: Arc<dyn Clock>, config: HyperliquidBuildConfig) -> Result<Self, ProviderError> {
+        if config.request_timeout.is_zero()
+            || config.body_limit == 0
+            || config.rate_limit_fallback.is_zero()
+        {
             return Err(ProviderError::Configuration(
                 "REST timeout, body limit, and fallback must be positive",
             ));
         }
-        live.validate()?;
-        let http = HttpRuntime::new(Arc::clone(&clock), request_timeout, body_limit)?;
+        config.live.validate()?;
+        let http = HttpRuntime::new(
+            Arc::clone(&clock),
+            config.request_timeout,
+            config.body_limit,
+        )?;
         Ok(Self {
             http,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            base_url,
+            base_url: config.base_url,
             clock,
-            rate_limit_fallback,
-            live,
+            rate_limit_fallback: config.rate_limit_fallback,
+            live: config.live,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            ws_base_url,
+            ws_base_url: config.ws_base_url,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            now_ms,
+            now_ms: config.now_ms,
         })
     }
 
@@ -787,13 +797,15 @@ impl HyperliquidProvider {
             )?;
             decode_candles(
                 &bytes,
-                request.kind(),
-                request.limit(),
-                instrument,
-                timeframe,
-                window_start,
-                window_end,
-                context,
+                CandleDecodeContext {
+                    kind: request.kind(),
+                    requested_limit: request.limit(),
+                    instrument,
+                    timeframe,
+                    window_start,
+                    window_end,
+                    error: context,
+                },
             )
         }
         #[cfg(all(feature = "production-transport", feature = "test-transport"))]
@@ -900,7 +912,7 @@ impl HyperliquidProvider {
     fn history_page_limit(&self) -> u16 {
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         {
-            return self.live.advertised_history_page_limit;
+            self.live.advertised_history_page_limit
         }
         #[cfg(any(
             all(feature = "production-transport", not(feature = "test-transport")),
@@ -1171,13 +1183,13 @@ impl LiveAdapter for HyperliquidLiveAdapter {
         let max_successors = MAX_GAP_RECONCILIATION_CANDLES;
         LiveConfig {
             supervisor: &self.provider.live.supervisor,
-            reconciliation: ReconciliationPolicy::Bounded(ReconciliationLimits {
+            reconciliation: ReconciliationLimits {
                 max_successors,
                 max_pages: MAX_GAP_RECONCILIATION_PAGES,
                 span_exceeded: "Hyperliquid gap reconciliation target exceeds the per-generation span limit",
                 page_exceeded: "Hyperliquid gap reconciliation exceeded the per-generation page limit",
                 distinct_exceeded: "Hyperliquid gap reconciliation exceeded the distinct buffered-candle limit",
-            }),
+            },
         }
     }
 
@@ -1239,12 +1251,12 @@ impl MarketDataProvider for HyperliquidProvider {
             let adapter = HyperliquidLiveAdapter::new(self.clone());
             let clock = Arc::clone(&self.clock);
             let capabilities = MarketDataProvider::capabilities(self);
-            return Box::pin(crate::provider::runtime::live::open_live(
+            Box::pin(crate::provider::runtime::live::open_live(
                 adapter,
                 clock,
                 capabilities,
                 request,
-            ));
+            ))
         }
         #[cfg(all(feature = "production-transport", feature = "test-transport"))]
         {
@@ -1260,18 +1272,22 @@ impl MarketDataProvider for HyperliquidProvider {
 }
 
 const OVERSIZED_CANDLE_ARRAY: &str = "Hyperliquid candle row limit exceeded";
-
-struct BoundedCandleVisitor<'a> {
+struct CandleDecodeContext<'a> {
     kind: HistoryRequestKind,
-    requested_limit: usize,
+    requested_limit: u16,
     instrument: &'a Instrument,
     timeframe: Timeframe,
     window_start: i64,
     window_end: i64,
-    context: &'a ErrorContext,
+    error: ErrorContext,
 }
 
-impl<'de> Visitor<'de> for BoundedCandleVisitor<'_> {
+struct BoundedCandleVisitor<'decode, 'instrument> {
+    decode: &'decode CandleDecodeContext<'instrument>,
+    requested_limit: usize,
+}
+
+impl<'de> Visitor<'de> for BoundedCandleVisitor<'_, '_> {
     type Value = Vec<Candle>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1290,20 +1306,26 @@ impl<'de> Visitor<'de> for BoundedCandleVisitor<'_> {
                 return Ok(candles.into_iter().collect());
             };
             row_count += 1;
-            candle_market_matches(&raw, self.instrument, self.timeframe, self.context, "REST")
-                .map_err(serde::de::Error::custom)?;
+            candle_market_matches(
+                &raw,
+                self.decode.instrument,
+                self.decode.timeframe,
+                &self.decode.error,
+                "REST",
+            )
+            .map_err(serde::de::Error::custom)?;
             validate_rest_candle_time_window(
                 &raw,
-                self.timeframe,
-                self.window_start,
-                self.window_end,
+                self.decode.timeframe,
+                self.decode.window_start,
+                self.decode.window_end,
                 previous_open,
-                self.context,
+                &self.decode.error,
             )
             .map_err(serde::de::Error::custom)?;
             previous_open = Some(raw.open_time);
             let (open, high, low, close, volume) =
-                candle_ohlcv(&raw, self.context).map_err(serde::de::Error::custom)?;
+                candle_ohlcv(&raw, &self.decode.error).map_err(serde::de::Error::custom)?;
             let candle = Candle::from_rest(
                 raw.open_time,
                 raw.close_time,
@@ -1314,7 +1336,7 @@ impl<'de> Visitor<'de> for BoundedCandleVisitor<'_> {
                 volume,
             )
             .map_err(serde::de::Error::custom)?;
-            match self.kind {
+            match self.decode.kind {
                 HistoryRequestKind::Latest | HistoryRequestKind::Older => {
                     if candles.len() == self.requested_limit {
                         candles.pop_front();
@@ -1337,13 +1359,7 @@ impl<'de> Visitor<'de> for BoundedCandleVisitor<'_> {
 
 fn decode_candles(
     bytes: &[u8],
-    kind: HistoryRequestKind,
-    requested_limit: u16,
-    instrument: &Instrument,
-    timeframe: Timeframe,
-    window_start: i64,
-    window_end: i64,
-    context: ErrorContext,
+    decode: CandleDecodeContext<'_>,
 ) -> Result<Vec<Candle>, ProviderError> {
     if bytes
         .iter()
@@ -1352,39 +1368,28 @@ fn decode_candles(
         != Some(b'[')
     {
         let value: Value = serde_json::from_slice(bytes)
-            .map_err(|_| payload(&context, PayloadError::MalformedJson))?;
+            .map_err(|_| payload(&decode.error, PayloadError::MalformedJson))?;
         if let Some(error) = info_error_text(&value) {
-            return Err(invalid_hyperliquid_symbol(context, error));
+            return Err(invalid_hyperliquid_symbol(decode.error, error));
         }
-        return Err(payload(&context, PayloadError::ExpectedArray));
+        return Err(payload(&decode.error, PayloadError::ExpectedArray));
     }
-    let requested_limit = usize::from(requested_limit);
+    let requested_limit = usize::from(decode.requested_limit);
     if !(1..=1000).contains(&requested_limit) {
-        return Err(payload(&context, PayloadError::MalformedProtocol));
+        return Err(payload(&decode.error, PayloadError::MalformedProtocol));
     }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let candles = serde::de::Deserializer::deserialize_seq(
         &mut deserializer,
         BoundedCandleVisitor {
-            kind,
+            decode: &decode,
             requested_limit,
-            instrument,
-            timeframe,
-            window_start,
-            window_end,
-            context: &context,
         },
     )
-    .map_err(|error| {
-        if error.to_string().contains(OVERSIZED_CANDLE_ARRAY) {
-            payload(&context, PayloadError::MalformedProtocol)
-        } else {
-            payload(&context, PayloadError::MalformedProtocol)
-        }
-    })?;
+    .map_err(|_| payload(&decode.error, PayloadError::MalformedProtocol))?;
     deserializer
         .end()
-        .map_err(|_| payload(&context, PayloadError::MalformedJson))?;
+        .map_err(|_| payload(&decode.error, PayloadError::MalformedJson))?;
     Ok(candles)
 }
 fn response_validation_window(

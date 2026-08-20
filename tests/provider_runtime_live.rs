@@ -24,8 +24,8 @@ use fccli::{
             ConnectionRotation, LiveAdapter, LiveCompletionDisposition, LiveConfig,
             LiveErrorDisposition, LiveInBandEventDisposition, LiveInputClassification,
             LiveRateGate, LiveSocket, LiveSocketEvent, LiveSupervisorConfig, ProcessBlockPolicy,
-            ReconciliationLimits, ReconciliationPolicy, classify_live_error_for_test,
-            classify_live_input_for_test, gap_target_within_generation_span_for_test, open_live,
+            ReconciliationLimits, classify_live_error_for_test, classify_live_input_for_test,
+            gap_target_within_generation_span_for_test, open_live,
             reconciliation_distinct_key_allowed_for_test, reconciliation_page_guard_for_test,
         },
     },
@@ -307,13 +307,11 @@ struct HarnessSocket {
 }
 
 impl LiveSocket for HarnessSocket {
-    fn read(&mut self) -> impl Future<Output = Result<LiveSocketEvent, ProviderError>> + Send + '_ {
-        async move {
-            self.events
-                .recv()
-                .await
-                .unwrap_or_else(|| Ok(LiveSocketEvent::ReconnectRequested))
-        }
+    async fn read(&mut self) -> Result<LiveSocketEvent, ProviderError> {
+        self.events
+            .recv()
+            .await
+            .unwrap_or(Ok(LiveSocketEvent::ReconnectRequested))
     }
 
     fn after_gap_sync_test_probe(
@@ -334,7 +332,7 @@ struct HarnessAdapter {
     history: Arc<Mutex<VecDeque<HistoryStep>>>,
     supervisor: LiveSupervisorConfig,
     gate: fccli::provider::RateGateSnapshot,
-    reconciliation: ReconciliationPolicy,
+    reconciliation: ReconciliationLimits,
 }
 
 impl LiveAdapter for HarnessAdapter {
@@ -437,13 +435,13 @@ impl Harness {
                 history: Arc::new(Mutex::new(history)),
                 supervisor,
                 gate,
-                reconciliation: ReconciliationPolicy::Bounded(ReconciliationLimits {
+                reconciliation: ReconciliationLimits {
                     max_successors: 64_000,
                     max_pages: 64,
                     span_exceeded: "runtime reconciliation span exceeded",
                     page_exceeded: "runtime reconciliation page limit exceeded",
                     distinct_exceeded: "runtime reconciliation distinct buffer exceeded",
-                }),
+                },
             },
             socket_senders,
             history_started,
@@ -459,13 +457,13 @@ impl Harness {
     }
 
     fn with_limits(mut self, max_successors: usize, max_pages: usize) -> Self {
-        self.adapter.reconciliation = ReconciliationPolicy::Bounded(ReconciliationLimits {
+        self.adapter.reconciliation = ReconciliationLimits {
             max_successors,
             max_pages,
             span_exceeded: "runtime reconciliation span exceeded",
             page_exceeded: "runtime reconciliation page limit exceeded",
             distinct_exceeded: "runtime reconciliation distinct buffer exceeded",
-        });
+        };
         self
     }
 
@@ -1118,8 +1116,10 @@ async fn cancellation_precedes_ready_history_and_first_candle_timeout_uses_manua
 
 #[tokio::test]
 async fn acknowledgement_timeout_fires_at_exact_boundary_purges_backs_off_and_retries() {
-    let mut supervisor = LiveSupervisorConfig::default();
-    supervisor.reconcile_ack_timeout = Duration::from_secs(5);
+    let supervisor = LiveSupervisorConfig {
+        reconcile_ack_timeout: Duration::from_secs(5),
+        ..LiveSupervisorConfig::default()
+    };
     let mut harness = Harness::new(2, 1, supervisor);
     let (mut feed, _watermark, _ack, cancellation) = harness.open(Some(OPEN)).await;
     harness.socket_senders[0]
@@ -1366,8 +1366,10 @@ async fn retry_deadline_is_maximum_of_rate_gate_and_backoff_in_both_directions()
 #[tokio::test]
 async fn reconnect_invalidates_an_actually_queued_generation_event() {
     let invalidated = Arc::new(tokio::sync::Notify::new());
-    let mut supervisor = LiveSupervisorConfig::default();
-    supervisor.generation_invalidated_test_hook = Some(Arc::clone(&invalidated));
+    let supervisor = LiveSupervisorConfig {
+        generation_invalidated_test_hook: Some(Arc::clone(&invalidated)),
+        ..LiveSupervisorConfig::default()
+    };
     let mut harness = Harness::new(2, 1, supervisor);
     let (mut feed, _watermark, ack, cancellation) = harness.open(Some(OPEN)).await;
     let generation = establish_connected(&mut harness, &mut feed, &ack).await;
@@ -1405,11 +1407,13 @@ async fn reconnect_invalidates_an_actually_queued_generation_event() {
 
 #[tokio::test]
 async fn saturation_emergency_barrier_blocks_retry_until_both_envelopes_are_dequeued() {
-    let mut supervisor = LiveSupervisorConfig::default();
-    supervisor.keyed_candle_capacity = 1;
-    supervisor.market_event_capacity = 1;
     let saturation = Arc::new(tokio::sync::Notify::new());
-    supervisor.saturation_test_hook = Some(Arc::clone(&saturation));
+    let supervisor = LiveSupervisorConfig {
+        keyed_candle_capacity: 1,
+        market_event_capacity: 1,
+        saturation_test_hook: Some(Arc::clone(&saturation)),
+        ..LiveSupervisorConfig::default()
+    };
     let mut harness = Harness::new(2, 1, supervisor);
     let (mut feed, _watermark, ack, cancellation) = harness.open(Some(OPEN)).await;
     assert_eq!(
