@@ -112,6 +112,8 @@ pub struct LiveSupervisorConfig {
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub subscribe_flush_test_hook: Option<SubscribeFlushTestHook>,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    pub close_flush_test_hook: Option<CloseFlushTestHook>,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub force_stalled_write_after_readiness_frame: bool,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub max_gap_reconciliation_candles_for_test: usize,
@@ -142,6 +144,8 @@ impl Default for LiveSupervisorConfig {
             readiness_drain_budget_test_hook: None,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             subscribe_flush_test_hook: None,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            close_flush_test_hook: None,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             force_stalled_write_after_readiness_frame: false,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -364,6 +368,13 @@ pub struct ReadinessDrainBudgetTestHook {
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[derive(Clone, Debug)]
 pub struct SubscribeFlushTestHook {
+    pub blocked: Arc<Notify>,
+    pub release: Arc<Notify>,
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+#[derive(Clone, Debug)]
+pub struct CloseFlushTestHook {
     pub blocked: Arc<Notify>,
     pub release: Arc<Notify>,
 }
@@ -644,7 +655,7 @@ pub struct RawWebSocket {
     pending_terminal_error: Option<ProviderError>,
     stalled_write_error: Option<ProviderError>,
     next_application_ping: Option<tokio::time::Instant>,
-    peer_close_outcome: Option<DecodedFrame>,
+    peer_close_received: bool,
     readiness_drain_yielded: bool,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     heartbeat_test_hook: Option<HeartbeatTestHook>,
@@ -658,6 +669,8 @@ pub struct RawWebSocket {
     force_stalled_write_after_readiness_frame: bool,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     subscribe_flush_test_hook: Option<SubscribeFlushTestHook>,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    close_flush_test_hook: Option<CloseFlushTestHook>,
 }
 
 impl RawWebSocket {
@@ -862,9 +875,7 @@ impl RawWebSocket {
         report_to_writer: bool,
     ) -> Result<(), ProviderError> {
         let error = self.stalled_write_error.clone().unwrap_or(error);
-        if let Some(close) = self.peer_close_outcome.take() {
-            self.decoded.push_back(close);
-        }
+        self.peer_close_received = false;
         self.finish_terminal_io();
         if !self.decoded.is_empty() {
             if self.pending_terminal_error.is_none() {
@@ -978,10 +989,6 @@ impl RawWebSocket {
         let mut readiness_frames = 0;
         loop {
             if readiness && readiness_frames == READINESS_DRAIN_POLL_BUDGET {
-                if let Some(close) = self.peer_close_outcome.take() {
-                    self.decoded.push_back(close);
-                    coalesce_readiness_outcomes(&mut self.decoded);
-                }
                 self.readiness_drain_yielded = true;
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
@@ -1013,13 +1020,13 @@ impl RawWebSocket {
                         &self.config,
                         &mut self.decoded,
                     );
-                    if let Some(close_index) = self
+                    if self
                         .decoded
                         .iter()
-                        .position(|decoded| matches!(decoded, DecodedFrame::Close(_)))
+                        .any(|decoded| matches!(decoded, DecodedFrame::Close(_)))
                     {
                         self.outbound.clear();
-                        self.peer_close_outcome = self.decoded.remove(close_index);
+                        self.peer_close_received = true;
                     }
                     made_progress = true;
                     if readiness {
@@ -1049,7 +1056,7 @@ impl RawWebSocket {
             return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
         }
         if self.stalled_write_error.is_none()
-            && self.peer_close_outcome.is_none()
+            && !self.peer_close_received
             && let Some(message) = self.outbound.pop_front()
         {
             let mut stream = Pin::new(&mut self.stream);
@@ -1075,11 +1082,24 @@ impl RawWebSocket {
             }
         }
 
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        if self.peer_close_received
+            && let Some(hook) = self.close_flush_test_hook.take()
+        {
+            hook.blocked.notify_one();
+            let waker = cx.waker().clone();
+            tokio::spawn(async move {
+                hook.release.notified().await;
+                waker.wake();
+            });
+            return Poll::Pending;
+        }
+
         match Sink::<Message>::poll_flush(Pin::new(&mut self.stream), cx) {
             Poll::Ready(Ok(())) => {
                 self.flush_pending = false;
-                if let Some(close) = self.peer_close_outcome.take() {
-                    self.decoded.push_back(close);
+                if self.peer_close_received {
+                    self.peer_close_received = false;
                     let error = ProviderError::Transport {
                         context: self.context.clone(),
                         cause: SanitizedCause::Closed,
@@ -1162,11 +1182,13 @@ async fn connect_websocket_url(
         pending_terminal_error: None,
         stalled_write_error: None,
         next_application_ping: None,
-        peer_close_outcome: None,
+        peer_close_received: false,
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         heartbeat_test_hook: None,
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         subscribe_flush_test_hook: None,
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        close_flush_test_hook: None,
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         readiness_inactivity_test_hook: None,
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -1894,6 +1916,7 @@ impl HyperliquidProvider {
                 self.live.readiness_decoded_ack_test_hook.clone();
             socket.readiness_drain_budget_test_hook =
                 self.live.readiness_drain_budget_test_hook.clone();
+            socket.close_flush_test_hook = self.live.close_flush_test_hook.clone();
             socket.force_stalled_write_after_readiness_frame =
                 self.live.force_stalled_write_after_readiness_frame;
         }
@@ -2024,12 +2047,12 @@ impl HyperliquidProvider {
                         "Hyperliquid gap reconciliation target exceeds the per-generation span limit",
                     )));
                 }
-                reconciliation_pages += 1;
-                if reconciliation_pages > MAX_GAP_RECONCILIATION_PAGES {
-                    return Ok(GenerationOutcome::Reconnect(live_protocol_error(
-                        request,
-                        "Hyperliquid gap reconciliation exceeded the per-generation page limit",
-                    )));
+                if let Err(error) = advance_reconciliation_page(
+                    &mut reconciliation_pages,
+                    ErrorContext::operation(ErrorOperation::Reconciliation)
+                        .with_market(&request.instrument, request.timeframe),
+                ) {
+                    return Ok(GenerationOutcome::Reconnect(error));
                 }
                 let request_target = target_open_time;
                 let history_request =
@@ -3103,12 +3126,7 @@ fn apply_reconciliation_candle(
         .ok_or(ProviderError::Invariant(
             "reconciliation buffer bound overflow",
         ))?;
-    if !pending.contains_key(&open_time) && pending.len() >= distinct_key_limit {
-        return Err(ProviderError::Protocol {
-            context: ErrorContext::operation(ErrorOperation::Reconciliation),
-            detail: "Hyperliquid gap reconciliation target exceeds the per-generation span limit",
-        });
-    }
+    ensure_reconciliation_buffer_capacity(pending, open_time, distinct_key_limit)?;
     advance_reconciliation_target(
         target_open_time,
         open_time,
@@ -3122,6 +3140,70 @@ fn apply_reconciliation_candle(
         .checked_add(1)
         .ok_or(ProviderError::Invariant("replay revision overflow"))?;
     Ok(())
+}
+
+fn ensure_reconciliation_buffer_capacity(
+    pending: &BTreeMap<i64, Candle>,
+    open_time: i64,
+    distinct_key_limit: usize,
+) -> Result<(), ProviderError> {
+    if !reconciliation_distinct_key_allowed(
+        pending.len(),
+        pending.contains_key(&open_time),
+        distinct_key_limit,
+    ) {
+        return Err(ProviderError::Protocol {
+            context: ErrorContext::operation(ErrorOperation::Reconciliation),
+            detail: "Hyperliquid gap reconciliation exceeded the distinct buffered-candle limit",
+        });
+    }
+    Ok(())
+}
+
+fn reconciliation_distinct_key_allowed(
+    existing_len: usize,
+    key_exists: bool,
+    distinct_key_limit: usize,
+) -> bool {
+    key_exists || existing_len < distinct_key_limit
+}
+
+fn advance_reconciliation_page(
+    pages: &mut usize,
+    context: ErrorContext,
+) -> Result<(), ProviderError> {
+    *pages = pages.checked_add(1).ok_or(ProviderError::Invariant(
+        "reconciliation page count overflow",
+    ))?;
+    if *pages > MAX_GAP_RECONCILIATION_PAGES {
+        return Err(ProviderError::Protocol {
+            context,
+            detail: "Hyperliquid gap reconciliation exceeded the per-generation page limit",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+pub fn reconciliation_page_guard_for_test(pages: usize) -> Result<(), ProviderError> {
+    let mut observed = 0;
+    for _ in 0..pages {
+        advance_reconciliation_page(
+            &mut observed,
+            ErrorContext::operation(ErrorOperation::Reconciliation),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+#[must_use]
+pub fn reconciliation_distinct_key_allowed_for_test(existing_len: usize, key_exists: bool) -> bool {
+    reconciliation_distinct_key_allowed(
+        existing_len,
+        key_exists,
+        MAX_GAP_RECONCILIATION_CANDLES + 1,
+    )
 }
 
 fn coalesce_candle(pending: &mut BTreeMap<i64, Candle>, candidate: Candle) -> bool {
@@ -3493,17 +3575,69 @@ fn gap_target_within_generation_span(
     target: i64,
     maximum_candles: usize,
 ) -> bool {
-    let mut cursor = start;
-    for _ in 0..maximum_candles {
-        if cursor >= target {
-            return true;
-        }
-        let Some(next) = timeframe_successor_open(timeframe, cursor) else {
+    if target < start {
+        return true;
+    }
+    if timeframe == Timeframe::Month1 {
+        let Some(start_month) = calendar_month_index(start) else {
             return false;
         };
-        cursor = next;
+        let Some(target_month) = calendar_month_index(target) else {
+            return false;
+        };
+        return target_month
+            .checked_sub(start_month)
+            .and_then(|distance| usize::try_from(distance).ok())
+            .is_some_and(|distance| distance <= maximum_candles);
     }
-    cursor >= target
+    let Some(interval) = fixed_timeframe_milliseconds(timeframe) else {
+        return false;
+    };
+    if start.rem_euclid(interval) != 0 || target.rem_euclid(interval) != 0 {
+        return false;
+    }
+    target
+        .checked_sub(start)
+        .and_then(|distance| {
+            i64::try_from(maximum_candles)
+                .ok()
+                .and_then(|maximum| interval.checked_mul(maximum))
+                .map(|maximum| distance <= maximum)
+        })
+        .unwrap_or(false)
+}
+
+fn fixed_timeframe_milliseconds(timeframe: Timeframe) -> Option<i64> {
+    match timeframe {
+        Timeframe::Second1 => Some(1_000),
+        Timeframe::Minute1 => Some(60_000),
+        Timeframe::Minute3 => Some(180_000),
+        Timeframe::Minute5 => Some(300_000),
+        Timeframe::Minute15 => Some(900_000),
+        Timeframe::Minute30 => Some(1_800_000),
+        Timeframe::Hour1 => Some(3_600_000),
+        Timeframe::Hour2 => Some(7_200_000),
+        Timeframe::Hour4 => Some(14_400_000),
+        Timeframe::Hour6 => Some(21_600_000),
+        Timeframe::Hour8 => Some(28_800_000),
+        Timeframe::Hour12 => Some(43_200_000),
+        Timeframe::Day1 => Some(86_400_000),
+        Timeframe::Day3 => Some(259_200_000),
+        Timeframe::Week1 => Some(604_800_000),
+        Timeframe::Month1 => None,
+    }
+}
+
+fn calendar_month_index(open_time: i64) -> Option<i64> {
+    let timestamp =
+        OffsetDateTime::from_unix_timestamp_nanos(i128::from(open_time) * 1_000_000).ok()?;
+    if timestamp.time() != time::Time::MIDNIGHT || timestamp.day() != 1 {
+        return None;
+    }
+    let month = i64::from(u8::from(timestamp.month()));
+    i64::from(timestamp.year())
+        .checked_mul(12)?
+        .checked_add(month - 1)
 }
 
 fn timeframe_successor_open(timeframe: Timeframe, open_time: i64) -> Option<i64> {
