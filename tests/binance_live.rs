@@ -1,6 +1,12 @@
 #![cfg(feature = "test-transport")]
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use fccli::{
     clock::{Clock, ManualClock},
@@ -12,7 +18,7 @@ use fccli::{
         ConnectionStatus, GapGeneration, HistoryRequest, Instrument, InstrumentSpec, Market,
         MarketEvent, MonoInstant, ProviderId, RateGateState, ReplayRevision, Timeframe,
     },
-    provider::binance::{BinanceProvider, BinanceTestConfig, MAX_CONNECTION_AGE},
+    provider::binance::{BinanceProvider, BinanceTestConfig, MAX_CONNECTION_AGE, decode_ws_frame},
     provider::{
         CONTROL_CAPACITY, CancellationToken, EMERGENCY_CONTROL_CAPACITY,
         FIRST_KLINE_HANDSHAKE_TIMEOUT, KEYED_CANDLE_CAPACITY, LiveCompletionDisposition,
@@ -21,6 +27,7 @@ use fccli::{
         ProducerCompletion, ProviderRegistry, RECONCILE_ACK_TIMEOUT, ReconcileAck,
         ReconcileAckPublishError, accepted_watermark_channel, classify_live_error_for_test,
         classify_live_input_for_test, reconcile_ack_channel,
+        test_transport::{DecodedFrame, WsConfig},
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -72,13 +79,32 @@ fn ws_kline(open_time: i64, closed: bool, close: &str) -> String {
 }
 
 fn ws_kline_for(open_time: i64, closed: bool, close: &str, interval: &str) -> String {
+    let close_time = if interval == "1M" {
+        let date = time::OffsetDateTime::from_unix_timestamp(open_time / 1_000)
+            .expect("monthly open timestamp")
+            .date();
+        let (year, month) = if date.month() == time::Month::December {
+            (date.year() + 1, time::Month::January)
+        } else {
+            (date.year(), date.month().next())
+        };
+        time::Date::from_calendar_date(year, month, 1)
+            .expect("next monthly open")
+            .midnight()
+            .assume_utc()
+            .unix_timestamp()
+            * 1_000
+            - 1
+    } else {
+        open_time + 59_999
+    };
     json!({
         "e": "kline",
-        "E": open_time + 60_001,
+        "E": close_time + 2,
         "s": "BTCUSDT",
         "k": {
             "t": open_time,
-            "T": open_time + 59_999,
+            "T": close_time,
             "s": "BTCUSDT",
             "i": interval,
             "o": "37000.00",
@@ -296,7 +322,120 @@ async fn next_batch(
             target_open_time,
             candles,
         } => (generation, revision, target_open_time, candles),
+
         other => panic!("expected reconcile batch, got {other:?}"),
+    }
+}
+#[test]
+fn binance_live_rejects_off_grid_bad_close_and_far_future_candles_before_state_use() {
+    let config = WsConfig::default();
+    let malformed = |open_time: i64, close_time: i64| {
+        Message::Text(
+            json!({
+                "e": "kline",
+                "s": "BTCUSDT",
+                "k": {
+                    "t": open_time,
+                    "T": close_time,
+                    "s": "BTCUSDT",
+                    "i": "1m",
+                    "o": "37000.00",
+                    "c": "37025.50",
+                    "h": "37200.00",
+                    "l": "36975.25",
+                    "v": "12.5",
+                    "x": false
+                }
+            })
+            .to_string()
+            .into(),
+        )
+    };
+    let far_future = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis(),
+    )
+    .expect("millisecond clock")
+        + 24 * 60 * 60 * 1_000;
+    for frame in [
+        malformed(OPEN_TIME + 1, OPEN_TIME + 60_000),
+        malformed(OPEN_TIME, OPEN_TIME + 60_000),
+        malformed(far_future, far_future + 59_999),
+    ] {
+        assert!(matches!(
+            decode_ws_frame(frame, &instrument(), Timeframe::Minute1, &config),
+            DecodedFrame::ProviderError(ProviderError::Payload {
+                source: PayloadError::MalformedProtocol,
+                ..
+            })
+        ));
+    }
+
+    assert!(matches!(
+        decode_ws_frame(
+            Message::Text(ws_kline(OPEN_TIME + 120_000, false, "37025.50").into()),
+            &instrument(),
+            Timeframe::Minute1,
+            &config,
+        ),
+        DecodedFrame::Provider(_)
+    ));
+}
+
+#[test]
+fn binance_live_accepts_calendar_month_lengths_and_rejects_invalid_month_boundaries() {
+    let config = WsConfig::default();
+    let month_open = |year, month| {
+        time::Date::from_calendar_date(year, month, 1)
+            .expect("valid month")
+            .midnight()
+            .assume_utc()
+            .unix_timestamp()
+            * 1_000
+    };
+
+    for open_time in [
+        month_open(2023, time::Month::February),
+        month_open(2024, time::Month::February),
+        month_open(2024, time::Month::December),
+    ] {
+        assert!(matches!(
+            decode_ws_frame(
+                Message::Text(ws_kline_for(open_time, false, "37025.50", "1M").into()),
+                &instrument(),
+                Timeframe::Month1,
+                &config,
+            ),
+            DecodedFrame::Provider(_)
+        ));
+    }
+
+    let january_open = month_open(2024, time::Month::January);
+    for (open_time, close_time) in [
+        (
+            january_open + 86_400_000,
+            month_open(2024, time::Month::February) - 1,
+        ),
+        (january_open, month_open(2024, time::Month::February)),
+    ] {
+        let mut frame: serde_json::Value =
+            serde_json::from_str(&ws_kline_for(open_time, false, "37025.50", "1M"))
+                .expect("monthly frame");
+        frame["k"]["T"] = json!(close_time);
+        assert!(matches!(
+            decode_ws_frame(
+                Message::Text(frame.to_string().into()),
+                &instrument(),
+                Timeframe::Month1,
+                &config,
+            ),
+            DecodedFrame::ProviderError(ProviderError::Payload {
+                source: PayloadError::MalformedProtocol,
+                ..
+            })
+        ));
     }
 }
 
@@ -2416,6 +2555,155 @@ async fn cancellation_is_dominant_in_first_kline_ack_connected_and_backoff_state
 }
 
 #[tokio::test]
+async fn reconciliation_request_64_succeeds_and_65_reconnects_before_network_io() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("REST listener");
+    let rest_uri = format!("http://{}", listener.local_addr().expect("REST address"));
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&request_count);
+    let rest_server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("REST accept");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.expect("REST request read");
+                assert!(read != 0, "REST request closed before headers");
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let index = observed.fetch_add(1, Ordering::SeqCst);
+            assert!(index < 64, "request 65 reached network I/O");
+            let body = serde_json::to_vec(&json!([rest_row(
+                OPEN_TIME + i64::try_from(index).expect("page index") * 60_000
+            )]))
+            .expect("REST JSON");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("REST headers");
+            stream.write_all(&body).await.expect("REST body");
+            stream.shutdown().await.expect("REST shutdown");
+        }
+    });
+    let (listener, ws_uri) = websocket_listener().await;
+    let ws_server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut websocket = accept_async(stream).await.expect("upgrade");
+        websocket
+            .send(Message::Text(
+                ws_kline(OPEN_TIME + 64 * 60_000, false, "37025.50").into(),
+            ))
+            .await
+            .expect("target candle");
+        futures_util::future::pending::<()>().await;
+    });
+    let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
+    let mut config = BinanceTestConfig::loopback(&rest_uri).with_websocket_base(&ws_uri);
+    config.advertised_history_page_limit = 1;
+    config.max_gap_reconciliation_pages = 64;
+    let provider = Arc::new(BinanceProvider::new_test_live(config, manual).expect("provider"));
+    let (request, _watermark_tx, _ack_tx) = request(Some(OPEN_TIME));
+    let mut feed = provider.open_live(request).await.expect("feed");
+    assert_status(
+        next_event(&mut feed).await,
+        Some(1),
+        ConnectionStatus::Connecting,
+    );
+    assert_status(
+        next_event(&mut feed).await,
+        Some(1),
+        ConnectionStatus::GapSync,
+    );
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::RecoverableError {
+            generation: Some(GapGeneration(1)),
+            error: ProviderError::Protocol {
+                detail: "Binance gap reconciliation exceeded the per-generation page limit",
+                ..
+            },
+            rate_gate_deadline: None,
+        }
+    ));
+    assert_eq!(request_count.load(Ordering::SeqCst), 64);
+    feed.request_shutdown();
+    ws_server.abort();
+    rest_server.abort();
+}
+
+#[tokio::test]
+async fn pending_history_rejects_distinct_successor_flood_before_additional_rest_work() {
+    let (rest_uri, rest_started_rx, _rest_release_tx, rest_server) =
+        held_rest_listener(json!([rest_row(OPEN_TIME)])).await;
+    let (listener, ws_uri) = websocket_listener().await;
+    let (flood_tx, flood_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut websocket = accept_async(stream).await.expect("upgrade");
+        websocket
+            .send(Message::Text(ws_kline(OPEN_TIME, false, "37025.50").into()))
+            .await
+            .expect("first candle");
+        flood_rx.await.expect("release successor flood");
+        for successor in 1..=4 {
+            websocket
+                .send(Message::Text(
+                    ws_kline(OPEN_TIME + successor * 60_000, false, "37025.50").into(),
+                ))
+                .await
+                .expect("successor candle");
+        }
+        futures_util::future::pending::<()>().await;
+    });
+    let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
+    let mut config = BinanceTestConfig::loopback(&rest_uri).with_websocket_base(&ws_uri);
+    config.max_gap_reconciliation_candles = 3;
+    config.max_gap_reconciliation_pages = 64;
+    let provider = Arc::new(BinanceProvider::new_test_live(config, manual).expect("provider"));
+    let (request, _watermark_tx, _ack_tx) = request(Some(OPEN_TIME));
+    let mut feed = provider.open_live(request).await.expect("feed");
+    assert_status(
+        next_event(&mut feed).await,
+        Some(1),
+        ConnectionStatus::Connecting,
+    );
+    assert_status(
+        next_event(&mut feed).await,
+        Some(1),
+        ConnectionStatus::GapSync,
+    );
+    rest_started_rx.await.expect("history request started");
+    flood_tx.send(()).expect("release flood");
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::RecoverableError {
+            generation: Some(GapGeneration(1)),
+            error: ProviderError::Protocol {
+                detail: "Binance gap reconciliation exceeded the distinct buffered-candle limit",
+                ..
+            },
+            rate_gate_deadline: None,
+        }
+    ));
+    assert_status(
+        next_event(&mut feed).await,
+        Some(1),
+        ConnectionStatus::Backoff,
+    );
+    feed.request_shutdown();
+    server.abort();
+    rest_server.abort();
+}
+
+#[tokio::test]
 async fn cancellation_dominates_a_held_rest_page() {
     let rest = MockServer::start().await;
     Mock::given(method("GET"))
@@ -3221,7 +3509,7 @@ fn supervisor_classifies_all_remaining_decoded_outcomes_and_errors() {
 #[tokio::test]
 async fn month1_multi_page_target_revision_race_uses_plus_one_cursor_and_latest_ack() {
     fn month_open(index: usize) -> i64 {
-        let absolute_month = 2000_i32 * 12 + 7 + i32::try_from(index).expect("month offset");
+        let absolute_month = 1940_i32 * 12 + 7 + i32::try_from(index).expect("month offset");
         let year = absolute_month.div_euclid(12);
         let month =
             time::Month::try_from(u8::try_from(absolute_month.rem_euclid(12) + 1).expect("month"))

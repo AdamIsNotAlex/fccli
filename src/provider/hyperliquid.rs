@@ -1160,7 +1160,7 @@ impl LiveAdapter for HyperliquidLiveAdapter {
                 max_successors,
                 max_pages: MAX_GAP_RECONCILIATION_PAGES,
                 span_exceeded: "Hyperliquid gap reconciliation target exceeds the per-generation span limit",
-                page_exceeded: "Hyperliquid gap reconciliation exceeded the page limit",
+                page_exceeded: "Hyperliquid gap reconciliation exceeded the per-generation page limit",
                 distinct_exceeded: "Hyperliquid gap reconciliation exceeded the distinct buffered-candle limit",
             }),
         }

@@ -963,6 +963,7 @@ impl<A: LiveAdapter> LiveEngine<A> {
         }
         let mut deferred_reconnect: Option<ProviderError> = None;
         let mut rest_synced_through = None;
+        let mut reconciliation_pages = 0;
 
         loop {
             let mut cursor = match rest_synced_through {
@@ -970,6 +971,12 @@ impl<A: LiveAdapter> LiveEngine<A> {
                 None => start,
             };
             while cursor <= target_open_time {
+                advance_reconciliation_page(
+                    &mut reconciliation_pages,
+                    self.reconciliation,
+                    ErrorContext::operation(ErrorOperation::Reconciliation)
+                        .with_market(&request.instrument, request.timeframe),
+                )?;
                 let request_target = target_open_time;
                 let history_request =
                     HistoryRequest::gap(cursor, request_target, self.gap_page_limit.get())

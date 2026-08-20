@@ -8,6 +8,7 @@ use serde::{
     de::{IgnoredAny, SeqAccess, Visitor},
 };
 use serde_json::Value;
+use time::{Date, Month, OffsetDateTime};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
@@ -28,7 +29,8 @@ use crate::{
         runtime::{
             live::{
                 ConnectionRotation, LiveAdapter, LiveConfig, LiveRateGate, LiveSocket,
-                LiveSocketEvent, LiveSupervisorConfig, ProcessBlockPolicy, ReconciliationPolicy,
+                LiveSocketEvent, LiveSupervisorConfig, ProcessBlockPolicy, ReconciliationLimits,
+                ReconciliationPolicy,
             },
             websocket::{
                 DecodedFrame, WsCodec, WsConfig, connect_websocket_url,
@@ -55,6 +57,9 @@ const PRODUCTION_SPOT_WS_BASE: &str = "wss://data-stream.binance.vision";
 const PRODUCTION_PERPETUAL_WS_BASE: &str = "wss://fstream.binance.com";
 
 pub const MAX_CONNECTION_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_FUTURE_CANDLE_SKEW: Duration = Duration::from_secs(5 * 60);
+const MAX_GAP_RECONCILIATION_CANDLES: usize = 64_000;
+const MAX_GAP_RECONCILIATION_PAGES: usize = 64;
 
 #[derive(Deserialize)]
 struct WsEnvelope {
@@ -288,6 +293,9 @@ fn decode_ws_payload(
             detail: "WebSocket kline market does not match subscription",
         });
     }
+    if let Err(error) = validate_live_candle_time_window(&kline, timeframe, &context) {
+        return DecodedFrame::ProviderError(error);
+    }
     let parse = |value: &str| {
         value
             .parse::<f64>()
@@ -321,6 +329,76 @@ fn decode_ws_payload(
         Ok(candle) => DecodedFrame::Provider(BinanceDecoded::Candle(candle)),
         Err(source) => DecodedFrame::ProviderError(ProviderError::Domain { context, source }),
     }
+}
+fn validate_live_candle_time_window(
+    candle: &WsKline,
+    timeframe: Timeframe,
+    context: &ErrorContext,
+) -> Result<(), ProviderError> {
+    let expected_close = timeframe_successor_open(timeframe, candle.open_time)
+        .and_then(|successor| successor.checked_sub(1));
+    let future_ceiling = unix_now_ms().ok().and_then(|now| {
+        i64::try_from(MAX_FUTURE_CANDLE_SKEW.as_millis())
+            .ok()
+            .and_then(|skew| now.checked_add(skew))
+    });
+    if expected_close != Some(candle.close_time)
+        || future_ceiling.is_none_or(|ceiling| candle.open_time > ceiling)
+    {
+        return Err(payload(context, PayloadError::MalformedProtocol));
+    }
+    Ok(())
+}
+
+fn timeframe_successor_open(timeframe: Timeframe, open_time: i64) -> Option<i64> {
+    let fixed_milliseconds = match timeframe {
+        Timeframe::Second1 => Some(1_000),
+        Timeframe::Minute1 => Some(60_000),
+        Timeframe::Minute3 => Some(180_000),
+        Timeframe::Minute5 => Some(300_000),
+        Timeframe::Minute15 => Some(900_000),
+        Timeframe::Minute30 => Some(1_800_000),
+        Timeframe::Hour1 => Some(3_600_000),
+        Timeframe::Hour2 => Some(7_200_000),
+        Timeframe::Hour4 => Some(14_400_000),
+        Timeframe::Hour6 => Some(21_600_000),
+        Timeframe::Hour8 => Some(28_800_000),
+        Timeframe::Hour12 => Some(43_200_000),
+        Timeframe::Day1 => Some(86_400_000),
+        Timeframe::Day3 => Some(259_200_000),
+        Timeframe::Week1 => Some(604_800_000),
+        Timeframe::Month1 => None,
+    };
+    if let Some(milliseconds) = fixed_milliseconds {
+        if open_time.rem_euclid(milliseconds) != 0 {
+            return None;
+        }
+        return open_time.checked_add(milliseconds);
+    }
+    let nanos = i128::from(open_time).checked_mul(1_000_000)?;
+    let date = OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .ok()?
+        .date();
+    if date.day() != 1 || open_time.rem_euclid(86_400_000) != 0 {
+        return None;
+    }
+    let (year, month) = if date.month() == Month::December {
+        (date.year().checked_add(1)?, Month::January)
+    } else {
+        (date.year(), date.month().next())
+    };
+    let next = Date::from_calendar_date(year, month, 1).ok()?;
+    i64::try_from(next.midnight().assume_utc().unix_timestamp_nanos() / 1_000_000).ok()
+}
+
+fn unix_now_ms() -> Result<i64, ProviderError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .ok_or(ProviderError::Invariant(
+            "system time is outside millisecond range",
+        ))
 }
 
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -365,6 +443,10 @@ pub struct BinanceProvider {
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     advertised_history_page_limit: u16,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    max_gap_reconciliation_candles: usize,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    max_gap_reconciliation_pages: usize,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     ws_base_url: Option<String>,
 }
 
@@ -396,6 +478,8 @@ impl BinanceTestConfig {
             live: LiveSupervisorConfig::default(),
             max_connection_age: MAX_CONNECTION_AGE,
             advertised_history_page_limit: 1000,
+            max_gap_reconciliation_candles: MAX_GAP_RECONCILIATION_CANDLES,
+            max_gap_reconciliation_pages: MAX_GAP_RECONCILIATION_PAGES,
         }
     }
 }
@@ -408,6 +492,8 @@ pub struct BinanceLiveTestConfig {
     pub live: LiveSupervisorConfig,
     pub max_connection_age: Duration,
     pub advertised_history_page_limit: u16,
+    pub max_gap_reconciliation_candles: usize,
+    pub max_gap_reconciliation_pages: usize,
 }
 
 pub(crate) struct BinanceLiveAdapter {
@@ -511,9 +597,23 @@ impl LiveAdapter for BinanceLiveAdapter {
     }
 
     fn live_config(&self) -> LiveConfig<'_> {
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        let (max_successors, max_pages) = (
+            self.provider.max_gap_reconciliation_candles,
+            self.provider.max_gap_reconciliation_pages,
+        );
+        #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+        let (max_successors, max_pages) =
+            (MAX_GAP_RECONCILIATION_CANDLES, MAX_GAP_RECONCILIATION_PAGES);
         LiveConfig {
             supervisor: &self.provider.live,
-            reconciliation: ReconciliationPolicy::Unbounded,
+            reconciliation: ReconciliationPolicy::Bounded(ReconciliationLimits {
+                max_successors,
+                max_pages,
+                span_exceeded: "Binance gap reconciliation target exceeds the per-generation span limit",
+                page_exceeded: "Binance gap reconciliation exceeded the per-generation page limit",
+                distinct_exceeded: "Binance gap reconciliation exceeded the distinct buffered-candle limit",
+            }),
         }
     }
 
@@ -561,6 +661,8 @@ impl BinanceProvider {
             LiveSupervisorConfig::default(),
             MAX_CONNECTION_AGE,
             1000,
+            MAX_GAP_RECONCILIATION_CANDLES,
+            MAX_GAP_RECONCILIATION_PAGES,
             None,
         )
     }
@@ -581,6 +683,8 @@ impl BinanceProvider {
             config.live,
             config.max_connection_age,
             config.advertised_history_page_limit,
+            config.max_gap_reconciliation_candles,
+            config.max_gap_reconciliation_pages,
             Some(config.ws_base_url),
         )
     }
@@ -596,6 +700,10 @@ impl BinanceProvider {
         max_connection_age: Duration,
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         advertised_history_page_limit: u16,
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        max_gap_reconciliation_candles: usize,
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        max_gap_reconciliation_pages: usize,
         #[cfg(all(
             feature = "test-transport",
             not(feature = "production-transport")
@@ -611,6 +719,12 @@ impl BinanceProvider {
         if max_connection_age.is_zero() {
             return Err(ProviderError::Configuration(
                 "live connection max age must be positive",
+            ));
+        }
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        if max_gap_reconciliation_candles == 0 || max_gap_reconciliation_pages == 0 {
+            return Err(ProviderError::Configuration(
+                "live reconciliation limits must be positive",
             ));
         }
         let client = Client::builder()
@@ -634,6 +748,10 @@ impl BinanceProvider {
             max_connection_age,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             advertised_history_page_limit,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            max_gap_reconciliation_candles,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            max_gap_reconciliation_pages,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             ws_base_url,
         })
