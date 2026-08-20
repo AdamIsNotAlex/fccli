@@ -248,29 +248,30 @@ Implementation note (verified): `runtime/http.rs` uniquely owns safe client cons
 
 ### R10 — Complete protocol/shared-test migration and cleanup
 
-**Status:** [ ]  
+**Status:** [x]  
 **Depends on:** R09  
 **Owned files:** `src/provider/binance.rs`, `src/provider/hyperliquid.rs`, `tests/binance_ws_codec.rs`, `tests/hyperliquid_ws_codec.rs`, `tests/binance_rest.rs`, `tests/hyperliquid_rest.rs`, `tests/binance_live.rs`, `tests/hyperliquid_live.rs`, `tests/provider_contract.rs`, `tests/provider_runtime_websocket.rs`, `tests/provider_runtime_live.rs`, `tests/provider_runtime_http.rs`  
 **Parallel safety:** Sequential; final provider and provider-test cleanup, with all overlapping runtime contract suites explicitly owned.  
 **Commit boundary:** `refactor(provider): finish runtime cutover and cleanup`
 
-- [ ] Audit every recommendation in `refactor.plan.md` against this tracker; add any missing actionable item before closing this chunk.
-- [ ] Final shared inventory: `provider_runtime_websocket` alone owns socket config/pump/control frames/deadlines/flush/decoded queue and emitter mechanics; `provider_runtime_live` alone owns reconciliation, generation, ack/watermark, concurrency, cancellation, saturation, backoff and purge; `provider_runtime_http` alone owns capped body/common cancellation-timeout/client/rate-gate mechanics.
-- [ ] Final Binance protocol inventory: `binance_ws_codec`/`binance_live` retain Spot/USD-M hosts and paths, stream URL, payload schema, `x`, provider readiness and `serverShutdown`; `binance_rest` retains strict 12-field rows, over-limit rejection, `-1121`, and 418/429 semantics. No provider-neutral runtime contract remains in those files.
-- [ ] Final Hyperliquid protocol inventory: `hyperliquid_ws_codec`/`hyperliquid_live` retain wire remap, unsupported timeframes, subscribe ack, JSON ping/pong, implicit finality, symbol/interval echoes and provider readiness; `hyperliquid_rest` retains candle window, bounded overlap/truncation, number/string decimals, `n`, symbol/interval echoes, error payload and Hyperliquid 429 policy. No provider-neutral runtime contract remains in those files.
-- [ ] Delete obsolete duplicate runtime code, aliases, re-exports, test-only accessors, comments, constants, and scaffolding; migrate every caller rather than leaving compatibility shims.
-- [ ] Confirm constraints C-01 through C-10 remain true and no explicitly non-applicable mechanism was implemented.
-- [ ] Record before/after provider file sizes as informational evidence only; do not make line count a correctness gate.
-- [ ] Verify: `cargo test --locked --test provider_runtime_websocket --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test provider_runtime_live --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test provider_runtime_http --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test binance_ws_codec --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test hyperliquid_ws_codec --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test binance_rest --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test hyperliquid_rest --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test provider_contract --no-default-features --features test-transport`.
+- [x] Audit every recommendation in `refactor.plan.md` against this tracker; add any missing actionable item before closing this chunk.
+- [x] Final shared inventory: `provider_runtime_websocket` alone owns socket config/pump/control frames/deadlines/flush/decoded queue and emitter mechanics; `provider_runtime_live` alone owns reconciliation, generation, ack/watermark, concurrency, cancellation, saturation, backoff and purge; `provider_runtime_http` alone owns capped body/common cancellation-timeout/client/rate-gate mechanics.
+- [x] Final Binance protocol inventory: `binance_ws_codec`/`binance_live` retain Spot/USD-M hosts and paths, stream URL, payload schema, `x`, provider readiness and `serverShutdown`; `binance_rest` retains strict 12-field rows, over-limit rejection, `-1121`, and 418/429 semantics. No provider-neutral runtime contract remains in those files.
+- [x] Final Hyperliquid protocol inventory: `hyperliquid_ws_codec`/`hyperliquid_live` retain wire remap, unsupported timeframes, subscribe ack, JSON ping/pong, implicit finality, symbol/interval echoes and provider readiness; `hyperliquid_rest` retains candle window, bounded overlap/truncation, number/string decimals, `n`, symbol/interval echoes, error payload and Hyperliquid 429 policy. No provider-neutral runtime contract remains in those files.
+- [x] Delete obsolete duplicate runtime code, aliases, re-exports, test-only accessors, comments, constants, and scaffolding; migrate every caller rather than leaving compatibility shims.
+- [x] Confirm constraints C-01 through C-10 remain true and no explicitly non-applicable mechanism was implemented.
+- [x] Record before/after provider file sizes as informational evidence only; do not make line count a correctness gate.
+**Implementation notes:** Complete. Audited the plan recommendations and C-01—C-10 against the durable tracker; no missing actionable recommendation was found and no explicitly non-applicable cross-provider mechanism was introduced. Final inventories confirm that the three shared suites exclusively own their listed provider-neutral contracts and the Binance/Hyperliquid suites retain every explicitly listed protocol case, with no duplicate shared-runtime contract found. Informational provider implementation sizes: `src/provider/binance.rs` 1,309 → 1,309 lines; `src/provider/hyperliquid.rs` 1,758 → 1,727 lines. Cleanup removed the proven-unused imports from `tests/binance_ws_codec.rs`, `tests/binance_live.rs`, and `tests/hyperliquid_live.rs`, plus the unused `rest_month_row` fixture. Imports required by the retained protocol tests remain present and referenced, including the codec types/configuration and asynchronous stream/sink extension traits; the formatted compile-and-test gates below verify their restoration. A repository-wide R10-owned surface search found no additional obsolete runtime alias, re-export, test accessor, comment, constant, or scaffolding that was both unreferenced and safe to remove without deleting protocol coverage.
+- [x] Verify: `cargo test --locked --test provider_runtime_websocket --no-default-features --features test-transport` (26 passed).
+- [x] Verify: `cargo test --locked --test provider_runtime_live --no-default-features --features test-transport` (15 passed).
+- [x] Verify: `cargo test --locked --test provider_runtime_http --no-default-features --features test-transport` (12 passed).
+- [x] Verify: `cargo test --locked --test binance_ws_codec --no-default-features --features test-transport` (4 passed).
+- [x] Verify: `cargo test --locked --test hyperliquid_ws_codec --no-default-features --features test-transport` (10 passed).
+- [x] Verify: `cargo test --locked --test binance_rest --no-default-features --features test-transport` (10 passed).
+- [x] Verify: `cargo test --locked --test hyperliquid_rest --no-default-features --features test-transport` (17 passed).
+- [x] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport` (11 passed).
+- [x] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport` (21 passed).
+- [x] Verify: `cargo test --locked --test provider_contract --no-default-features --features test-transport` (15 passed).
 
 ### R11 — Final repository gates and tracker accounting
 
@@ -332,7 +333,7 @@ Implementation note (verified): `runtime/http.rs` uniquely owns safe client cons
 | R07 | [x] | R06 | no | Complete; deterministic shared-runtime coverage verifies request/body connection failures and history recoverability, exact-cap acceptance and one-byte-over rejection for declared-length and genuinely streamed bodies, cancellation/timeout mapping, safe-client behavior, common status handling, rate-gate waits, maximum timed deadlines, and absorbing process block. Formatted gates passed: `provider_runtime_http` 12/12, `binance_rest` 10/10, `hyperliquid_rest` 17/17, `binance_live` 23/23, and `hyperliquid_live` 26/26. |
 | R08 | [x] | R07 | no | Complete; capability consumers validate before network/output work, preserve desired 500-row app/snapshot requests capped by provider maximum, and use the advertised maximum exactly for older history. Deterministic coverage verifies pending-switch supersession, the switch limit/rejection matrix, snapshot pre-output rejection, and real Binance/Hyperliquid capabilities. Formatted gates passed: `provider_contract` 12/12, `history_coordinator` 23/23, `snapshot_runner` 8/8, `app_live_contract` 54/54, `binance_live` 23/23, and `hyperliquid_live` 26/26. |
 | R09 | [x] | R08 | no | Complete; the generic `BTreeMap` registry rejects duplicate IDs, uses borrowed lookup, has no provider-specific accessor/injection path, and keeps canonicalization metadata independent from transport registration. Corrected ownership includes Binance/Hyperliquid xor-cfg purity and shared HTTP unreachable-arm cleanup. Compile fixtures prove `binance`, `with_hyperliquid`, and `with_test_provider` are absent and preserve the dedicated dual-feature diagnostic. Formatted gates passed: `provider_contract` 15/15, `app_live_contract` 54/54, `binance_live` 23/23, and `api_boundaries` 6/6. |
-| R10 | [ ] | R09 | yes | — |
-| R11 | [ ] | R10 | no | — |
+| R10 | [x] | R09 | no | Complete; final inventories leave provider-neutral WebSocket, live-engine, and HTTP contracts solely in their shared runtime suites while preserving the explicit Binance and Hyperliquid protocol contracts. Proven-unused imports and the `rest_month_row` fixture were removed; required retained-test imports were restored and exercised, and no further proven-obsolete R10 scaffolding remains. Formatted gates passed: `provider_runtime_websocket` 26/26, `provider_runtime_live` 15/15, `provider_runtime_http` 12/12, `binance_ws_codec` 4/4, `hyperliquid_ws_codec` 10/10, `binance_rest` 10/10, `hyperliquid_rest` 17/17, `binance_live` 11/11, `hyperliquid_live` 21/21, and `provider_contract` 15/15. |
+| R11 | [ ] | R10 | yes | — |
 
-**Next dependency-ready unchecked chunk:** R10 — Complete protocol/shared-test migration and cleanup.
+**Next dependency-ready unchecked chunk:** R11 — Final repository gates and tracker accounting.

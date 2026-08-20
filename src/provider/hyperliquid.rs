@@ -1723,36 +1723,3 @@ fn remap_instrument(spec: &InstrumentSpec) -> Result<Instrument, ProviderError> 
     )
     .map_err(|_| ProviderError::Configuration("instrument is not valid for Hyperliquid"))
 }
-
-#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-#[must_use]
-pub fn gap_target_within_generation_span_for_test(
-    timeframe: Timeframe,
-    start: i64,
-    target: i64,
-) -> bool {
-    crate::provider::runtime::live::gap_target_within_generation_span_for_test(
-        timeframe,
-        start,
-        target,
-        MAX_GAP_RECONCILIATION_CANDLES,
-    )
-}
-
-#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-pub fn reconciliation_page_guard_for_test(pages: usize) -> Result<(), ProviderError> {
-    crate::provider::runtime::live::reconciliation_page_guard_for_test(
-        pages,
-        MAX_GAP_RECONCILIATION_PAGES,
-    )
-}
-
-#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-#[must_use]
-pub fn reconciliation_distinct_key_allowed_for_test(existing_len: usize, key_exists: bool) -> bool {
-    crate::provider::runtime::live::reconciliation_distinct_key_allowed_for_test(
-        existing_len,
-        key_exists,
-        MAX_GAP_RECONCILIATION_CANDLES,
-    )
-}

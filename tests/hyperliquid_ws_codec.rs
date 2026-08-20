@@ -6,10 +6,7 @@ use fccli::{
     error::{PayloadError, ProviderError},
     model::{FinalityAuthority, Instrument, Market, ProviderId, Timeframe},
     provider::{
-        hyperliquid::{
-            HyperliquidWsCodec, decode_ws_frame, gap_target_within_generation_span_for_test,
-            test_websocket_url,
-        },
+        hyperliquid::{HyperliquidWsCodec, decode_ws_frame, test_websocket_url},
         test_transport::{DecodedFrame, HyperliquidDecoded, WsConfig},
     },
 };
@@ -273,21 +270,6 @@ fn far_future_first_and_successor_are_rejected_without_poisoning_state() {
     };
     assert_eq!(closed.open_time(), CURRENT);
     assert_eq!(open.open_time(), CURRENT + 3 * 60_000);
-}
-
-#[test]
-fn reconciliation_span_accepts_skips_and_rejects_forged_targets() {
-    const START: i64 = 1_704_067_200_000;
-    assert!(gap_target_within_generation_span_for_test(
-        Timeframe::Minute1,
-        START,
-        START + 3 * 60_000,
-    ));
-    assert!(!gap_target_within_generation_span_for_test(
-        Timeframe::Minute1,
-        START,
-        START + 64_001 * 60_000,
-    ));
 }
 
 #[test]

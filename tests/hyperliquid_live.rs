@@ -6,21 +6,18 @@ use fccli::{
     clock::ManualClock,
     error::{ErrorContext, ErrorOperation, ProviderError, TimeoutKind},
     model::{
-        ConnectionStatus, GapGeneration, Instrument, Market, MarketEvent, MonoInstant, ProviderId,
-        Timeframe,
+        ConnectionStatus, Instrument, Market, MarketEvent, MonoInstant, ProviderId, Timeframe,
     },
     provider::{
-        LiveRequest, MarketDataProvider, ProducerCompletion, ReconcileAck,
-        accepted_watermark_channel,
+        LiveRequest, MarketDataProvider, accepted_watermark_channel,
         hyperliquid::{
             APPLICATION_HEARTBEAT_INTERVAL, HyperliquidLiveConfig, HyperliquidProvider,
             HyperliquidTestConfig, connect_test_websocket,
         },
         reconcile_ack_channel,
         test_transport::{
-            CloseFlushTestHook, DecodedFrame, HeartbeatTestHook, HyperliquidDecoded,
-            LiveSupervisorConfig, ReadinessDecodedAckTestHook, ReadinessDrainBudgetTestHook,
-            SubscribeFlushTestHook, WsConfig, read_raw_websocket,
+            CloseFlushTestHook, DecodedFrame, HeartbeatTestHook, ReadinessDecodedAckTestHook,
+            ReadinessDrainBudgetTestHook, SubscribeFlushTestHook, WsConfig, read_raw_websocket,
         },
     },
 };
@@ -29,10 +26,6 @@ use serde_json::json;
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{method, path},
-};
 
 fn clock() -> Arc<ManualClock> {
     Arc::new(ManualClock::new(MonoInstant::ZERO))
@@ -80,17 +73,6 @@ fn provider(
 ) -> HyperliquidProvider {
     let mut config =
         HyperliquidTestConfig::loopback("http://127.0.0.1:9").with_websocket_base(ws_uri);
-    config.live = live;
-    HyperliquidProvider::new_test_live(config, clock).expect("provider")
-}
-
-fn provider_with_http(
-    http_uri: &str,
-    ws_uri: &str,
-    clock: Arc<ManualClock>,
-    live: HyperliquidLiveConfig,
-) -> HyperliquidProvider {
-    let mut config = HyperliquidTestConfig::loopback(http_uri).with_websocket_base(ws_uri);
     config.live = live;
     HyperliquidProvider::new_test_live(config, clock).expect("provider")
 }
@@ -214,113 +196,6 @@ fn subscribe_ack_timeout_configuration_bounds_are_enforced() {
         };
         live.validate().expect("boundary is valid");
     }
-}
-
-#[tokio::test]
-async fn zero_advertised_history_limit_is_rejected_before_live_io() {
-    let mut live = HyperliquidLiveConfig::default();
-    live.advertised_history_page_limit = 0;
-    let provider = provider("ws://127.0.0.1:1", clock(), live);
-    let cancellation = CancellationToken::new();
-    let error = match provider.open_live(request(cancellation)).await {
-        Ok(_) => panic!("zero advertised history limit must fail"),
-        Err(error) => error,
-    };
-    assert_eq!(
-        error,
-        ProviderError::Configuration("provider history page limit must be non-zero")
-    );
-}
-
-#[tokio::test]
-async fn smaller_advertised_history_limit_is_used_by_shared_gap_request() {
-    const START: i64 = 1_699_999_980_000;
-    const LIMIT: u16 = 7;
-    const TARGET: i64 = START + 10 * 60_000;
-    let rest = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/info"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .mount(&rest)
-        .await;
-
-    let (listener, ws_uri) = websocket_listener().await;
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("WebSocket accept");
-        let mut websocket = accept_async(stream).await.expect("upgrade");
-        assert!(matches!(websocket.next().await, Some(Ok(Message::Text(_)))));
-        websocket
-            .send(Message::Text(subscribe_ack().into()))
-            .await
-            .expect("subscribe ack");
-        websocket
-            .send(Message::Text(candle_message(TARGET).into()))
-            .await
-            .expect("gap target candle");
-        std::future::pending::<()>().await;
-    });
-    let live = HyperliquidLiveConfig {
-        advertised_history_page_limit: LIMIT,
-        ..HyperliquidLiveConfig::default()
-    };
-    let provider = provider_with_http(&rest.uri(), &ws_uri, clock(), live);
-    let cancellation = CancellationToken::new();
-    let (watermark_tx, watermark_rx) = accepted_watermark_channel(Some(START));
-    let (_ack_tx, ack_rx) = reconcile_ack_channel();
-    let mut feed = provider
-        .open_live(LiveRequest {
-            instrument: instrument(),
-            timeframe: Timeframe::Minute1,
-            startup_watermark: Some(START),
-            accepted_watermark_rx: watermark_rx,
-            reconcile_ack_rx: ack_rx,
-            cancellation: cancellation.clone(),
-        })
-        .await
-        .expect("feed");
-    assert!(matches!(
-        next_event(&mut feed).await,
-        MarketEvent::Status {
-            status: ConnectionStatus::Connecting,
-            ..
-        }
-    ));
-    assert!(matches!(
-        next_event(&mut feed).await,
-        MarketEvent::Status {
-            status: ConnectionStatus::GapSync,
-            ..
-        }
-    ));
-    assert!(matches!(
-        next_event(&mut feed).await,
-        MarketEvent::RecoverableError {
-            error: ProviderError::GapSyncNoProgress { .. },
-            ..
-        }
-    ));
-    let requests = rest
-        .received_requests()
-        .await
-        .expect("request recording is enabled");
-    assert_eq!(requests.len(), 1);
-    let body: serde_json::Value =
-        serde_json::from_slice(&requests[0].body).expect("candle snapshot JSON");
-    assert_eq!(
-        body,
-        json!({
-            "type": "candleSnapshot",
-            "req": {
-                "coin": "@142",
-                "interval": "1m",
-                "startTime": START,
-                "endTime": START + i64::from(LIMIT) * 60_000 - 1,
-            }
-        })
-    );
-    cancellation.cancel();
-    drop(watermark_tx);
-    server.abort();
 }
 
 #[tokio::test]
@@ -746,260 +621,6 @@ async fn matching_ack_on_readiness_budget_boundary_wins_simultaneous_ack_deadlin
     ));
 }
 
-#[tokio::test]
-async fn reconciliation_span_bound_reconnects_while_rest_page_is_pending() {
-    let (http_listener, http_ws_uri) = websocket_listener().await;
-    let http_uri = http_ws_uri.replacen("ws://", "http://", 1);
-    let (ws_listener, ws_uri) = websocket_listener().await;
-    let (history_started_tx, history_started_rx) = oneshot::channel();
-    let http_server = tokio::spawn(async move {
-        let (stream, _) = http_listener.accept().await.expect("HTTP accept");
-        let mut request = [0_u8; 2048];
-        stream.readable().await.expect("HTTP request readiness");
-        let bytes = stream.try_read(&mut request).expect("HTTP request");
-        assert!(bytes > 0, "history request must reach the pending server");
-        history_started_tx.send(()).expect("history started");
-        std::future::pending::<()>().await;
-    });
-    let ws_server = tokio::spawn(async move {
-        let (stream, _) = ws_listener.accept().await.expect("WebSocket accept");
-
-        let mut websocket = accept_async(stream).await.expect("upgrade");
-        let _ = websocket
-            .next()
-            .await
-            .expect("subscribe")
-            .expect("subscribe");
-        websocket
-            .send(Message::Text(subscribe_ack().into()))
-            .await
-            .expect("ack");
-        const START: i64 = 1_699_999_980_000;
-        websocket
-            .send(Message::Text(candle_message(START).into()))
-            .await
-            .expect("first candle");
-        await_signal(history_started_rx, "pending history request").await;
-        websocket
-            .send(Message::Text(candle_message(START + 4 * 60_000).into()))
-            .await
-            .expect("out-of-span reconciliation successor");
-        std::future::pending::<()>().await;
-    });
-    let live = HyperliquidLiveConfig {
-        max_gap_reconciliation_candles_for_test: 3,
-        ..HyperliquidLiveConfig::default()
-    };
-    assert_eq!(
-        HyperliquidLiveConfig::default().max_gap_reconciliation_candles_for_test,
-        64_000,
-        "the test override must default to the production generation bound"
-    );
-    let provider = provider_with_http(&http_uri, &ws_uri, clock(), live);
-    let cancellation = CancellationToken::new();
-    let mut feed = provider
-        .open_live(request(cancellation.clone()))
-        .await
-        .expect("feed");
-    assert!(matches!(
-        next_event(&mut feed).await,
-        MarketEvent::Status {
-            status: ConnectionStatus::Connecting,
-            ..
-        }
-    ));
-    assert!(matches!(
-        next_event(&mut feed).await,
-        MarketEvent::Status {
-            status: ConnectionStatus::GapSync,
-            ..
-        }
-    ));
-    assert!(matches!(
-        next_event(&mut feed).await,
-        MarketEvent::RecoverableError {
-            error: ProviderError::Protocol {
-                detail: "Hyperliquid gap reconciliation target exceeds the per-generation span limit",
-                ..
-            },
-            ..
-        }
-    ));
-    cancellation.cancel();
-    http_server.abort();
-    ws_server.abort();
-}
-#[tokio::test]
-async fn large_in_bound_pending_rest_sequence_remains_promptly_cancellable() {
-    let (http_listener, http_ws_uri) = websocket_listener().await;
-    let http_uri = http_ws_uri.replacen("ws://", "http://", 1);
-    let (ws_listener, ws_uri) = websocket_listener().await;
-    let (history_started_tx, history_started_rx) = oneshot::channel();
-    let http_server = tokio::spawn(async move {
-        let (stream, _) = http_listener.accept().await.expect("HTTP accept");
-        let mut request = [0_u8; 2048];
-        stream.readable().await.expect("HTTP request readiness");
-        assert!(stream.try_read(&mut request).expect("HTTP request") > 0);
-        history_started_tx.send(()).expect("history started");
-        std::future::pending::<()>().await;
-    });
-    let (sequence_sent_tx, sequence_sent_rx) = oneshot::channel();
-    let ws_server = tokio::spawn(async move {
-        let (stream, _) = ws_listener.accept().await.expect("WebSocket accept");
-        let mut websocket = accept_async(stream).await.expect("upgrade");
-        assert!(matches!(websocket.next().await, Some(Ok(Message::Text(_)))));
-        websocket
-            .send(Message::Text(subscribe_ack().into()))
-            .await
-            .expect("ack");
-        const START: i64 = 1_699_999_980_000;
-        websocket
-            .send(Message::Text(candle_message(START).into()))
-            .await
-            .expect("first candle");
-        await_signal(history_started_rx, "pending history request").await;
-        for successor in 1..=8_192_i64 {
-            websocket
-                .feed(Message::Text(
-                    candle_message(START + successor * 60_000).into(),
-                ))
-                .await
-                .expect("in-bound reconciliation candle");
-        }
-        websocket
-            .flush()
-            .await
-            .expect("large reconciliation sequence");
-        sequence_sent_tx.send(()).expect("sequence sent");
-        std::future::pending::<()>().await;
-    });
-    let provider = provider_with_http(
-        &http_uri,
-        &ws_uri,
-        clock(),
-        HyperliquidLiveConfig::default(),
-    );
-    let cancellation = CancellationToken::new();
-    let mut feed = provider
-        .open_live(request(cancellation.clone()))
-        .await
-        .expect("feed");
-    assert!(matches!(
-        next_event(&mut feed).await,
-        MarketEvent::Status { .. }
-    ));
-    assert!(matches!(
-        next_event(&mut feed).await,
-        MarketEvent::Status {
-            status: ConnectionStatus::GapSync,
-            ..
-        }
-    ));
-    await_signal(sequence_sent_rx, "large sequence").await;
-    cancellation.cancel();
-    timeout(Duration::from_secs(2), async {
-        while feed.events.next().await.is_some() {}
-    })
-    .await
-    .expect("cancellation must promptly stop reconciliation");
-    http_server.abort();
-    ws_server.abort();
-}
-
-#[tokio::test]
-async fn accepted_watermark_span_bound_reconnects_while_rest_page_is_pending() {
-    let (http_listener, http_ws_uri) = websocket_listener().await;
-    let http_uri = http_ws_uri.replacen("ws://", "http://", 1);
-    let (ws_listener, ws_uri) = websocket_listener().await;
-    let (history_started_tx, history_started_rx) = oneshot::channel();
-    let http_server = tokio::spawn(async move {
-        let (stream, _) = http_listener.accept().await.expect("HTTP accept");
-        let mut request = [0_u8; 2048];
-        stream.readable().await.expect("HTTP request readiness");
-        let bytes = stream.try_read(&mut request).expect("HTTP request");
-        assert!(bytes > 0, "history request must reach the pending server");
-        history_started_tx.send(()).expect("history started");
-        std::future::pending::<()>().await;
-    });
-    const START: i64 = 1_699_999_980_000;
-    let ws_server = tokio::spawn(async move {
-        let (stream, _) = ws_listener.accept().await.expect("WebSocket accept");
-        let mut websocket = accept_async(stream).await.expect("upgrade");
-        let _ = websocket
-            .next()
-            .await
-            .expect("subscribe")
-            .expect("subscribe");
-        websocket
-            .send(Message::Text(subscribe_ack().into()))
-            .await
-            .expect("ack");
-        websocket
-            .send(Message::Text(candle_message(START).into()))
-            .await
-            .expect("first candle");
-        std::future::pending::<()>().await;
-    });
-    let live = HyperliquidLiveConfig {
-        max_gap_reconciliation_candles_for_test: 3,
-        ..HyperliquidLiveConfig::default()
-    };
-    let provider = provider_with_http(&http_uri, &ws_uri, clock(), live);
-    let cancellation = CancellationToken::new();
-    let (watermark_tx, watermark_rx) = accepted_watermark_channel(None);
-    let (ack_tx, ack_rx) = reconcile_ack_channel();
-    let mut feed = provider
-        .open_live(LiveRequest {
-            instrument: instrument(),
-            timeframe: Timeframe::Minute1,
-            startup_watermark: None,
-            accepted_watermark_rx: watermark_rx,
-            reconcile_ack_rx: ack_rx,
-            cancellation: cancellation.clone(),
-        })
-        .await
-        .expect("feed");
-    assert!(matches!(
-        next_event(&mut feed).await,
-        MarketEvent::Status {
-            status: ConnectionStatus::Connecting,
-            ..
-        }
-    ));
-    assert!(matches!(
-        next_event(&mut feed).await,
-        MarketEvent::Status {
-            status: ConnectionStatus::GapSync,
-            ..
-        }
-    ));
-    await_signal(history_started_rx, "pending history request").await;
-    watermark_tx
-        .publish(Some(START + 3 * 60_000))
-        .expect("valid watermark advance");
-    tokio::task::yield_now().await;
-    assert!(
-        feed.events.next().now_or_never().is_none(),
-        "a watermark at the configured successor limit must remain valid"
-    );
-    watermark_tx
-        .publish(Some(START + 4 * 60_000))
-        .expect("out-of-bound watermark advance");
-    assert!(matches!(
-        next_event(&mut feed).await,
-        MarketEvent::RecoverableError {
-            error: ProviderError::Protocol {
-                context,
-                detail: "Hyperliquid gap reconciliation target exceeds the per-generation span limit",
-            },
-            ..
-        } if context == ErrorContext::operation(ErrorOperation::Reconciliation)
-    ));
-    cancellation.cancel();
-    drop(ack_tx);
-    http_server.abort();
-    ws_server.abort();
-}
 #[tokio::test]
 async fn decoded_ack_wins_deterministic_deadline_tie_before_arbitration() {
     let (listener, ws_uri) = websocket_listener().await;

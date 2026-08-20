@@ -1,35 +1,14 @@
 #![cfg(feature = "test-transport")]
 
-use std::time::Duration;
-
 use fccli::{
-    error::{PayloadError, ProviderError, SanitizedCause, SanitizedMessage, TimeoutKind},
+    error::{PayloadError, ProviderError, SanitizedMessage},
     model::{FinalityAuthority, Instrument, Market, ProviderId, Timeframe},
     provider::{
         binance::{decode_ws_frame, test_websocket_url},
-        test_transport::{
-            BinanceDecoded, DecodedFrame, WS_FRAME_SIZE, WS_MAX_WRITE_BUFFER_SIZE,
-            WS_MESSAGE_INACTIVITY_TIMEOUT, WS_MESSAGE_SIZE, WS_READ_BUFFER_SIZE,
-            WS_STALLED_WRITE_TIMEOUT, WS_WRITE_BUFFER_SIZE, WsConfig, read_raw_websocket,
-            send_raw_websocket,
-        },
+        test_transport::{BinanceDecoded, DecodedFrame, WsConfig},
     },
 };
-use futures_util::{SinkExt, StreamExt};
-use tokio::{io::AsyncWriteExt, net::TcpListener, time::timeout};
-use tokio_tungstenite::{
-    accept_async,
-    tungstenite::{
-        Message,
-        protocol::{
-            CloseFrame,
-            frame::{
-                Frame,
-                coding::{CloseCode, Data, OpCode},
-            },
-        },
-    },
-};
+use tokio_tungstenite::tungstenite::Message;
 
 const OPEN: &str = include_str!("fixtures/binance_kline_open.json");
 const CLOSED: &str = include_str!("fixtures/binance_kline_closed.json");
