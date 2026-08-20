@@ -73,6 +73,11 @@ fn rest_row(open_time: i64) -> serde_json::Value {
         "0"
     ])
 }
+fn rest_month_row(open_time: i64, successor_open_time: i64) -> serde_json::Value {
+    let mut row = rest_row(open_time);
+    row[6] = json!(successor_open_time - 1);
+    row
+}
 
 fn ws_kline(open_time: i64, closed: bool, close: &str) -> String {
     ws_kline_for(open_time, closed, close, "1m")
@@ -2841,56 +2846,75 @@ async fn peer_close_recovers_from_first_kline_ack_and_connected_without_status_s
 }
 
 #[tokio::test]
-async fn repeated_full_duplicate_page_stops_once_without_same_generation_spin() {
-    let repeated = vec![rest_row(OPEN_TIME); 1_000];
-    let rest = rest_server(ResponseTemplate::new(200).set_body_json(repeated)).await;
-    let (listener, ws_uri) = websocket_listener().await;
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        let mut websocket = accept_async(stream).await.expect("upgrade");
-        websocket
-            .send(Message::Text(
-                ws_kline(OPEN_TIME + 60_000, false, "37025.50").into(),
-            ))
-            .await
-            .expect("target candle");
-        futures_util::future::pending::<()>().await;
-    });
-    let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
-    let clock: Arc<dyn Clock> = manual;
-    let provider = provider(&rest.uri(), &ws_uri, clock, LiveSupervisorConfig::default());
-    let (request, _watermark_tx, _ack_tx) = request(Some(OPEN_TIME));
-    let mut feed = provider.open_live(request).await.expect("feed");
-    assert_status(
-        next_event(&mut feed).await,
-        Some(1),
-        ConnectionStatus::Connecting,
-    );
-    assert_status(
-        next_event(&mut feed).await,
-        Some(1),
-        ConnectionStatus::GapSync,
-    );
-    assert!(matches!(
-        next_event(&mut feed).await,
-        MarketEvent::RecoverableError {
-            generation: Some(GapGeneration(1)),
-            error: ProviderError::GapSyncNoProgress {
-                target_open_time,
-                last_open_time: Some(last_open_time),
-            },
-            rate_gate_deadline: None,
-        } if target_open_time == OPEN_TIME + 60_000 && last_open_time == OPEN_TIME
-    ));
-    assert_status(
-        next_event(&mut feed).await,
-        Some(1),
-        ConnectionStatus::Backoff,
-    );
-    let requests = rest.received_requests().await.expect("received requests");
-    assert_eq!(requests.len(), 2, "duplicate page must not spin");
-    feed.request_shutdown();
-    server.abort();
+async fn invalid_gap_rest_rows_reject_the_generation_before_reconcile_batch_emission() {
+    let target = OPEN_TIME + 60_000;
+    let mut inconsistent_close = rest_row(OPEN_TIME);
+    inconsistent_close.as_array_mut().expect("REST row")[6] = json!(OPEN_TIME + 60_000);
+    for (case, rows) in [
+        ("off-grid", json!([rest_row(OPEN_TIME + 1)])),
+        ("inconsistent close", json!([inconsistent_close])),
+        ("out of window", json!([rest_row(OPEN_TIME - 60_000)])),
+        (
+            "duplicate",
+            json!([rest_row(OPEN_TIME), rest_row(OPEN_TIME)]),
+        ),
+        ("regressive", json!([rest_row(target), rest_row(OPEN_TIME)])),
+    ] {
+        let rest = rest_server(ResponseTemplate::new(200).set_body_json(rows)).await;
+        let (listener, ws_uri) = websocket_listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut websocket = accept_async(stream).await.expect("upgrade");
+            websocket
+                .send(Message::Text(ws_kline(target, false, "37025.50").into()))
+                .await
+                .expect("target candle");
+            futures_util::future::pending::<()>().await;
+        });
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+        let provider = provider(&rest.uri(), &ws_uri, clock, LiveSupervisorConfig::default());
+        let (request, _watermark_tx, _ack_tx) = request(Some(OPEN_TIME));
+        let mut feed = provider.open_live(request).await.expect("feed");
+        assert_status(
+            next_event(&mut feed).await,
+            Some(1),
+            ConnectionStatus::Connecting,
+        );
+        assert_status(
+            next_event(&mut feed).await,
+            Some(1),
+            ConnectionStatus::GapSync,
+        );
+        assert!(
+            matches!(
+                next_event(&mut feed).await,
+                MarketEvent::RecoverableError {
+                    generation: Some(GapGeneration(1)),
+                    error: ProviderError::Payload {
+                        source: PayloadError::MalformedProtocol,
+                        ..
+                    },
+                    rate_gate_deadline: None,
+                }
+            ),
+            "{case}"
+        );
+        assert_status(
+            next_event(&mut feed).await,
+            Some(1),
+            ConnectionStatus::Backoff,
+        );
+        assert_eq!(
+            rest.received_requests()
+                .await
+                .expect("received requests")
+                .len(),
+            1,
+            "{case} must reject before another same-generation history request"
+        );
+        feed.request_shutdown();
+        server.abort();
+    }
 }
 
 #[tokio::test]
@@ -3522,7 +3546,7 @@ async fn month1_multi_page_target_revision_race_uses_plus_one_cursor_and_latest_
             * 1_000
     }
 
-    let opens: Vec<_> = (0..=1_001).map(month_open).collect();
+    let opens: Vec<_> = (0..=1_002).map(month_open).collect();
     let start = opens[0];
     let first_target = opens[1_000];
     let latest_target = opens[1_001];
@@ -3535,7 +3559,11 @@ async fn month1_multi_page_target_revision_race_uses_plus_one_cursor_and_latest_
             .year()
     );
 
-    let first_page: Vec<_> = opens[..1_000].iter().copied().map(rest_row).collect();
+    let first_page: Vec<_> = opens[..1_000]
+        .iter()
+        .zip(&opens[1..=1_000])
+        .map(|(&open, &successor)| rest_month_row(open, successor))
+        .collect();
     let rest = MockServer::start().await;
     Mock::given(method("GET"))
         .and(query_param("startTime", start.to_string()))
@@ -3545,19 +3573,29 @@ async fn month1_multi_page_target_revision_race_uses_plus_one_cursor_and_latest_
         .expect(1)
         .mount(&rest)
         .await;
+    let second_cursor = opens[999] + 1;
+    assert!(second_cursor < first_target);
     Mock::given(method("GET"))
-        .and(query_param("startTime", (opens[999] + 1).to_string()))
+        .and(query_param("startTime", second_cursor.to_string()))
         .and(query_param("endTime", first_target.to_string()))
         .and(query_param("limit", "1000"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([rest_row(first_target)])))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([rest_month_row(first_target, latest_target)])),
+        )
         .expect(1)
         .mount(&rest)
         .await;
+    let third_cursor = first_target + 1;
+    assert!(third_cursor < latest_target);
     Mock::given(method("GET"))
-        .and(query_param("startTime", (first_target + 1).to_string()))
+        .and(query_param("startTime", third_cursor.to_string()))
         .and(query_param("endTime", latest_target.to_string()))
         .and(query_param("limit", "1000"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([rest_row(latest_target)])))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([rest_month_row(latest_target, opens[1_002])])),
+        )
         .expect(1)
         .mount(&rest)
         .await;

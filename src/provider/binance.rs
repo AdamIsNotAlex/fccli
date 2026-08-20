@@ -833,7 +833,7 @@ impl BinanceProvider {
                 return Err(map_http_error(status, &bytes, context));
             }
             let bytes = read_capped(response, self.body_limit, &cancellation, &context).await?;
-            decode_klines(&bytes, request.limit(), context)
+            decode_klines(&bytes, request, timeframe, context)
         }
         #[cfg(all(feature = "production-transport", feature = "test-transport"))]
         {
@@ -1114,7 +1114,8 @@ impl<'de> Visitor<'de> for BoundedRowsVisitor {
 }
 fn decode_klines(
     bytes: &[u8],
-    requested_limit: u16,
+    request: HistoryRequest,
+    timeframe: Timeframe,
     context: ErrorContext,
 ) -> Result<Vec<Candle>, ProviderError> {
     if bytes
@@ -1129,7 +1130,7 @@ fn decode_klines(
             Err(payload(&context, PayloadError::MalformedJson))
         };
     }
-    let limit = usize::from(requested_limit).min(1000);
+    let limit = usize::from(request.limit()).min(1000);
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let rows =
         serde::de::Deserializer::deserialize_seq(&mut deserializer, BoundedRowsVisitor { limit })
@@ -1138,6 +1139,7 @@ fn decode_klines(
         .end()
         .map_err(|_| payload(&context, PayloadError::MalformedJson))?;
     let mut candles = Vec::with_capacity(rows.len());
+    let mut previous_open = None;
     for row in rows {
         let fields = match row {
             Value::Array(fields) => fields,
@@ -1171,16 +1173,49 @@ fn decode_klines(
         let volume = decimal_field(&raw.5, "base_volume", &context)?;
         let close_time = integer_field(&raw.6, "close_time", &context)?;
         validate_ignored_fields(&raw, &context)?;
-        candles.push(
-            Candle::from_rest(open_time, close_time, open, high, low, close, volume).map_err(
-                |source| ProviderError::Domain {
-                    context: context.clone(),
-                    source,
-                },
-            )?,
-        );
+        let candle = Candle::from_rest(open_time, close_time, open, high, low, close, volume)
+            .map_err(|source| ProviderError::Domain {
+                context: context.clone(),
+                source,
+            })?;
+        validate_rest_candle_time_window(
+            open_time,
+            close_time,
+            timeframe,
+            request,
+            previous_open,
+            &context,
+        )?;
+        previous_open = Some(open_time);
+        candles.push(candle);
     }
     Ok(candles)
+}
+
+fn validate_rest_candle_time_window(
+    open_time: i64,
+    close_time: i64,
+    timeframe: Timeframe,
+    request: HistoryRequest,
+    previous_open: Option<i64>,
+    context: &ErrorContext,
+) -> Result<(), ProviderError> {
+    let expected_close = timeframe_successor_open(timeframe, open_time)
+        .and_then(|successor| successor.checked_sub(1));
+    let outside_start = request
+        .start_time()
+        .is_some_and(|start_time| open_time < start_time);
+    let outside_end = request
+        .end_time()
+        .is_some_and(|end_time| open_time > end_time);
+    if expected_close != Some(close_time)
+        || outside_start
+        || outside_end
+        || previous_open.is_some_and(|previous| open_time <= previous)
+    {
+        return Err(payload(context, PayloadError::MalformedProtocol));
+    }
+    Ok(())
 }
 
 fn validate_ignored_fields(raw: &RawKline, context: &ErrorContext) -> Result<(), ProviderError> {
