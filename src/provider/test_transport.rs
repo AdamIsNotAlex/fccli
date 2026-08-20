@@ -8,3 +8,9 @@ pub use super::runtime::websocket::{
     WS_WRITE_BUFFER_SIZE, WsConfig, flush_raw_websocket, read_raw_websocket, send_raw_websocket,
 };
 pub use super::{binance::BinanceDecoded, hyperliquid::HyperliquidDecoded};
+
+pub fn validate_loopback_websocket_base(
+    base_url: &str,
+) -> Result<reqwest::Url, crate::error::ProviderError> {
+    super::runtime::websocket::validate_websocket_base(base_url, true)
+}

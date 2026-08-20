@@ -68,30 +68,14 @@ fn all_timeframe_stream_paths_are_exact() {
 }
 
 #[test]
-fn loopback_test_urls_are_exact_and_public_hosts_are_rejected() {
+fn loopback_stream_urls_append_only_the_binance_path() {
     let expected_path = "/ws/btcusdt@kline_1m";
     for base in ["ws://127.0.0.1:32123", "ws://[::1]:32123"] {
         let url = test_websocket_url(base, &instrument(), Timeframe::Minute1)
             .expect("literal loopback URL");
         assert_eq!(url.path(), expected_path);
         assert!(url.query().is_none());
-    }
-
-    for unsafe_base in [
-        "wss://data-stream.binance.vision",
-        "ws://example.com",
-        "ws://192.0.2.1:80",
-        "http://127.0.0.1:80",
-        "ws://127.0.0.1:80?token=secret",
-        "ws://127.0.0.1:80/#fragment",
-    ] {
-        assert!(
-            matches!(
-                test_websocket_url(unsafe_base, &instrument(), Timeframe::Minute1),
-                Err(ProviderError::WebSocketConfiguration { .. })
-            ),
-            "accepted unsafe test WebSocket base {unsafe_base}"
-        );
+        assert!(url.fragment().is_none());
     }
 }
 

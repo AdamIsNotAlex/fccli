@@ -6,12 +6,12 @@ use fccli::{
     error::{PayloadError, ProviderError, SanitizedCause, SanitizedMessage, TimeoutKind},
     model::{FinalityAuthority, Instrument, Market, ProviderId, Timeframe},
     provider::{
-        binance::{decode_ws_frame, test_websocket_url},
+        binance::decode_ws_frame,
         test_transport::{
             BinanceDecoded, DecodedFrame, WS_FRAME_SIZE, WS_MAX_WRITE_BUFFER_SIZE,
             WS_MESSAGE_INACTIVITY_TIMEOUT, WS_MESSAGE_SIZE, WS_READ_BUFFER_SIZE,
             WS_STALLED_WRITE_TIMEOUT, WS_WRITE_BUFFER_SIZE, WsConfig, read_raw_websocket,
-            send_raw_websocket,
+            send_raw_websocket, validate_loopback_websocket_base,
         },
     },
 };
@@ -185,6 +185,35 @@ async fn test_connector_rejects_public_hosts_before_network_io() {
         result,
         Err(ProviderError::WebSocketConfiguration { .. })
     ));
+}
+
+#[test]
+fn loopback_websocket_base_rejection_matrix_is_shared() {
+    for valid in ["ws://127.0.0.1:32123", "ws://[::1]:32123"] {
+        let url = validate_loopback_websocket_base(valid).expect("literal loopback URL");
+        assert_eq!(url.as_str(), format!("{valid}/"));
+    }
+    for invalid in [
+        "wss://127.0.0.1:32123",
+        "wss://data-stream.binance.vision",
+        "ws://example.com:80",
+        "ws://192.0.2.1:80",
+        "http://127.0.0.1:80",
+        "ws://127.0.0.1",
+        "ws://127.0.0.1:0",
+        "ws://user@127.0.0.1:80",
+        "ws://user:pass@127.0.0.1:80",
+        "ws://127.0.0.1:80?token=secret",
+        "ws://127.0.0.1:80/#fragment",
+    ] {
+        assert!(
+            matches!(
+                validate_loopback_websocket_base(invalid),
+                Err(ProviderError::Configuration(_))
+            ),
+            "accepted unsafe WebSocket base {invalid}"
+        );
+    }
 }
 
 #[test]
@@ -1149,50 +1178,18 @@ async fn stalled_drain_flushes_automatic_close_reply_before_close_outcome_and_er
 }
 
 mod emitter_contracts {
-    #![cfg(feature = "test-transport")]
-
-    use std::{sync::Arc, time::Duration};
+    use std::time::Duration;
 
     use fccli::{
-        clock::{Clock, ManualClock},
-        error::{
-            ErrorContext, ErrorOperation, ModelError, PayloadError, ProviderError, SanitizedCause,
-            SanitizedMessage, TimeoutKind,
-        },
-        model::{
-            Candle, ConnectionStatus, GapGeneration, HistoryRequest, Instrument, InstrumentSpec,
-            Market, MarketEvent, MonoInstant, ProviderId, RateGateState, ReplayRevision, Timeframe,
-        },
-        provider::binance::{
-            BinanceProvider, BinanceTestConfig, CONTROL_CAPACITY, EMERGENCY_CONTROL_CAPACITY,
-            FIRST_KLINE_HANDSHAKE_TIMEOUT, KEYED_CANDLE_CAPACITY, LiveCompletionDisposition,
-            LiveErrorDisposition, LiveInBandEventDisposition, LiveInputClassification,
-            LiveSupervisorConfig, MARKET_EVENT_CHANNEL_CAPACITY, MAX_CONNECTION_AGE,
-            RECONCILE_ACK_TIMEOUT, classify_live_error_for_test, classify_live_input_for_test,
-        },
-        provider::test_transport::{BinanceDecoded, DecodedFrame, EventEmitterTestFacade},
-        provider::{
-            CancellationToken, LiveRequest, MarketDataProvider, ProducerCompletion,
-            ProviderRegistry, ReconcileAck, ReconcileAckPublishError, accepted_watermark_channel,
-            reconcile_ack_channel,
-        },
+        error::ProviderError,
+        model::{Candle, ConnectionStatus, GapGeneration, MarketEvent},
+        provider::test_transport::EventEmitterTestFacade,
     };
-    use futures_util::{SinkExt, StreamExt};
-    use serde_json::json;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-        sync::oneshot,
-        time::timeout,
-    };
-    use tokio_tungstenite::{accept_async, tungstenite::Message};
-    use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{method, query_param},
-    };
+    use tokio::time::timeout;
 
     const OPEN_TIME: i64 = 1_700_000_040_000;
-    fn candle(open_time: i64, close: f64) -> Candle {
+
+    fn candle(open_time: i64, close: f64, closed: bool) -> Candle {
         Candle::from_ws(
             open_time,
             open_time + 59_999,
@@ -1201,701 +1198,178 @@ mod emitter_contracts {
             close,
             close,
             1.0,
-            false,
+            closed,
         )
         .expect("valid candle")
     }
 
-    #[tokio::test]
-    async fn same_key_replacement_preserves_distinct_capacity_and_event_order() {
-        let mut facade = EventEmitterTestFacade::new(2);
-
-        facade
-            .queue_candle(candle(OPEN_TIME, 37_000.0))
-            .expect("first keyed slot");
-        facade
-            .queue_candle(candle(OPEN_TIME, 37_111.0))
-            .expect("same-key replacement must not consume a second slot");
-        facade
-            .queue_candle(candle(OPEN_TIME + 60_000, 37_222.0))
-            .expect("distinct key retains the second keyed slot");
-        assert_eq!(
-            facade.queue_candle(candle(OPEN_TIME + 120_000, 37_333.0)),
-            Err(ProviderError::QueueSaturated),
-            "only a third distinct key exhausts keyed capacity"
-        );
-
-        facade.flush().await.expect("flush queued candles");
-        let first = timeout(Duration::from_secs(1), facade.recv())
-            .await
-            .expect("first event timeout")
-            .expect("first event")
-            .expect("first event result");
-        let second = timeout(Duration::from_secs(1), facade.recv())
-            .await
-            .expect("second event timeout")
-            .expect("second event")
-            .expect("second event result");
-
-        match first {
-            MarketEvent::Candle { generation, candle } => {
-                assert_eq!(generation, GapGeneration(1));
-                assert_eq!(candle.open_time(), OPEN_TIME);
-                assert_eq!(candle.close(), 37_111.0, "queued value must be replaced");
-            }
-            other => panic!("expected first keyed candle, got {other:?}"),
-        }
-        match second {
-            MarketEvent::Candle { generation, candle } => {
-                assert_eq!(generation, GapGeneration(1));
-                assert_eq!(candle.open_time(), OPEN_TIME + 60_000);
-                assert_eq!(candle.close(), 37_222.0);
-            }
-            other => panic!("expected second keyed candle, got {other:?}"),
-        }
-        assert!(
-            timeout(Duration::from_millis(25), facade.recv())
-                .await
-                .is_err(),
-            "replacement must not enqueue an extra event"
-        );
-    }
-
-    fn instrument() -> Instrument {
-        Instrument::new(
-            ProviderId::new("binance").expect("provider"),
-            Market::Spot,
-            "BTC",
-            "USDT",
-            "BTCUSDT",
-        )
-        .expect("instrument")
-    }
-
-    fn rest_row(open_time: i64) -> serde_json::Value {
-        json!([
-            open_time,
-            "37000.00",
-            "37050.00",
-            "36975.25",
-            "37025.50",
-            "12.5",
-            open_time + 59_999,
-            "462812.5",
-            50,
-            "6.25",
-            "231406.25",
-            "0"
-        ])
-    }
-
-    fn ws_kline(open_time: i64, closed: bool, close: &str) -> String {
-        ws_kline_for(open_time, closed, close, "1m")
-    }
-
-    fn ws_kline_for(open_time: i64, closed: bool, close: &str, interval: &str) -> String {
-        json!({
-            "e": "kline",
-            "E": open_time + 60_001,
-            "s": "BTCUSDT",
-            "k": {
-                "t": open_time,
-                "T": open_time + 59_999,
-                "s": "BTCUSDT",
-                "i": interval,
-                "o": "37000.00",
-                "c": close,
-                "h": "37200.00",
-                "l": "36975.25",
-                "v": "12.5",
-                "x": closed
-            }
-        })
-        .to_string()
-    }
-
-    async fn rest_server(response: ResponseTemplate) -> MockServer {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(response)
-            .mount(&server)
-            .await;
-        server
-    }
-
-    async fn websocket_listener() -> (TcpListener, String) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("WS listener");
-        let address = listener.local_addr().expect("WS address");
-        (listener, format!("ws://{address}"))
-    }
-
-    async fn held_rest_listener(
-        body: serde_json::Value,
-    ) -> (
-        String,
-        oneshot::Receiver<()>,
-        oneshot::Sender<()>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        held_rest_listener_with_followup(body, None).await
-    }
-
-    async fn held_rest_listener_with_followup(
-        body: serde_json::Value,
-        followup_body: Option<serde_json::Value>,
-    ) -> (
-        String,
-        oneshot::Receiver<()>,
-        oneshot::Sender<()>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("REST listener");
-        let address = listener.local_addr().expect("REST address");
-        let (started_tx, started_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let mut started_tx = Some(started_tx);
-            let mut release_rx = Some(release_rx);
-            let mut request_count = 0_usize;
-            loop {
-                let (mut stream, _) = listener.accept().await.expect("REST accept");
-                let mut request = Vec::new();
-                let mut chunk = [0_u8; 1024];
-                loop {
-                    let read = stream.read(&mut chunk).await.expect("REST request read");
-                    assert!(read != 0, "REST request closed before headers");
-                    request.extend_from_slice(&chunk[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                if let Some(started_tx) = started_tx.take() {
-                    started_tx.send(()).ok();
-                    if release_rx
-                        .take()
-                        .expect("first REST release receiver")
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                let response_body = if request_count == 0 {
-                    &body
-                } else {
-                    followup_body.as_ref().unwrap_or(&body)
-                };
-                request_count += 1;
-                let body = serde_json::to_vec(response_body).expect("REST JSON");
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                if stream.write_all(response.as_bytes()).await.is_ok() {
-                    let _ = stream.write_all(&body).await;
-                    let _ = stream.shutdown().await;
-                }
-            }
-        });
-        (format!("http://{address}"), started_rx, release_tx, server)
-    }
-
-    fn provider(
-        rest_uri: &str,
-        websocket_uri: &str,
-        clock: Arc<dyn Clock>,
-        live: LiveSupervisorConfig,
-    ) -> Arc<BinanceProvider> {
-        let mut config = BinanceTestConfig::loopback(rest_uri).with_websocket_base(websocket_uri);
-        config.live = live;
-        Arc::new(BinanceProvider::new_test_live(config, clock).expect("test provider"))
-    }
-
-    fn request(
-        startup_watermark: Option<i64>,
-    ) -> (
-        LiveRequest,
-        fccli::provider::AcceptedWatermarkSender,
-        fccli::provider::ReconcileAckSender,
-    ) {
-        request_for(startup_watermark, Timeframe::Minute1)
-    }
-
-    fn request_for(
-        startup_watermark: Option<i64>,
-        timeframe: Timeframe,
-    ) -> (
-        LiveRequest,
-        fccli::provider::AcceptedWatermarkSender,
-        fccli::provider::ReconcileAckSender,
-    ) {
-        let (watermark_tx, watermark_rx) = accepted_watermark_channel(startup_watermark);
-        let (ack_tx, ack_rx) = reconcile_ack_channel();
-        let cancellation = fccli::provider::CancellationToken::new();
-        (
-            LiveRequest {
-                instrument: instrument(),
-                timeframe,
-                startup_watermark,
-                accepted_watermark_rx: watermark_rx,
-                reconcile_ack_rx: ack_rx,
-                cancellation,
-            },
-            watermark_tx,
-            ack_tx,
-        )
-    }
-
-    async fn next_event(feed: &mut fccli::provider::LiveFeed) -> MarketEvent {
-        timeout(Duration::from_secs(2), feed.events.next())
+    async fn recv(facade: &mut EventEmitterTestFacade) -> MarketEvent {
+        timeout(Duration::from_secs(1), facade.recv())
             .await
             .expect("event timeout")
-            .expect("event stream closed")
-            .expect("event error")
+            .expect("event stream")
+            .expect("event result")
     }
 
-    fn assert_status(event: MarketEvent, generation: Option<u64>, expected: ConnectionStatus) {
-        assert_eq!(
-            event,
-            MarketEvent::Status {
-                generation: generation.map(GapGeneration),
-                status: expected,
-            }
+    #[tokio::test]
+    async fn keyed_buffer_preserves_finality_replacement_order_and_distinct_capacity() {
+        let mut facade = EventEmitterTestFacade::new(2);
+        assert!(
+            facade
+                .queue_candle(candle(OPEN_TIME, 37_000.0, false))
+                .expect("first")
         );
-    }
+        assert!(
+            facade
+                .queue_candle(candle(OPEN_TIME, 37_111.0, true))
+                .expect("authoritative close")
+        );
+        assert!(
+            !facade
+                .queue_candle(candle(OPEN_TIME, 37_222.0, false))
+                .expect("regressive open ignored")
+        );
+        assert!(
+            facade
+                .queue_candle(candle(OPEN_TIME + 60_000, 37_333.0, false))
+                .expect("second key")
+        );
+        assert_eq!(
+            facade.queue_candle(candle(OPEN_TIME + 120_000, 37_444.0, false)),
+            Err(ProviderError::QueueSaturated)
+        );
 
-    async fn next_after_optional_startup_statuses(
-        feed: &mut fccli::provider::LiveFeed,
-    ) -> MarketEvent {
-        let mut saw_connecting = false;
-        let mut saw_gap_sync = false;
-        loop {
-            let event = next_event(feed).await;
-            match event {
-                MarketEvent::Status {
-                    generation: Some(GapGeneration(1)),
-                    status: ConnectionStatus::Connecting,
-                } if !saw_connecting && !saw_gap_sync => saw_connecting = true,
-                MarketEvent::Status {
-                    generation: Some(GapGeneration(1)),
-                    status: ConnectionStatus::GapSync,
-                } if saw_connecting && !saw_gap_sync => saw_gap_sync = true,
-                other @ MarketEvent::Status {
-                    generation: None,
-                    status: ConnectionStatus::Stopped,
-                } => return other,
-                other @ MarketEvent::Status { .. } => {
-                    panic!("non-canonical startup status before immediate fault: {other:?}")
-                }
-                other => return other,
+        assert!(facade.flush_one().await.expect("first flush"));
+        assert!(facade.flush_one().await.expect("second flush"));
+        assert!(!facade.flush_one().await.expect("empty flush"));
+        match recv(&mut facade).await {
+            MarketEvent::Candle { generation, candle } => {
+                assert_eq!(generation, GapGeneration(1));
+                assert_eq!(
+                    (candle.open_time(), candle.close(), candle.is_closed()),
+                    (OPEN_TIME, 37_111.0, true)
+                );
             }
+            other => panic!("expected first candle, got {other:?}"),
+        }
+        match recv(&mut facade).await {
+            MarketEvent::Candle { candle, .. } => {
+                assert_eq!(candle.open_time(), OPEN_TIME + 60_000)
+            }
+            other => panic!("expected second candle, got {other:?}"),
         }
     }
 
-    async fn next_batch(
-        feed: &mut fccli::provider::LiveFeed,
-    ) -> (
-        GapGeneration,
-        fccli::model::ReplayRevision,
-        i64,
-        Vec<fccli::model::Candle>,
-    ) {
-        match next_event(feed).await {
-            MarketEvent::ReconcileBatch {
-                generation,
-                revision,
-                target_open_time,
-                candles,
-            } => (generation, revision, target_open_time, candles),
-            other => panic!("expected reconcile batch, got {other:?}"),
-        }
-    }
-
-    fn acknowledge(
-        sender: &fccli::provider::ReconcileAckSender,
-        generation: GapGeneration,
-        revision: fccli::model::ReplayRevision,
-        through: i64,
-    ) {
-        sender
-            .publish(ReconcileAck {
-                generation,
-                revision,
-                through,
+    #[tokio::test]
+    async fn emergency_pair_uses_reserved_capacity_and_preserves_order() {
+        let mut facade = EventEmitterTestFacade::new(1);
+        facade
+            .send(MarketEvent::Status {
+                generation: Some(GapGeneration(1)),
+                status: ConnectionStatus::Connected,
             })
-            .expect("reconciliation acknowledgement");
-    }
-
-    #[tokio::test]
-    async fn saturated_app_channel_keeps_pong_progress_and_uses_emergency_pair_before_retry() {
-        let rest =
-            rest_server(ResponseTemplate::new(200).set_body_json(json!([rest_row(OPEN_TIME)])))
-                .await;
-        let (listener, ws_uri) = websocket_listener().await;
-        let (release_tx, release_rx) = oneshot::channel();
-        let (pongs_tx, pongs_rx) = oneshot::channel();
-        let (second_release_tx, second_release_rx) = oneshot::channel();
-        let (second_accept_tx, mut second_accept_rx) = oneshot::channel();
-        let (third_accept_tx, mut third_accept_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let mut websocket = accept_async(stream).await.expect("upgrade");
-            websocket
-                .send(Message::Text(ws_kline(OPEN_TIME, false, "37025.50").into()))
-                .await
-                .expect("first candle");
-            release_rx.await.expect("connected release");
-            for payload in [vec![1], vec![2], vec![3]] {
-                websocket
-                    .send(Message::Ping(payload.into()))
-                    .await
-                    .expect("ping");
-            }
-            for (offset, close) in [
-                (60_000, "37030.00"),
-                (120_000, "37035.00"),
-                (180_000, "37040.00"),
-            ] {
-                websocket
-                    .send(Message::Text(
-                        ws_kline(OPEN_TIME + offset, false, close).into(),
-                    ))
-                    .await
-                    .expect("queued candle");
-            }
-            let mut pongs = Vec::new();
-            while pongs.len() < 3 {
-                match timeout(Duration::from_secs(1), websocket.next()).await {
-                    Ok(Some(Ok(Message::Pong(payload)))) => pongs.push(payload.to_vec()),
-                    Ok(Some(Ok(_))) => {}
-                    _ => break,
-                }
-            }
-            pongs_tx.send(pongs).ok();
-            let (stream, _) = listener.accept().await.expect("second accept");
-            second_accept_tx.send(true).ok();
-            let mut websocket = accept_async(stream).await.expect("second upgrade");
-            websocket
-                .send(Message::Text(ws_kline(OPEN_TIME, false, "37025.50").into()))
-                .await
-                .expect("second-generation first candle");
-            second_release_rx.await.expect("second connected release");
-            for (offset, close) in [
-                (60_000, "37030.00"),
-                (120_000, "37035.00"),
-                (180_000, "37040.00"),
-            ] {
-                websocket
-                    .send(Message::Text(
-                        ws_kline(OPEN_TIME + offset, false, close).into(),
-                    ))
-                    .await
-                    .expect("second-generation saturating candle");
-            }
-            let third_connection = listener.accept().await;
-            third_accept_tx.send(third_connection.is_ok()).ok();
-        });
-        let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
-        let clock: Arc<dyn Clock> = manual.clone();
-        let live = LiveSupervisorConfig {
-            keyed_candle_capacity: 1,
-            control_capacity: 1,
-            market_event_capacity: 1,
-            ..LiveSupervisorConfig::default()
-        };
-        let provider = provider(&rest.uri(), &ws_uri, clock, live);
-        let (request, _watermark_tx, ack_tx) = request(Some(OPEN_TIME));
-        let mut feed = provider.open_live(request).await.expect("feed");
-        assert_status(
-            next_event(&mut feed).await,
-            Some(1),
-            ConnectionStatus::Connecting,
-        );
-        assert_status(
-            next_event(&mut feed).await,
-            Some(1),
-            ConnectionStatus::GapSync,
-        );
-        let (generation, revision, target, _) = next_batch(&mut feed).await;
-        acknowledge(&ack_tx, generation, revision, target);
-        assert_status(
-            next_event(&mut feed).await,
-            Some(1),
-            ConnectionStatus::Connected,
-        );
-        release_tx.send(()).expect("release connected traffic");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            pongs_rx.await.expect("pong report"),
-            vec![vec![1], vec![2], vec![3]]
-        );
-        manual
-            .advance_by(Duration::from_secs(1))
-            .expect("first backoff elapsed while output remains saturated");
-        assert!(
-            timeout(Duration::from_millis(50), &mut second_accept_rx)
-                .await
-                .is_err(),
-            "the backoff clock starts while the emergency pair remains queued, but the next generation cannot start before dequeue"
-        );
-
-        assert_eq!(
-            next_event(&mut feed).await,
-            MarketEvent::RecoverableError {
-                generation: None,
-                error: ProviderError::QueueSaturated,
-                rate_gate_deadline: None,
-            },
-            "saturation logically purges the already queued generation-1 candle"
-        );
-        assert!(
-            timeout(Duration::from_millis(50), &mut second_accept_rx)
-                .await
-                .is_err(),
-            "dequeueing only the first half of the pair must not release the next generation"
-        );
-
-        assert_status(next_event(&mut feed).await, None, ConnectionStatus::Backoff);
-        assert_status(
-            next_event(&mut feed).await,
-            Some(2),
-            ConnectionStatus::Connecting,
-        );
-        assert!(
-            timeout(Duration::from_secs(1), &mut second_accept_rx)
-                .await
-                .expect("second-generation connection timeout")
-                .expect("second-generation accept report"),
-            "the second generation must connect after the full emergency pair is consumed"
-        );
-        assert_status(
-            next_event(&mut feed).await,
-            Some(2),
-            ConnectionStatus::GapSync,
-        );
-        let (generation, revision, target, _) = next_batch(&mut feed).await;
-        acknowledge(&ack_tx, generation, revision, target);
-        assert_status(
-            next_event(&mut feed).await,
-            Some(2),
-            ConnectionStatus::Connected,
-        );
-        second_release_tx
-            .send(())
-            .expect("release second-generation traffic");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        manual
-            .advance_by(Duration::from_secs(2))
-            .expect("second backoff elapsed while pair remains queued");
-        assert!(
-            timeout(Duration::from_millis(50), &mut third_accept_rx)
-                .await
-                .is_err(),
-            "repeated saturation must reuse the reserved pair and still wait for dequeue"
-        );
-        assert_eq!(
-            next_event(&mut feed).await,
-            MarketEvent::RecoverableError {
-                generation: None,
-                error: ProviderError::QueueSaturated,
-                rate_gate_deadline: None,
-            }
-        );
-        assert_status(next_event(&mut feed).await, None, ConnectionStatus::Backoff);
-        assert_status(
-            next_event(&mut feed).await,
-            Some(3),
-            ConnectionStatus::Connecting,
-        );
-        assert!(
-            timeout(Duration::from_secs(1), &mut third_accept_rx)
-                .await
-                .expect("third-generation connection timeout")
-                .expect("third-generation accept report"),
-            "a second saturation cycle must not exhaust or allocate a one-shot emergency path"
-        );
-        feed.request_shutdown();
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn cancellation_while_saturation_pair_is_queued_emits_only_stopped() {
-        let rest =
-            rest_server(ResponseTemplate::new(200).set_body_json(json!([rest_row(OPEN_TIME)])))
-                .await;
-        let (listener, ws_uri) = websocket_listener().await;
-        let (release_tx, release_rx) = oneshot::channel();
-        let (saturated_connection_closed_tx, saturated_connection_closed_rx) = oneshot::channel();
-        let (second_accept_tx, mut second_accept_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let mut websocket = accept_async(stream).await.expect("upgrade");
-            websocket
-                .send(Message::Text(ws_kline(OPEN_TIME, false, "37025.50").into()))
-                .await
-                .expect("first candle");
-            release_rx.await.expect("release saturating traffic");
-            for (offset, close) in [
-                (60_000, "37030.00"),
-                (120_000, "37035.00"),
-                (180_000, "37040.00"),
-            ] {
-                websocket
-                    .send(Message::Text(
-                        ws_kline(OPEN_TIME + offset, false, close).into(),
-                    ))
-                    .await
-                    .expect("saturating candle");
-            }
-            while let Some(message) = websocket.next().await {
-                if message.is_err() || matches!(message, Ok(Message::Close(_))) {
-                    break;
-                }
-            }
-            saturated_connection_closed_tx.send(()).ok();
-            let second_connection = listener.accept().await;
-            second_accept_tx.send(second_connection.is_ok()).ok();
-        });
-        let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
-        let clock: Arc<dyn Clock> = manual.clone();
-        let live = LiveSupervisorConfig {
-            keyed_candle_capacity: 1,
-            control_capacity: 1,
-            market_event_capacity: 1,
-            ..LiveSupervisorConfig::default()
-        };
-        let provider = provider(&rest.uri(), &ws_uri, clock, live);
-        let (request, _watermark_tx, ack_tx) = request(Some(OPEN_TIME));
-        let cancellation = request.cancellation.clone();
-        let mut feed = provider.open_live(request).await.expect("feed");
-        assert_status(
-            next_event(&mut feed).await,
-            Some(1),
-            ConnectionStatus::Connecting,
-        );
-        assert_status(
-            next_event(&mut feed).await,
-            Some(1),
-            ConnectionStatus::GapSync,
-        );
-        let (generation, revision, target, _) = next_batch(&mut feed).await;
-        acknowledge(&ack_tx, generation, revision, target);
-        assert_status(
-            next_event(&mut feed).await,
-            Some(1),
-            ConnectionStatus::Connected,
-        );
-        release_tx.send(()).expect("release saturating traffic");
-        saturated_connection_closed_rx
             .await
-            .expect("saturated generation closed");
-        for _ in 0..3 {
-            tokio::task::yield_now().await;
-        }
-        manual
-            .advance_by(Duration::from_secs(1))
-            .expect("emergency-pair backoff deadline");
-        for _ in 0..3 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            timeout(Duration::from_millis(50), &mut second_accept_rx)
-                .await
-                .is_err(),
-            "elapsed backoff cannot start generation 2 while the queued emergency pair is not dequeued"
-        );
-        cancellation.cancel();
-        assert_status(next_event(&mut feed).await, None, ConnectionStatus::Stopped);
-        match timeout(Duration::from_millis(50), feed.events.next()).await {
-            Ok(Some(Ok(event))) => panic!("unexpected event after cancellation stop: {event:?}"),
-            Ok(Some(Err(error))) => {
-                panic!("unexpected stream error after cancellation stop: {error:?}")
-            }
-            Ok(None) | Err(_) => {}
-        }
+            .expect("regular event");
+        facade
+            .queue_emergency_pair(
+                MarketEvent::RecoverableError {
+                    generation: None,
+                    error: ProviderError::QueueSaturated,
+                    rate_gate_deadline: None,
+                },
+                MarketEvent::Status {
+                    generation: None,
+                    status: ConnectionStatus::Backoff,
+                },
+            )
+            .expect("emergency pair");
         assert!(matches!(
-            feed.producer_completion.changed().await,
-            Ok(ProducerCompletion::Finished(Ok(())))
+            recv(&mut facade).await,
+            MarketEvent::Status {
+                status: ConnectionStatus::Connected,
+                ..
+            }
         ));
-        assert!(
-            timeout(Duration::from_millis(50), &mut second_accept_rx)
-                .await
-                .is_err(),
-            "cancellation must suppress the next generation"
-        );
-        server.abort();
+        assert!(matches!(
+            recv(&mut facade).await,
+            MarketEvent::RecoverableError {
+                error: ProviderError::QueueSaturated,
+                ..
+            }
+        ));
+        assert!(matches!(
+            recv(&mut facade).await,
+            MarketEvent::Status {
+                status: ConnectionStatus::Backoff,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
-    async fn dropping_saturated_event_receiver_unblocks_the_producer() {
-        let rest =
-            rest_server(ResponseTemplate::new(200).set_body_json(json!([rest_row(OPEN_TIME)])))
-                .await;
-        let (listener, ws_uri) = websocket_listener().await;
-        let (traffic_sent_tx, traffic_sent_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            let mut websocket = accept_async(stream).await.expect("upgrade");
-            websocket
-                .send(Message::Text(ws_kline(OPEN_TIME, false, "37025.50").into()))
-                .await
-                .expect("first candle");
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            for offset in [60_000, 120_000, 180_000] {
-                websocket
-                    .send(Message::Text(
-                        ws_kline(OPEN_TIME + offset, false, "37030.00").into(),
-                    ))
-                    .await
-                    .expect("saturating candle");
-            }
-            traffic_sent_tx.send(()).ok();
-            futures_util::future::pending::<()>().await;
-        });
-        let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
-        let clock: Arc<dyn Clock> = manual;
-        let live = LiveSupervisorConfig {
-            keyed_candle_capacity: 1,
-            control_capacity: 1,
-            market_event_capacity: 1,
-            ..LiveSupervisorConfig::default()
-        };
-        let provider = provider(&rest.uri(), &ws_uri, clock, live);
-        let (request, _watermark_tx, ack_tx) = request(Some(OPEN_TIME));
-        let mut feed = provider.open_live(request).await.expect("feed");
-        assert_status(
-            next_event(&mut feed).await,
-            Some(1),
-            ConnectionStatus::Connecting,
-        );
-        assert_status(
-            next_event(&mut feed).await,
-            Some(1),
-            ConnectionStatus::GapSync,
-        );
-        let (generation, revision, target, _) = next_batch(&mut feed).await;
-        acknowledge(&ack_tx, generation, revision, target);
-        assert_status(
-            next_event(&mut feed).await,
-            Some(1),
-            ConnectionStatus::Connected,
-        );
-
-        traffic_sent_rx.await.expect("saturating traffic sent");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let events = std::mem::replace(&mut feed.events, Box::pin(futures_util::stream::empty()));
-        drop(events);
-
+    async fn shutdown_suppresses_queued_emergency_pair_and_delivers_stopped() {
+        let mut facade = EventEmitterTestFacade::new(1);
+        facade
+            .queue_emergency_pair(
+                MarketEvent::RecoverableError {
+                    generation: None,
+                    error: ProviderError::QueueSaturated,
+                    rate_gate_deadline: None,
+                },
+                MarketEvent::Status {
+                    generation: None,
+                    status: ConnectionStatus::Backoff,
+                },
+            )
+            .expect("emergency pair");
+        let first = recv(&mut facade).await;
+        assert!(matches!(first, MarketEvent::RecoverableError { .. }));
+        let second = recv(&mut facade).await;
         assert!(matches!(
-            timeout(Duration::from_secs(1), feed.producer_completion.changed())
-                .await
-                .expect("receiver drop must unblock producer"),
-            Ok(ProducerCompletion::Finished(Err(
-                ProviderError::ChannelClosed { .. }
-            )))
+            second,
+            MarketEvent::Status {
+                status: ConnectionStatus::Backoff,
+                ..
+            }
         ));
-        server.abort();
+        facade.shutdown().await;
+        assert!(matches!(
+            recv(&mut facade).await,
+            MarketEvent::Status {
+                generation: None,
+                status: ConnectionStatus::Stopped
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn receiver_close_unblocks_a_producer_waiting_for_regular_capacity() {
+        let mut facade = EventEmitterTestFacade::new(1);
+        facade
+            .send(MarketEvent::Candle {
+                generation: GapGeneration(1),
+                candle: candle(OPEN_TIME, 1.0, false),
+            })
+            .await
+            .expect("fill capacity");
+        let producer = {
+            let facade = facade.clone_emitter();
+            tokio::spawn(async move {
+                facade
+                    .send(MarketEvent::Candle {
+                        generation: GapGeneration(1),
+                        candle: candle(OPEN_TIME + 60_000, 2.0, false),
+                    })
+                    .await
+            })
+        };
+        facade.close_receiver();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), producer)
+                .await
+                .expect("producer timeout")
+                .expect("producer task"),
+            Err(ProviderError::ChannelClosed { .. })
+        ));
     }
 }

@@ -1,7 +1,7 @@
 //! Hyperliquid Spot and Perpetual REST history and raw WebSocket transport.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
@@ -28,16 +28,16 @@ use crate::{
         SanitizedMessage, TimeoutKind,
     },
     model::{
-        Candle, ConnectionStatus, FinalityAuthority, GapGeneration, HistoryRequest,
-        HistoryRequestKind, Instrument, InstrumentSpec, Market, MarketEvent, MonoInstant,
-        ProviderId, RateGateState, ReplayRevision, Timeframe, is_spot_index_token,
+        Candle, ConnectionStatus, GapGeneration, HistoryRequest, HistoryRequestKind, Instrument,
+        InstrumentSpec, Market, MarketEvent, MonoInstant, ProviderId, RateGateState,
+        ReplayRevision, Timeframe, is_spot_index_token,
     },
     provider::{
         LiveFeed, LiveRequest, MarketDataProvider, ProviderFuture, RateGateSender,
         RateGateSnapshot, ReconcileAck, ReconcileExpectation, ReconcileExpectationError,
         rate_gate_channel,
         runtime::{
-            emitter::{EventEmitter, live_channel_closed},
+            emitter::{EventEmitter, KeyedCandleBuffer, live_channel_closed},
             websocket::{
                 DecodedFrame, ReadinessInput, WsCodec, WsConfig, connect_websocket_url,
                 contextualize_websocket_configuration, validate_websocket_base,
@@ -1252,9 +1252,9 @@ impl HyperliquidProvider {
         let start = confirmed.unwrap_or_else(|| first.open_time());
         let mut target_open_time = first.open_time().max(start);
         let mut revision = ReplayRevision(1);
-        let mut buffered = BTreeMap::new();
+        let mut buffered = KeyedCandleBuffer::unbounded();
         if first.open_time() >= start {
-            coalesce_candle(&mut buffered, first);
+            let _ = buffered.push(first)?;
         }
         let mut deferred_reconnect: Option<ProviderError> = None;
         let mut rest_synced_through = None;
@@ -1537,7 +1537,7 @@ impl HyperliquidProvider {
                 let page_len = page.len();
                 let mut accepted_any = false;
                 for candle in page {
-                    accepted_any |= coalesce_candle(&mut buffered, candle);
+                    accepted_any |= buffered.push(candle)?;
                 }
                 let Some(last) = last else { unreachable!() };
                 rest_synced_through = Some(last);
@@ -1678,7 +1678,7 @@ impl HyperliquidProvider {
         age_deadline: MonoInstant,
     ) -> Result<GenerationOutcome, ProviderError> {
         let mut connected_queued = false;
-        let mut pending = BTreeMap::<i64, Candle>::new();
+        let mut pending = KeyedCandleBuffer::bounded(self.live.keyed_candle_capacity);
         let mut gate = self.gate_snapshot.clone();
         loop {
             if matches!(gate.current(), Ok(RateGateState::ProcessBlocked(_))) {
@@ -1701,8 +1701,7 @@ impl HyperliquidProvider {
                 },
                 permit = sender.reserve_regular(), if connected_queued && !pending.is_empty() => {
                     let permit = permit?;
-                    let key = *pending.first_key_value().expect("pending is nonempty").0;
-                    let candle = pending.remove(&key).expect("key came from pending");
+                    let candle = pending.pop_first().expect("pending is nonempty");
                     sender.send_reserved(permit, MarketEvent::Candle { generation, candle })?;
                 },
                 frame = socket.read() => {
@@ -1712,12 +1711,9 @@ impl HyperliquidProvider {
                     }
                     match frame {
                         Ok(DecodedFrame::Provider(HyperliquidDecoded::Candle(candle))) => {
-                            let is_new_key = !pending.contains_key(&candle.open_time());
-                            if is_new_key && pending.len() == self.live.keyed_candle_capacity {
-                                let outcome = ProviderError::QueueSaturated;
+                            if let Err(outcome) = pending.push(candle) {
                                 return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(outcome) } else { GenerationOutcome::Reconnect(outcome) });
                             }
-                            coalesce_candle(&mut pending, candle);
                         }
                         Ok(DecodedFrame::Ignored | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong)) => {}
                         Ok(DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted)) => {
@@ -1972,7 +1968,7 @@ fn advance_reconciliation_target(
 }
 
 fn apply_reconciliation_candle(
-    pending: &mut BTreeMap<i64, Candle>,
+    pending: &mut KeyedCandleBuffer,
     candidate: Candle,
     revision: &mut ReplayRevision,
     target_open_time: &mut i64,
@@ -1994,7 +1990,7 @@ fn apply_reconciliation_candle(
         timeframe,
         maximum_successors,
     )?;
-    let _ = coalesce_candle(pending, candidate);
+    let _ = pending.push(candidate)?;
     revision.0 = revision
         .0
         .checked_add(1)
@@ -2003,13 +1999,13 @@ fn apply_reconciliation_candle(
 }
 
 fn ensure_reconciliation_buffer_capacity(
-    pending: &BTreeMap<i64, Candle>,
+    pending: &KeyedCandleBuffer,
     open_time: i64,
     distinct_key_limit: usize,
 ) -> Result<(), ProviderError> {
     if !reconciliation_distinct_key_allowed(
         pending.len(),
-        pending.contains_key(&open_time),
+        pending.contains_key(open_time),
         distinct_key_limit,
     ) {
         return Err(ProviderError::Protocol {
@@ -2064,36 +2060,6 @@ pub fn reconciliation_distinct_key_allowed_for_test(existing_len: usize, key_exi
         key_exists,
         MAX_GAP_RECONCILIATION_CANDLES + 1,
     )
-}
-
-fn coalesce_candle(pending: &mut BTreeMap<i64, Candle>, candidate: Candle) -> bool {
-    use FinalityAuthority::{
-        RestProvisionalClosed, RestProvisionalOpen, WsAuthoritativeClosed, WsAuthoritativeOpen,
-    };
-    let key = candidate.open_time();
-    match pending.get(&key) {
-        None => {
-            pending.insert(key, candidate);
-            true
-        }
-        Some(current) => {
-            let replace = match (current.authority(), candidate.authority()) {
-                (_, WsAuthoritativeClosed) => true,
-                (WsAuthoritativeClosed, _) => false,
-                (WsAuthoritativeOpen, RestProvisionalOpen | RestProvisionalClosed) => false,
-                (RestProvisionalOpen | RestProvisionalClosed, WsAuthoritativeOpen) => true,
-                (WsAuthoritativeOpen, WsAuthoritativeOpen) => true,
-                (RestProvisionalClosed, RestProvisionalOpen) => false,
-                (RestProvisionalOpen, RestProvisionalClosed)
-                | (RestProvisionalOpen, RestProvisionalOpen)
-                | (RestProvisionalClosed, RestProvisionalClosed) => true,
-            };
-            if replace {
-                pending.insert(key, candidate);
-            }
-            replace
-        }
-    }
 }
 
 fn control_channel_closed(instrument: &Instrument, timeframe: Timeframe) -> ProviderError {

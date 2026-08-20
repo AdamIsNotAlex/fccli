@@ -1,17 +1,17 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+    },
 };
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::{
     error::{ErrorContext, ErrorOperation, ProviderError},
-    model::{ConnectionStatus, GapGeneration, MarketEvent},
+    model::{Candle, ConnectionStatus, GapGeneration, MarketEvent},
 };
-
-#[cfg(feature = "test-transport")]
-use std::collections::BTreeMap;
 
 pub(crate) type StatusKey = (Option<GapGeneration>, ConnectionStatus);
 
@@ -138,13 +138,96 @@ pub(crate) struct EventEmitter {
     pub(crate) emergency_barrier: Arc<EmergencyBarrier>,
     shutdown: Arc<AtomicBool>,
 }
+pub(crate) struct KeyedCandleBuffer {
+    pending: BTreeMap<i64, Candle>,
+    capacity: Option<usize>,
+}
+
+impl KeyedCandleBuffer {
+    pub(crate) fn unbounded() -> Self {
+        Self {
+            pending: BTreeMap::new(),
+            capacity: None,
+        }
+    }
+
+    pub(crate) fn bounded(capacity: usize) -> Self {
+        Self {
+            pending: BTreeMap::new(),
+            capacity: Some(capacity),
+        }
+    }
+
+    pub(crate) fn push(&mut self, candidate: Candle) -> Result<bool, ProviderError> {
+        use crate::model::FinalityAuthority::{
+            RestProvisionalClosed, RestProvisionalOpen, WsAuthoritativeClosed, WsAuthoritativeOpen,
+        };
+
+        let key = candidate.open_time();
+        let Some(current) = self.pending.get(&key) else {
+            if self
+                .capacity
+                .is_some_and(|capacity| self.pending.len() == capacity)
+            {
+                return Err(ProviderError::QueueSaturated);
+            }
+            self.pending.insert(key, candidate);
+            return Ok(true);
+        };
+        let replace = match (current.authority(), candidate.authority()) {
+            (_, WsAuthoritativeClosed) => true,
+            (WsAuthoritativeClosed, _) => false,
+            (WsAuthoritativeOpen, RestProvisionalOpen | RestProvisionalClosed) => false,
+            (RestProvisionalOpen | RestProvisionalClosed, WsAuthoritativeOpen) => true,
+            (WsAuthoritativeOpen, WsAuthoritativeOpen) => true,
+            (RestProvisionalClosed, RestProvisionalOpen) => false,
+            (RestProvisionalOpen, RestProvisionalClosed)
+            | (RestProvisionalOpen, RestProvisionalOpen)
+            | (RestProvisionalClosed, RestProvisionalClosed) => true,
+        };
+        if replace {
+            self.pending.insert(key, candidate);
+        }
+        Ok(replace)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub(crate) fn contains_key(&self, key: i64) -> bool {
+        self.pending.contains_key(&key)
+    }
+
+    pub(crate) fn pop_first(&mut self) -> Option<Candle> {
+        self.pending.pop_first().map(|(_, candle)| candle)
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &Candle> {
+        self.pending.values()
+    }
+}
+
 #[cfg(feature = "test-transport")]
 pub struct EventEmitterTestFacade {
     emitter: EventEmitter,
     receiver: mpsc::Receiver<EventEnvelope>,
-    keyed_capacity: usize,
-    pending: BTreeMap<i64, crate::model::Candle>,
+    keyed: KeyedCandleBuffer,
     generation: GapGeneration,
+}
+#[cfg(feature = "test-transport")]
+#[derive(Clone)]
+pub struct EventEmitterTestSender(EventEmitter);
+
+#[cfg(feature = "test-transport")]
+impl EventEmitterTestSender {
+    pub async fn send(&self, event: MarketEvent) -> Result<(), ProviderError> {
+        self.0.send_regular(event).await
+    }
 }
 
 #[cfg(feature = "test-transport")]
@@ -157,35 +240,56 @@ impl EventEmitterTestFacade {
         Self {
             emitter: EventEmitter::new(sender, keyed_capacity, 1),
             receiver,
-            keyed_capacity,
-            pending: BTreeMap::new(),
+            keyed: KeyedCandleBuffer::bounded(keyed_capacity),
             generation: GapGeneration(1),
         }
     }
 
-    pub fn queue_candle(&mut self, candle: crate::model::Candle) -> Result<(), ProviderError> {
-        let key = candle.open_time();
-        if !self.pending.contains_key(&key) && self.pending.len() == self.keyed_capacity {
-            return Err(ProviderError::QueueSaturated);
-        }
-        self.pending.insert(key, candle);
-        Ok(())
+    pub fn queue_candle(&mut self, candle: Candle) -> Result<bool, ProviderError> {
+        self.keyed.push(candle)
     }
 
-    pub async fn flush(&mut self) -> Result<(), ProviderError> {
-        while let Some((_, candle)) = self.pending.pop_first() {
-            self.emitter
-                .send_regular(MarketEvent::Candle {
-                    generation: self.generation,
-                    candle,
-                })
-                .await?;
-        }
-        Ok(())
+    pub async fn flush_one(&mut self) -> Result<bool, ProviderError> {
+        let Some(candle) = self.keyed.pop_first() else {
+            return Ok(false);
+        };
+        self.emitter
+            .send_regular(MarketEvent::Candle {
+                generation: self.generation,
+                candle,
+            })
+            .await?;
+        Ok(true)
+    }
+
+    pub async fn send(&self, event: MarketEvent) -> Result<(), ProviderError> {
+        self.emitter.send_regular(event).await
+    }
+
+    pub fn queue_emergency_pair(
+        &self,
+        first: MarketEvent,
+        second: MarketEvent,
+    ) -> Result<(), ProviderError> {
+        self.emitter.queue_emergency_pair(first, second).map(|_| ())
+    }
+
+    pub async fn shutdown(&self) {
+        self.emitter.shutdown().await;
     }
 
     pub async fn recv(&mut self) -> Option<Result<MarketEvent, ProviderError>> {
         self.receiver.recv().await.map(EventEnvelope::into_item)
+    }
+
+    pub fn close_receiver(&mut self) {
+        let (_sender, receiver) = mpsc::channel(1);
+        let previous = std::mem::replace(&mut self.receiver, receiver);
+        drop(previous);
+    }
+
+    pub fn clone_emitter(&self) -> EventEmitterTestSender {
+        EventEmitterTestSender(self.emitter.clone())
     }
 }
 
