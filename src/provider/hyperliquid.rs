@@ -2,7 +2,7 @@
 
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
-use reqwest::{Client, StatusCode, Url, header::RETRY_AFTER};
+use reqwest::{StatusCode, Url, header::RETRY_AFTER};
 use serde::{
     Deserialize,
     de::{IgnoredAny, SeqAccess, Visitor},
@@ -18,17 +18,17 @@ use crate::{
     cli::canonicalize_instrument,
     clock::{Clock, checked_deadline},
     error::{
-        ErrorContext, ErrorOperation, PayloadError, ProviderError, SanitizedCause,
-        SanitizedMessage, TimeoutKind,
+        ErrorContext, ErrorOperation, PayloadError, ProviderError, SanitizedMessage, TimeoutKind,
     },
     model::{
         Candle, HistoryRequest, HistoryRequestKind, Instrument, InstrumentSpec, Market, ProviderId,
-        RateGateState, Timeframe, is_spot_index_token,
+        Timeframe, is_spot_index_token,
     },
     provider::{
         LiveFeed, LiveRequest, MarketDataProvider, ProviderCapabilities, ProviderFuture,
-        RateGateSender, RateGateSnapshot, rate_gate_channel,
+        RateGateSnapshot,
         runtime::{
+            http::{HttpRuntime, RateLimitDecision},
             live::{
                 ConnectionRotation, LiveAdapter, LiveConfig, LiveRateGate, LiveSocket,
                 LiveSocketEvent, LiveSupervisorConfig as SharedLiveSupervisorConfig,
@@ -540,13 +540,10 @@ pub async fn connect_test_websocket(
 
 #[derive(Clone)]
 pub struct HyperliquidProvider {
-    client: Client,
+    http: HttpRuntime,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     base_url: Url,
     clock: Arc<dyn Clock>,
-    gate_sender: RateGateSender,
-    gate_snapshot: RateGateSnapshot,
-    body_limit: usize,
     rate_limit_fallback: Duration,
     live: HyperliquidLiveConfig,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -678,22 +675,12 @@ impl HyperliquidProvider {
             ));
         }
         live.validate()?;
-        let client = Client::builder()
-            .no_proxy()
-            .timeout(request_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("fccli/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|_| ProviderError::Configuration("failed to build REST client"))?;
-        let (gate_sender, gate_snapshot) = rate_gate_channel(RateGateState::Open);
+        let http = HttpRuntime::new(Arc::clone(&clock), request_timeout, body_limit)?;
         Ok(Self {
-            client,
+            http,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             base_url,
             clock,
-            gate_sender,
-            gate_snapshot,
-            body_limit,
             rate_limit_fallback,
             live,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -738,46 +725,23 @@ impl HyperliquidProvider {
                 }
             });
 
-            let response = tokio::select! {
-                biased;
-                () = cancellation.cancelled() => return Err(cancelled(context.clone())),
-                result = self.client.post(url).json(&body).send() => result.map_err(|error| {
-                    if error.is_timeout() {
-                        ProviderError::Timeout { context: context.clone(), kind: TimeoutKind::Request }
-                    } else {
-                        ProviderError::Transport { context: context.clone(), cause: SanitizedCause::Connection }
-                    }
-                })?,
-            };
+            let response = self
+                .http
+                .send(
+                    self.http.client().post(url).json(&body),
+                    &cancellation,
+                    &context,
+                )
+                .await?;
 
             let status = response.status();
             if status == StatusCode::TOO_MANY_REQUESTS {
                 return self.handle_rate_limit(&response, context);
             }
-            if status.is_server_error() {
-                return Err(ProviderError::ServerStatus {
-                    context,
-                    status: status.as_u16(),
-                });
-            }
-            if status.is_redirection() {
-                return Err(ProviderError::ClientStatus {
-                    context,
-                    status: status.as_u16(),
-                    code: None,
-                    message: None,
-                });
-            }
-            if status.is_client_error() {
-                let bytes =
-                    match read_capped(response, self.body_limit, &cancellation, &context).await {
-                        Ok(bytes) => bytes,
-                        Err(error) if is_cancelled(&error) => return Err(error),
-                        Err(_) => Vec::new(),
-                    };
-                return Err(map_http_error(status, &bytes, context));
-            }
-            let bytes = read_capped(response, self.body_limit, &cancellation, &context).await?;
+            let bytes = self
+                .http
+                .read_response(response, &cancellation, context.clone(), map_http_error)
+                .await?;
             let (window_start, window_end) = response_validation_window(
                 timeframe,
                 request.kind(),
@@ -808,33 +772,11 @@ impl HyperliquidProvider {
         cancellation: &CancellationToken,
         context: &ErrorContext,
     ) -> Result<(), ProviderError> {
-        let mut snapshot = self.gate_snapshot.clone();
-        loop {
-            match snapshot
-                .current()
-                .map_err(|_| ProviderError::Invariant("rate gate closed"))?
-            {
-                RateGateState::Open => return Ok(()),
-                RateGateState::ProcessBlocked(_) => {
-                    return Err(ProviderError::Invariant(
-                        "Hyperliquid rate gate cannot be process-blocked",
-                    ));
-                }
-                RateGateState::TimedUntil(deadline) if deadline <= self.clock.now() => {
-                    return Ok(());
-                }
-                RateGateState::TimedUntil(deadline) => {
-                    tokio::select! {
-                        biased;
-                        () = cancellation.cancelled() => return Err(cancelled(context.clone())),
-                        changed = snapshot.changed() => {
-                            changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?;
-                        }
-                        () = self.clock.sleep_until(deadline) => {}
-                    }
-                }
-            }
-        }
+        self.http
+            .await_gate(cancellation, context, |_| {
+                ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked")
+            })
+            .await
     }
 
     fn handle_rate_limit(
@@ -853,13 +795,12 @@ impl HyperliquidProvider {
             })
             .or_else(|| checked_deadline(self.clock.now(), self.rate_limit_fallback).ok())
             .ok_or(ProviderError::Invariant("rate-limit deadline overflow"))?;
-        self.gate_sender
-            .publish(RateGateState::TimedUntil(deadline))
-            .map_err(|_| ProviderError::Invariant("rate gate closed"))?;
-        Err(ProviderError::RateLimited {
+        self.http.apply_rate_limit(
+            RateLimitDecision::TimedUntil(deadline),
             context,
-            status: response.status().as_u16(),
-        })
+            response.status(),
+        )?;
+        unreachable!("rate-limit application always returns an error")
     }
     pub fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
         if spec.provider().as_str() != "hyperliquid" {
@@ -917,7 +858,7 @@ impl HyperliquidProvider {
 
     #[must_use]
     pub fn rate_gate(&self) -> RateGateSnapshot {
-        self.gate_snapshot.clone()
+        self.http.gate_snapshot()
     }
 
     async fn connect_live_socket(
@@ -1240,57 +1181,6 @@ impl MarketDataProvider for HyperliquidProvider {
     }
 }
 
-async fn read_capped(
-    mut response: reqwest::Response,
-    limit: usize,
-    cancellation: &CancellationToken,
-    context: &ErrorContext,
-) -> Result<Vec<u8>, ProviderError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(payload(
-            context,
-            PayloadError::OverBudget { limit_bytes: limit },
-        ));
-    }
-    let mut body =
-        Vec::with_capacity(response.content_length().unwrap_or(0).min(limit as u64) as usize);
-    loop {
-        let chunk = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(cancelled(context.clone())),
-            chunk = response.chunk() => chunk.map_err(|error| {
-                if error.is_timeout() {
-                    ProviderError::Timeout {
-                        context: context.clone(),
-                        kind: TimeoutKind::Request,
-                    }
-                } else {
-                    ProviderError::Transport {
-                        context: context.clone(),
-                        cause: SanitizedCause::Connection,
-                    }
-                }
-            })?,
-        };
-        let Some(chunk) = chunk else { break };
-        if body
-            .len()
-            .checked_add(chunk.len())
-            .is_none_or(|size| size > limit)
-        {
-            return Err(payload(
-                context,
-                PayloadError::OverBudget { limit_bytes: limit },
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
 const OVERSIZED_CANDLE_ARRAY: &str = "Hyperliquid candle row limit exceeded";
 
 struct BoundedCandleVisitor<'a> {
@@ -1599,23 +1489,6 @@ fn payload(context: &ErrorContext, source: PayloadError) -> ProviderError {
         context: context.clone(),
         source,
     }
-}
-
-fn cancelled(context: ErrorContext) -> ProviderError {
-    ProviderError::Transport {
-        context,
-        cause: SanitizedCause::Cancelled,
-    }
-}
-
-fn is_cancelled(error: &ProviderError) -> bool {
-    matches!(
-        error,
-        ProviderError::Transport {
-            cause: SanitizedCause::Cancelled,
-            ..
-        }
-    )
 }
 
 #[cfg(feature = "test-transport")]

@@ -183,22 +183,24 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 
 ### R07 — Extract shared HTTP runtime and rate-limit decision policy
 
-**Status:** [ ]  
+**Status:** [x]  
 **Depends on:** R06  
 **Owned files:** `src/provider/runtime/http.rs` (new), `src/provider/runtime/mod.rs`, `src/provider/binance.rs`, `src/provider/hyperliquid.rs`, `tests/provider_runtime_http.rs` (new), `tests/binance_rest.rs`, `tests/hyperliquid_rest.rs`  
 **Parallel safety:** Sequential; both provider files and both REST suites overlap.  
 **Commit boundary:** `refactor(provider): share HTTP runtime and rate gating`
 
-- [ ] Move safe `reqwest::Client` construction, `no_proxy`, disabled redirects, User-Agent, request cancellation, timeout/transport mapping, capped body reader, rate-gate wait, and absorbing/max-deadline gate mechanics into `runtime/http.rs`.
-- [ ] Keep URL/method/query/body, provider error payload parsing, invalid-symbol detection, rate-limit status interpretation, and success decoder in provider code.
-- [ ] Introduce the internal provider-specific `RateLimitDecision` mapping: Binance may process-block only for its 418 contract; Hyperliquid never derives a permanent block from absent Binance ban metadata.
-- [ ] Remove both duplicate `read_capped` implementations and duplicate common status skeletons without moving Binance `-1121` or Hyperliquid `{error: ...}` into shared code.
-- [ ] Move provider-neutral capped-body, cancellation, timeout mapping, safe-client, rate-gate wait, maximum timed deadline, and absorbing process-block cases from both REST suites into `tests/provider_runtime_http.rs`. Retain provider payload/status/decoder behavior in its provider REST suite.
-- [ ] Verify: `cargo test --locked --test provider_runtime_http --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test binance_rest --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test hyperliquid_rest --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport`.
+- [x] Move safe `reqwest::Client` construction, `no_proxy`, disabled redirects, User-Agent, request cancellation, timeout/transport mapping, capped body reader, rate-gate wait, and absorbing/max-deadline gate mechanics into `runtime/http.rs`.
+- [x] Keep URL/method/query/body, provider error payload parsing, invalid-symbol detection, rate-limit status interpretation, and success decoder in provider code.
+- [x] Introduce the internal provider-specific `RateLimitDecision` mapping: Binance may process-block only for its 418 contract; Hyperliquid never derives a permanent block from absent Binance ban metadata.
+- [x] Remove both duplicate `read_capped` implementations and duplicate common status skeletons without moving Binance `-1121` or Hyperliquid `{error: ...}` into shared code. `HttpRuntime::read_response` is the sole common response/status skeleton and delegates only provider-specific client-error payload mapping; both provider `history` methods call it.
+- [x] Move provider-neutral capped-body, cancellation, timeout mapping, safe-client, rate-gate wait, maximum timed deadline, and absorbing process-block cases from both REST suites into `tests/provider_runtime_http.rs`. Retain provider payload/status/decoder behavior in its provider REST suite. The shared suite exercises the real `HttpRuntime` production path, including declared-length and genuinely streamed overflow, direct gate wait/cancellation, common status handling, maximum timed deadline, and absorbing process block; provider REST suites retain Binance `-1121`/418 and Hyperliquid payload/rate semantics without duplicate common contracts.
+
+Implementation note (verified): `runtime/http.rs` uniquely owns safe client construction, cancellation-aware request/body transport mapping, capped body reads, the common response-status skeleton, rate-gate waits, and absorbing/max-deadline updates. `HttpRuntime::read_response` invokes a narrow provider callback only for client-error payload mapping; Binance `-1121`/418 and Hyperliquid payload/rate-limit semantics remain provider-owned. Provider-neutral safe-client/no-proxy, request and body cancellation, timeout mapping, declared and genuinely streamed over-budget bodies, common response handling, direct gate waits, maximum timed deadlines, and absorbing process blocks run through the real production `HttpRuntime` in `provider_runtime_http`; duplicate common REST contracts were removed.
+- [x] Verify: `cargo test --locked --test provider_runtime_http --no-default-features --features test-transport` (11 passed).
+- [x] Verify: `cargo test --locked --test binance_rest --no-default-features --features test-transport` (10 passed).
+- [x] Verify: `cargo test --locked --test hyperliquid_rest --no-default-features --features test-transport` (17 passed).
+- [x] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport` (23 passed).
+- [x] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport` (26 passed).
 
 ### R08 — Complete capability consumers and internal protocol policy
 
@@ -323,10 +325,10 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 | R04 | [x] | R03 | no | Complete; formatted exact gates passed: `provider_runtime_websocket` 26/26, `binance_ws_codec` 4/4, `hyperliquid_ws_codec` 11/11, `binance_live` 40/40, and `hyperliquid_live` 27/27; identical-control coalescing, distinct-control blocking/resume/order, real provider saturation integrations, deterministic synchronization hooks, and queued-emergency shutdown suppression verified |
 | R05 | [x] | R04 | no | Complete; Binance REST temporal/grid, exact-close, request-window, and strict-order validation rejects malformed gap pages before shared state mutation; formatted gates passed: `binance_live` 45/45, `hyperliquid_live` 29/29, `app_live_contract` 51/51, with `provider_contract` 10/10, `history_coordinator` 21/21, `snapshot_runner` 6/6, plus supplemental `binance_rest` 23/23 |
 | R06 | [x] | R05 | no | Complete; deterministic shared runtime harness owns reconciliation/concurrency, exact ack timeout and actual stale-ack gating, both control-channel closures, cancellation, saturation/emergency barrier ordering, capped backoff and maximum rate/backoff deadlines in both directions, real generation purge, first-candle timeout, and completion/error contracts; `provider_runtime_live.rs` is mode `100644`; formatted gates passed: `provider_runtime_live` 15/15, `binance_live` 23/23, `hyperliquid_live` 26/26, `app_live_contract` 51/51 |
-| R07 | [ ] | R06 | yes | — |
+| R07 | [x] | R06 | no | Complete; `HttpRuntime` is the sole owner of safe client construction, capped body reads, common response/status handling, request/body cancellation and timeout mapping, and rate-gate wait/deadline/process-block mechanics. Shared contracts exercise the real production runtime, including streamed overflow and direct gate cancellation; provider suites retain Binance `-1121`/418 and Hyperliquid payload/status policies without duplicate common tests. Formatted exact gates passed: `provider_runtime_http` 11/11, `binance_rest` 10/10, `hyperliquid_rest` 17/17, `binance_live` 23/23, and `hyperliquid_live` 26/26. |
 | R08 | [ ] | R07 | no | Completes app/snapshot/older-history and market/timeframe capability consumption after the R05 interface foundation; no second capability or live-limit source |
 | R09 | [ ] | R08 | no | — |
 | R10 | [ ] | R09 | no | — |
 | R11 | [ ] | R10 | no | — |
 
-**Next dependency-ready unchecked chunk:** R07 — extract the shared HTTP runtime and rate-limit decision policy.
+**Next dependency-ready unchecked chunk:** R08 — complete capability consumers and internal protocol policy.

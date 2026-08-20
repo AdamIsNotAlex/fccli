@@ -2,7 +2,7 @@
 
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
-use reqwest::{Client, StatusCode, Url, header::RETRY_AFTER};
+use reqwest::{StatusCode, Url, header::RETRY_AFTER};
 use serde::{
     Deserialize,
     de::{IgnoredAny, SeqAccess, Visitor},
@@ -15,18 +15,16 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     cli::canonicalize_instrument,
     clock::{Clock, checked_deadline},
-    error::{
-        ErrorContext, ErrorOperation, PayloadError, ProviderError, SanitizedCause,
-        SanitizedMessage, TimeoutKind,
-    },
+    error::{ErrorContext, ErrorOperation, PayloadError, ProviderError, SanitizedMessage},
     model::{
         Candle, HistoryRequest, Instrument, InstrumentSpec, Market, ProcessBlocker, ProviderId,
-        RateGateState, Timeframe,
+        Timeframe,
     },
     provider::{
         LiveFeed, LiveRequest, MarketDataProvider, ProviderCapabilities, ProviderFuture,
-        RateGateSender, RateGateSnapshot, rate_gate_channel,
+        RateGateSnapshot,
         runtime::{
+            http::{HttpRuntime, RateLimitDecision},
             live::{
                 ConnectionRotation, LiveAdapter, LiveConfig, LiveRateGate, LiveSocket,
                 LiveSocketEvent, LiveSupervisorConfig, ProcessBlockPolicy, ReconciliationLimits,
@@ -430,13 +428,10 @@ pub async fn connect_test_websocket(
 
 #[derive(Clone)]
 pub struct BinanceProvider {
-    client: Client,
+    http: HttpRuntime,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     base_url: Url,
     clock: Arc<dyn Clock>,
-    gate_sender: RateGateSender,
-    gate_snapshot: RateGateSnapshot,
-    body_limit: usize,
     rate_limit_fallback: Duration,
     live: LiveSupervisorConfig,
     max_connection_age: Duration,
@@ -727,22 +722,12 @@ impl BinanceProvider {
                 "live reconciliation limits must be positive",
             ));
         }
-        let client = Client::builder()
-            .no_proxy()
-            .timeout(request_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("fccli/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|_| ProviderError::Configuration("failed to build REST client"))?;
-        let (gate_sender, gate_snapshot) = rate_gate_channel(RateGateState::Open);
+        let http = HttpRuntime::new(Arc::clone(&clock), request_timeout, body_limit)?;
         Ok(Self {
-            client,
+            http,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             base_url,
             clock,
-            gate_sender,
-            gate_snapshot,
-            body_limit,
             rate_limit_fallback,
             live,
             max_connection_age,
@@ -793,46 +778,23 @@ impl BinanceProvider {
                 query.push(("endTime", end_time.to_string()));
             }
 
-            let response = tokio::select! {
-                biased;
-                () = cancellation.cancelled() => return Err(cancelled(context.clone())),
-                result = self.client.get(url).query(&query).send() => result.map_err(|error| {
-                    if error.is_timeout() {
-                        ProviderError::Timeout { context: context.clone(), kind: TimeoutKind::Request }
-                    } else {
-                        ProviderError::Transport { context: context.clone(), cause: SanitizedCause::Connection }
-                    }
-                })?,
-            };
+            let response = self
+                .http
+                .send(
+                    self.http.client().get(url).query(&query),
+                    &cancellation,
+                    &context,
+                )
+                .await?;
 
             let status = response.status();
             if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::IM_A_TEAPOT {
                 return self.handle_rate_limit(&response, context);
             }
-            if status.is_server_error() {
-                return Err(ProviderError::ServerStatus {
-                    context,
-                    status: status.as_u16(),
-                });
-            }
-            if status.is_redirection() {
-                return Err(ProviderError::ClientStatus {
-                    context,
-                    status: status.as_u16(),
-                    code: None,
-                    message: None,
-                });
-            }
-            if status.is_client_error() {
-                let bytes =
-                    match read_capped(response, self.body_limit, &cancellation, &context).await {
-                        Ok(bytes) => bytes,
-                        Err(error) if is_cancelled(&error) => return Err(error),
-                        Err(_) => Vec::new(),
-                    };
-                return Err(map_http_error(status, &bytes, context));
-            }
-            let bytes = read_capped(response, self.body_limit, &cancellation, &context).await?;
+            let bytes = self
+                .http
+                .read_response(response, &cancellation, context.clone(), map_http_error)
+                .await?;
             decode_klines(&bytes, request, timeframe, context)
         }
         #[cfg(all(feature = "production-transport", feature = "test-transport"))]
@@ -847,31 +809,11 @@ impl BinanceProvider {
         cancellation: &CancellationToken,
         context: &ErrorContext,
     ) -> Result<(), ProviderError> {
-        let mut snapshot = self.gate_snapshot.clone();
-        loop {
-            match snapshot
-                .current()
-                .map_err(|_| ProviderError::Invariant("rate gate closed"))?
-            {
-                RateGateState::Open => return Ok(()),
-                RateGateState::ProcessBlocked(ProcessBlocker::InvalidBanExpiry) => {
-                    return Err(ProviderError::InvalidBanExpiry);
-                }
-                RateGateState::TimedUntil(deadline) if deadline <= self.clock.now() => {
-                    return Ok(());
-                }
-                RateGateState::TimedUntil(deadline) => {
-                    tokio::select! {
-                        biased;
-                        () = cancellation.cancelled() => return Err(cancelled(context.clone())),
-                        changed = snapshot.changed() => {
-                            changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?;
-                        }
-                        () = self.clock.sleep_until(deadline) => {}
-                    }
-                }
-            }
-        }
+        self.http
+            .await_gate(cancellation, context, |blocker| match blocker {
+                ProcessBlocker::InvalidBanExpiry => ProviderError::InvalidBanExpiry,
+            })
+            .await
     }
 
     fn handle_rate_limit(
@@ -889,37 +831,17 @@ impl BinanceProvider {
             .and_then(|seconds| {
                 checked_deadline(self.clock.now(), Duration::from_secs(seconds)).ok()
             });
-
         let deadline = if status == StatusCode::TOO_MANY_REQUESTS {
             parsed.or_else(|| checked_deadline(self.clock.now(), self.rate_limit_fallback).ok())
         } else {
             parsed
         };
-        if let Some(deadline) = deadline {
-            self.gate_sender
-                .publish(RateGateState::TimedUntil(deadline))
-                .map_err(|_| ProviderError::Invariant("rate gate closed"))?;
-        } else {
-            self.gate_sender
-                .publish(RateGateState::ProcessBlocked(
-                    ProcessBlocker::InvalidBanExpiry,
-                ))
-                .map_err(|_| ProviderError::Invariant("rate gate closed"))?;
-        }
-        let effective = self
-            .gate_snapshot
-            .current()
-            .map_err(|_| ProviderError::Invariant("rate gate closed"))?;
-        if matches!(
-            effective,
-            RateGateState::ProcessBlocked(ProcessBlocker::InvalidBanExpiry)
-        ) {
-            return Err(ProviderError::InvalidBanExpiry);
-        }
-        Err(ProviderError::RateLimited {
-            context,
-            status: status.as_u16(),
-        })
+        let decision = deadline.map_or(
+            RateLimitDecision::ProcessBlocked(ProcessBlocker::InvalidBanExpiry),
+            RateLimitDecision::TimedUntil,
+        );
+        self.http.apply_rate_limit(decision, context, status)?;
+        unreachable!("rate-limit application always returns an error")
     }
 
     async fn connect_live_socket(
@@ -960,7 +882,7 @@ impl BinanceProvider {
 
     #[must_use]
     pub fn rate_gate(&self) -> RateGateSnapshot {
-        self.gate_snapshot.clone()
+        self.http.gate_snapshot()
     }
 }
 
@@ -1017,57 +939,6 @@ impl MarketDataProvider for BinanceProvider {
     fn rate_gate(&self) -> RateGateSnapshot {
         BinanceProvider::rate_gate(self)
     }
-}
-
-async fn read_capped(
-    mut response: reqwest::Response,
-    limit: usize,
-    cancellation: &CancellationToken,
-    context: &ErrorContext,
-) -> Result<Vec<u8>, ProviderError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(payload(
-            context,
-            PayloadError::OverBudget { limit_bytes: limit },
-        ));
-    }
-    let mut body =
-        Vec::with_capacity(response.content_length().unwrap_or(0).min(limit as u64) as usize);
-    loop {
-        let chunk = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(cancelled(context.clone())),
-            chunk = response.chunk() => chunk.map_err(|error| {
-                if error.is_timeout() {
-                    ProviderError::Timeout {
-                        context: context.clone(),
-                        kind: TimeoutKind::Request,
-                    }
-                } else {
-                    ProviderError::Transport {
-                        context: context.clone(),
-                        cause: SanitizedCause::Connection,
-                    }
-                }
-            })?,
-        };
-        let Some(chunk) = chunk else { break };
-        if body
-            .len()
-            .checked_add(chunk.len())
-            .is_none_or(|size| size > limit)
-        {
-            return Err(payload(
-                context,
-                PayloadError::OverBudget { limit_bytes: limit },
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
 }
 
 struct RawKline(
@@ -1316,23 +1187,6 @@ fn payload(context: &ErrorContext, source: PayloadError) -> ProviderError {
         context: context.clone(),
         source,
     }
-}
-
-fn cancelled(context: ErrorContext) -> ProviderError {
-    ProviderError::Transport {
-        context,
-        cause: SanitizedCause::Cancelled,
-    }
-}
-
-fn is_cancelled(error: &ProviderError) -> bool {
-    matches!(
-        error,
-        ProviderError::Transport {
-            cause: SanitizedCause::Cancelled,
-            ..
-        }
-    )
 }
 
 #[cfg(feature = "test-transport")]

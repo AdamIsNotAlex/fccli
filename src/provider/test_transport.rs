@@ -1,6 +1,9 @@
 //! Integration-test-only transport harness.
 
 pub use super::runtime::emitter::EventEmitterTestFacade;
+pub use super::runtime::http::{
+    HttpRuntime, RateLimitDecision, StatusDisposition, classify_status, is_cancelled,
+};
 pub use super::runtime::live::{
     ConnectionRotation, LiveAdapter, LiveConfig, LiveRateGate, LiveSocket, LiveSupervisorConfig,
     ProcessBlockPolicy, ReconciliationLimits, ReconciliationPolicy,
