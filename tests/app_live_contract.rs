@@ -26,8 +26,8 @@ use fccli::{
     error::{AppError, ErrorContext, ErrorOperation, ProviderError, RenderError, TerminalError},
     model::{
         Candle, ConnectionStatus, GapGeneration, HistoryRequest, HistoryRequestKind, Instrument,
-        InstrumentSpec, MarketEvent, MonoInstant, ProcessBlocker, ProviderId, RateGateState,
-        ReplayRevision, Timeframe,
+        InstrumentSpec, Market, MarketEvent, MonoInstant, ProcessBlocker, ProviderId,
+        RateGateState, ReplayRevision, Timeframe,
     },
     provider::{
         CancellationToken, LiveFeed, LiveRequest, MarketDataProvider, MarketEventStream,
@@ -722,6 +722,14 @@ impl MarketDataProvider for FakeProvider {
     fn id(&self) -> ProviderId {
         ProviderId::new("binance").unwrap()
     }
+    fn capabilities(&self) -> fccli::provider::ProviderCapabilities {
+        fccli::provider::ProviderCapabilities {
+            markets: &[Market::Spot, Market::Perpetual],
+            timeframes: &Timeframe::ALL,
+            history_page_limit: 1000,
+        }
+    }
+
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
         self.canonicalize_calls.fetch_add(1, Ordering::SeqCst);
         canonicalize_instrument(spec)

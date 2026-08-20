@@ -13,8 +13,8 @@ use fccli::{
         ProcessBlocker, ProviderId, RateGateState, Timeframe,
     },
     provider::{
-        CancellationToken, LiveFeed, LiveRequest, MarketDataProvider, ProviderFuture,
-        RateGateSender, RateGateSnapshot, rate_gate_channel,
+        CancellationToken, LiveFeed, LiveRequest, MarketDataProvider, ProviderCapabilities,
+        ProviderFuture, RateGateSender, RateGateSnapshot, rate_gate_channel,
     },
 };
 use tokio::sync::oneshot;
@@ -71,6 +71,14 @@ impl MarketDataProvider for FakeProvider {
     fn id(&self) -> ProviderId {
         ProviderId::new("binance").unwrap()
     }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            markets: &[Market::Spot, Market::Perpetual],
+            timeframes: &Timeframe::ALL,
+            history_page_limit: HISTORY_PAGE_LIMIT,
+        }
+    }
+
     fn canonicalize(&self, _spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
         Ok(instrument())
     }

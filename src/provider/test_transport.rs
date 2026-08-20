@@ -1,6 +1,11 @@
 //! Integration-test-only transport harness.
 
+pub use super::hyperliquid::{
+    gap_target_within_generation_span_for_test, reconciliation_distinct_key_allowed_for_test,
+    reconciliation_page_guard_for_test,
+};
 pub use super::runtime::emitter::EventEmitterTestFacade;
+pub use super::runtime::live::LiveSupervisorConfig;
 pub use super::runtime::websocket::{
     CloseFlushTestHook, DecodedFrame, HeartbeatTestHook, ReadinessDecodedAckTestHook,
     ReadinessDrainBudgetTestHook, SubscribeFlushTestHook, WS_FRAME_SIZE, WS_MAX_WRITE_BUFFER_SIZE,

@@ -13,16 +13,16 @@ use fccli::{
         LiveRequest, MarketDataProvider, ProducerCompletion, ReconcileAck,
         accepted_watermark_channel,
         hyperliquid::{
-            APPLICATION_HEARTBEAT_INTERVAL, HyperliquidProvider, HyperliquidTestConfig,
-            LiveSupervisorConfig, connect_test_websocket,
-            gap_target_within_generation_span_for_test,
-            reconciliation_distinct_key_allowed_for_test, reconciliation_page_guard_for_test,
+            APPLICATION_HEARTBEAT_INTERVAL, HyperliquidLiveConfig, HyperliquidProvider,
+            HyperliquidTestConfig, connect_test_websocket,
         },
         reconcile_ack_channel,
         test_transport::{
             CloseFlushTestHook, DecodedFrame, HeartbeatTestHook, HyperliquidDecoded,
-            ReadinessDecodedAckTestHook, ReadinessDrainBudgetTestHook, SubscribeFlushTestHook,
-            WsConfig, read_raw_websocket,
+            LiveSupervisorConfig, ReadinessDecodedAckTestHook, ReadinessDrainBudgetTestHook,
+            SubscribeFlushTestHook, WsConfig, gap_target_within_generation_span_for_test,
+            read_raw_websocket, reconciliation_distinct_key_allowed_for_test,
+            reconciliation_page_guard_for_test,
         },
     },
 };
@@ -31,7 +31,10 @@ use serde_json::json;
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
-use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{method, path},
+};
 
 fn clock() -> Arc<ManualClock> {
     Arc::new(ManualClock::new(MonoInstant::ZERO))
@@ -75,7 +78,7 @@ async fn websocket_listener() -> (TcpListener, String) {
 fn provider(
     ws_uri: &str,
     clock: Arc<ManualClock>,
-    live: LiveSupervisorConfig,
+    live: HyperliquidLiveConfig,
 ) -> HyperliquidProvider {
     let mut config =
         HyperliquidTestConfig::loopback("http://127.0.0.1:9").with_websocket_base(ws_uri);
@@ -87,7 +90,7 @@ fn provider_with_http(
     http_uri: &str,
     ws_uri: &str,
     clock: Arc<ManualClock>,
-    live: LiveSupervisorConfig,
+    live: HyperliquidLiveConfig,
 ) -> HyperliquidProvider {
     let mut config = HyperliquidTestConfig::loopback(http_uri).with_websocket_base(ws_uri);
     config.live = live;
@@ -193,13 +196,13 @@ async fn unsupported_timeframe_open_live_fails_before_connect() {
 #[test]
 fn subscribe_ack_timeout_configuration_bounds_are_enforced() {
     assert_eq!(
-        LiveSupervisorConfig::default().subscribe_ack_timeout,
+        HyperliquidLiveConfig::default().subscribe_ack_timeout,
         Duration::from_secs(10)
     );
     for timeout in [Duration::ZERO, Duration::from_secs(61)] {
-        let live = LiveSupervisorConfig {
+        let live = HyperliquidLiveConfig {
             subscribe_ack_timeout: timeout,
-            ..LiveSupervisorConfig::default()
+            ..HyperliquidLiveConfig::default()
         };
         assert!(matches!(
             live.validate(),
@@ -207,12 +210,119 @@ fn subscribe_ack_timeout_configuration_bounds_are_enforced() {
         ));
     }
     for timeout in [Duration::from_millis(1), Duration::from_secs(60)] {
-        let live = LiveSupervisorConfig {
+        let live = HyperliquidLiveConfig {
             subscribe_ack_timeout: timeout,
-            ..LiveSupervisorConfig::default()
+            ..HyperliquidLiveConfig::default()
         };
         live.validate().expect("boundary is valid");
     }
+}
+
+#[tokio::test]
+async fn zero_advertised_history_limit_is_rejected_before_live_io() {
+    let mut live = HyperliquidLiveConfig::default();
+    live.advertised_history_page_limit = 0;
+    let provider = provider("ws://127.0.0.1:1", clock(), live);
+    let cancellation = CancellationToken::new();
+    let error = match provider.open_live(request(cancellation)).await {
+        Ok(_) => panic!("zero advertised history limit must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        ProviderError::Configuration("provider history page limit must be non-zero")
+    );
+}
+
+#[tokio::test]
+async fn smaller_advertised_history_limit_is_used_by_shared_gap_request() {
+    const START: i64 = 1_699_999_980_000;
+    const LIMIT: u16 = 7;
+    const TARGET: i64 = START + 10 * 60_000;
+    let rest = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&rest)
+        .await;
+
+    let (listener, ws_uri) = websocket_listener().await;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("WebSocket accept");
+        let mut websocket = accept_async(stream).await.expect("upgrade");
+        assert!(matches!(websocket.next().await, Some(Ok(Message::Text(_)))));
+        websocket
+            .send(Message::Text(subscribe_ack().into()))
+            .await
+            .expect("subscribe ack");
+        websocket
+            .send(Message::Text(candle_message(TARGET).into()))
+            .await
+            .expect("gap target candle");
+        std::future::pending::<()>().await;
+    });
+    let live = HyperliquidLiveConfig {
+        advertised_history_page_limit: LIMIT,
+        ..HyperliquidLiveConfig::default()
+    };
+    let provider = provider_with_http(&rest.uri(), &ws_uri, clock(), live);
+    let cancellation = CancellationToken::new();
+    let (watermark_tx, watermark_rx) = accepted_watermark_channel(Some(START));
+    let (_ack_tx, ack_rx) = reconcile_ack_channel();
+    let mut feed = provider
+        .open_live(LiveRequest {
+            instrument: instrument(),
+            timeframe: Timeframe::Minute1,
+            startup_watermark: Some(START),
+            accepted_watermark_rx: watermark_rx,
+            reconcile_ack_rx: ack_rx,
+            cancellation: cancellation.clone(),
+        })
+        .await
+        .expect("feed");
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::Status {
+            status: ConnectionStatus::Connecting,
+            ..
+        }
+    ));
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::Status {
+            status: ConnectionStatus::GapSync,
+            ..
+        }
+    ));
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::RecoverableError {
+            error: ProviderError::GapSyncNoProgress { .. },
+            ..
+        }
+    ));
+    let requests = rest
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("candle snapshot JSON");
+    assert_eq!(
+        body,
+        json!({
+            "type": "candleSnapshot",
+            "req": {
+                "coin": "@142",
+                "interval": "1m",
+                "startTime": START,
+                "endTime": START + i64::from(LIMIT) * 60_000 - 1,
+            }
+        })
+    );
+    cancellation.cancel();
+    drop(watermark_tx);
+    server.abort();
 }
 
 #[tokio::test]
@@ -270,11 +380,14 @@ async fn decoded_candle_saturation_invalidates_generation_and_blocks_retry_until
     });
 
     let manual = clock();
-    let live = LiveSupervisorConfig {
-        keyed_candle_capacity: 1,
-        market_event_capacity: 1,
-        saturation_test_hook: Some(Arc::clone(&saturation)),
-        ..LiveSupervisorConfig::default()
+    let live = HyperliquidLiveConfig {
+        supervisor: LiveSupervisorConfig {
+            keyed_candle_capacity: 1,
+            market_event_capacity: 1,
+            saturation_test_hook: Some(Arc::clone(&saturation)),
+            ..LiveSupervisorConfig::default()
+        },
+        ..HyperliquidLiveConfig::default()
     };
     let provider = provider_with_http(&rest.uri(), &ws_uri, Arc::clone(&manual), live);
     let cancellation = CancellationToken::new();
@@ -420,7 +533,7 @@ async fn gap_sync_waits_for_matching_subscribe_ack() {
     let provider = provider(
         &ws_uri,
         Arc::clone(&manual),
-        LiveSupervisorConfig::default(),
+        HyperliquidLiveConfig::default(),
     );
     let cancellation = CancellationToken::new();
     let mut feed = provider
@@ -466,9 +579,9 @@ async fn subscribe_ack_expiry_is_recoverable_and_never_first_kline() {
         std::future::pending::<()>().await;
     });
     let manual = clock();
-    let live = LiveSupervisorConfig {
+    let live = HyperliquidLiveConfig {
         subscribe_ack_timeout: Duration::from_millis(1),
-        ..LiveSupervisorConfig::default()
+        ..HyperliquidLiveConfig::default()
     };
     let provider = provider(&ws_uri, Arc::clone(&manual), live);
     let cancellation = CancellationToken::new();
@@ -515,7 +628,7 @@ async fn far_future_first_candle_reconnects_before_gap_history_work() {
             .expect("future candle");
         std::future::pending::<()>().await;
     });
-    let provider = provider(&ws_uri, clock(), LiveSupervisorConfig::default());
+    let provider = provider(&ws_uri, clock(), HyperliquidLiveConfig::default());
     let cancellation = CancellationToken::new();
     let mut feed = provider
         .open_live(request(cancellation.clone()))
@@ -565,7 +678,7 @@ async fn readiness_terminal_after_malformed_flood(close_cleanly: bool) -> Market
             websocket.close(None).await.expect("close");
         }
     });
-    let provider = provider(&ws_uri, clock(), LiveSupervisorConfig::default());
+    let provider = provider(&ws_uri, clock(), HyperliquidLiveConfig::default());
     let cancellation = CancellationToken::new();
     let mut feed = provider
         .open_live(request(cancellation.clone()))
@@ -598,12 +711,12 @@ async fn received_close_wins_while_automatic_close_response_flush_is_held() {
     });
     let blocked = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    let live = LiveSupervisorConfig {
+    let live = HyperliquidLiveConfig {
         close_flush_test_hook: Some(CloseFlushTestHook {
             blocked: Arc::clone(&blocked),
             release: Arc::clone(&release),
         }),
-        ..LiveSupervisorConfig::default()
+        ..HyperliquidLiveConfig::default()
     };
     let provider = provider(&ws_uri, clock(), live);
     let cancellation = CancellationToken::new();
@@ -643,12 +756,12 @@ async fn cancellation_drops_blocked_pre_subscription_close_finalization() {
     });
     let blocked = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    let live = LiveSupervisorConfig {
+    let live = HyperliquidLiveConfig {
         close_flush_test_hook: Some(CloseFlushTestHook {
             blocked: Arc::clone(&blocked),
             release,
         }),
-        ..LiveSupervisorConfig::default()
+        ..HyperliquidLiveConfig::default()
     };
     let provider = provider(&ws_uri, clock(), live);
     let cancellation = CancellationToken::new();
@@ -795,7 +908,7 @@ async fn readiness_budget_boundary_event(outcome: ReadinessBoundaryOutcome) -> M
     let subscribe_blocked = Arc::new(tokio::sync::Notify::new());
     let subscribe_release = Arc::new(tokio::sync::Notify::new());
     let manual = clock();
-    let live = LiveSupervisorConfig {
+    let live = HyperliquidLiveConfig {
         subscribe_ack_timeout: Duration::from_millis(1),
         readiness_drain_budget_test_hook: Some(ReadinessDrainBudgetTestHook {
             observed: Arc::clone(&observed),
@@ -805,7 +918,7 @@ async fn readiness_budget_boundary_event(outcome: ReadinessBoundaryOutcome) -> M
             blocked: Arc::clone(&subscribe_blocked),
             release: Arc::clone(&subscribe_release),
         }),
-        ..LiveSupervisorConfig::default()
+        ..HyperliquidLiveConfig::default()
     };
     let provider = provider(&ws_uri, Arc::clone(&manual), live);
     let cancellation = CancellationToken::new();
@@ -908,12 +1021,12 @@ async fn reconciliation_span_bound_reconnects_while_rest_page_is_pending() {
             .expect("out-of-span reconciliation successor");
         std::future::pending::<()>().await;
     });
-    let live = LiveSupervisorConfig {
+    let live = HyperliquidLiveConfig {
         max_gap_reconciliation_candles_for_test: 3,
-        ..LiveSupervisorConfig::default()
+        ..HyperliquidLiveConfig::default()
     };
     assert_eq!(
-        LiveSupervisorConfig::default().max_gap_reconciliation_candles_for_test,
+        HyperliquidLiveConfig::default().max_gap_reconciliation_candles_for_test,
         64_000,
         "the test override must default to the production generation bound"
     );
@@ -995,7 +1108,12 @@ async fn large_in_bound_pending_rest_sequence_remains_promptly_cancellable() {
         sequence_sent_tx.send(()).expect("sequence sent");
         std::future::pending::<()>().await;
     });
-    let provider = provider_with_http(&http_uri, &ws_uri, clock(), LiveSupervisorConfig::default());
+    let provider = provider_with_http(
+        &http_uri,
+        &ws_uri,
+        clock(),
+        HyperliquidLiveConfig::default(),
+    );
     let cancellation = CancellationToken::new();
     let mut feed = provider
         .open_live(request(cancellation.clone()))
@@ -1057,9 +1175,9 @@ async fn accepted_watermark_span_bound_reconnects_while_rest_page_is_pending() {
             .expect("first candle");
         std::future::pending::<()>().await;
     });
-    let live = LiveSupervisorConfig {
+    let live = HyperliquidLiveConfig {
         max_gap_reconciliation_candles_for_test: 3,
-        ..LiveSupervisorConfig::default()
+        ..HyperliquidLiveConfig::default()
     };
     let provider = provider_with_http(&http_uri, &ws_uri, clock(), live);
     let cancellation = CancellationToken::new();
@@ -1137,13 +1255,13 @@ async fn decoded_ack_wins_deterministic_deadline_tie_before_arbitration() {
     let observed = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let manual = clock();
-    let live = LiveSupervisorConfig {
+    let live = HyperliquidLiveConfig {
         subscribe_ack_timeout: Duration::from_millis(1),
         readiness_decoded_ack_test_hook: Some(ReadinessDecodedAckTestHook {
             observed: Arc::clone(&observed),
             release: Arc::clone(&release),
         }),
-        ..LiveSupervisorConfig::default()
+        ..HyperliquidLiveConfig::default()
     };
     let provider = provider(&ws_uri, Arc::clone(&manual), live);
     let cancellation = CancellationToken::new();
@@ -1187,10 +1305,10 @@ async fn ack_deadline_wins_actual_readiness_loop_tie_with_inactivity() {
     });
     let inactivity = Arc::new(tokio::sync::Notify::new());
     let manual = clock();
-    let live = LiveSupervisorConfig {
+    let live = HyperliquidLiveConfig {
         subscribe_ack_timeout: Duration::from_millis(1),
         readiness_inactivity_test_hook: Some(Arc::clone(&inactivity)),
-        ..LiveSupervisorConfig::default()
+        ..HyperliquidLiveConfig::default()
     };
     let provider = provider(&ws_uri, Arc::clone(&manual), live);
     let cancellation = CancellationToken::new();
@@ -1233,12 +1351,12 @@ async fn cancellation_precedes_simultaneously_queued_ack() {
     });
     let observed = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    let live = LiveSupervisorConfig {
+    let live = HyperliquidLiveConfig {
         readiness_decoded_ack_test_hook: Some(ReadinessDecodedAckTestHook {
             observed: Arc::clone(&observed),
             release: Arc::clone(&release),
         }),
-        ..LiveSupervisorConfig::default()
+        ..HyperliquidLiveConfig::default()
     };
     let provider = provider(&ws_uri, clock(), live);
     let cancellation = CancellationToken::new();
@@ -1277,10 +1395,10 @@ async fn stalled_write_outranks_buffered_malformed_ack_and_ack_deadline() {
             std::future::pending::<()>().await;
         });
         let manual = clock();
-        let live = LiveSupervisorConfig {
+        let live = HyperliquidLiveConfig {
             subscribe_ack_timeout: Duration::from_millis(1),
             force_stalled_write_after_readiness_frame: true,
-            ..LiveSupervisorConfig::default()
+            ..HyperliquidLiveConfig::default()
         };
         let provider = provider(&ws_uri, Arc::clone(&manual), live);
         let cancellation = CancellationToken::new();
@@ -1325,13 +1443,13 @@ async fn blocked_subscribe_flush_does_not_start_ack_deadline() {
     let blocked = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let manual = clock();
-    let live = LiveSupervisorConfig {
+    let live = HyperliquidLiveConfig {
         subscribe_ack_timeout: Duration::from_millis(1),
         subscribe_flush_test_hook: Some(SubscribeFlushTestHook {
             blocked: Arc::clone(&blocked),
             release: Arc::clone(&release),
         }),
-        ..LiveSupervisorConfig::default()
+        ..HyperliquidLiveConfig::default()
     };
     let provider = provider(&ws_uri, Arc::clone(&manual), live);
     let cancellation = CancellationToken::new();
@@ -1383,9 +1501,9 @@ async fn ignored_json_cannot_starve_absolute_subscribe_ack_deadline() {
         }
     });
     let manual = clock();
-    let live = LiveSupervisorConfig {
+    let live = HyperliquidLiveConfig {
         subscribe_ack_timeout: Duration::from_millis(1),
-        ..LiveSupervisorConfig::default()
+        ..HyperliquidLiveConfig::default()
     };
     let provider = provider(&ws_uri, Arc::clone(&manual), live);
     let cancellation = CancellationToken::new();
@@ -1458,12 +1576,12 @@ async fn application_heartbeat_schedule_begins_only_after_ack() {
             Message::Text(r#"{"method":"ping"}"#.into())
         );
     });
-    let live = LiveSupervisorConfig {
+    let live = HyperliquidLiveConfig {
         heartbeat_test_hook: Some(HeartbeatTestHook {
             started: Arc::clone(&started),
             due: Arc::clone(&due),
         }),
-        ..LiveSupervisorConfig::default()
+        ..HyperliquidLiveConfig::default()
     };
     let provider = provider(&ws_uri, clock(), live);
     let cancellation = CancellationToken::new();

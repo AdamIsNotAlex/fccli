@@ -139,26 +139,28 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 
 ### R05 — Extract the shared live engine
 
-**Status:** [ ]  
+**Status:** [x]
 **Depends on:** R04  
 **Owned files:** `src/provider/mod.rs`, `src/provider/runtime/live.rs` (new), `src/provider/runtime/mod.rs`, `src/provider/binance.rs`, `src/provider/hyperliquid.rs`, `tests/provider_contract.rs`, `tests/app_live_contract.rs`, `tests/history_coordinator.rs`, `tests/snapshot_runner.rs`, `tests/binance_live.rs`, `tests/hyperliquid_live.rs`  
 **Parallel safety:** Sequential; highest overlap across both providers, both live suites, the provider trait, and every current fake provider needed for a green required-method cutover.  
 **Commit boundary:** `refactor(provider): share live supervision engine and capability source`
 
-- [ ] Move `LiveSupervisorConfig`, supervision, generation lifecycle, connected loop, gap REST/WS reconciliation, accepted-watermark pursuit, revision/ack gate, backoff, generation invalidation/purge, queue saturation handling, emergency barrier, classifications, cancellation precedence, and filtered event stream into `runtime/live.rs`.
-- [ ] Permanently add public `ProviderCapabilities { markets, timeframes, history_page_limit }` and required, no-default `MarketDataProvider::capabilities()`. Define `history_page_limit` as a non-zero provider maximum per history request, not an exact caller request size.
-- [ ] Implement explicit capabilities for Binance, Hyperliquid, and every current fake provider in `provider_contract`, `app_live_contract`, `history_coordinator`, and `snapshot_runner` so the trait cutover is complete and this commit is green. Binance advertises all supported timeframes; Hyperliquid excludes 1s/6h. Do not yet migrate non-live consumer behavior owned by R08.
-- [ ] Define only the minimal internal hooks needed for request validation, ready socket connection, history, rate gate, live config, and connection rotation. Do not define an internal history-page-limit hook: shared live gap must read, validate as non-zero before network I/O, and use `capabilities().history_page_limit` as its sole maximum; remove provider-local live `GAP_PAGE_LIMIT` ownership in this commit.
-- [ ] Enforce that `connect_ready_socket()` returns only after provider-specific subscription establishment; Binance URL handshake and Hyperliquid subscribe ack remain provider-owned.
-- [ ] Preserve REST concurrency during WS activity, first-candle timeout semantics, rate-gate/backoff deadline combination, reconnect generation purge, and terminal/recoverable error precedence.
-- [ ] Migrate every provider caller and both live suites' imports; remove duplicated live state-machine code/types/test exports in the same commit. Keep semantic test relocation for R06.
-- [ ] Add/adjust live contract coverage proving a zero advertised history maximum is rejected before gap network I/O and a smaller fake advertised maximum is used exactly; capability-only fake updates in the other contract suites must not change their pre-R08 request behavior.
-- [ ] Verify: `cargo test --locked --test provider_contract --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test history_coordinator --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test snapshot_runner --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test app_live_contract --no-default-features --features test-transport`.
+- [x] Move `LiveSupervisorConfig`, supervision, generation lifecycle, connected loop, gap REST/WS reconciliation, accepted-watermark pursuit, revision/ack gate, backoff, generation invalidation/purge, queue saturation handling, emergency barrier, classifications, cancellation precedence, and filtered event stream into `runtime/live.rs`.
+- [x] Permanently add public `ProviderCapabilities { markets, timeframes, history_page_limit }` and required, no-default `MarketDataProvider::capabilities()`. Define `history_page_limit` as a non-zero provider maximum per history request, not an exact caller request size.
+- [x] Implement explicit capabilities for Binance, Hyperliquid, and every current fake provider in `provider_contract`, `app_live_contract`, `history_coordinator`, and `snapshot_runner` so the trait cutover is complete and this commit is green. Binance advertises all supported timeframes; Hyperliquid excludes 1s/6h. Do not yet migrate non-live consumer behavior owned by R08.
+- [x] Define only the minimal internal hooks needed for request validation, ready socket connection, history, rate gate, live config, and connection rotation. Do not define an internal history-page-limit hook: shared live gap must read, validate as non-zero before network I/O, and use `capabilities().history_page_limit` as its sole maximum; remove provider-local live `GAP_PAGE_LIMIT` ownership in this commit.
+- [x] Enforce that `connect_ready_socket()` returns only after provider-specific subscription establishment; Binance URL handshake and Hyperliquid subscribe ack remain provider-owned.
+- [x] Preserve REST concurrency during WS activity, first-candle timeout semantics, rate-gate/backoff deadline combination, reconnect generation purge, and terminal/recoverable error precedence.
+- [x] Migrate every provider caller and both live suites' imports; remove duplicated live state-machine code/types/test exports in the same commit. Keep semantic test relocation for R06.
+- [x] Add/adjust live contract coverage proving a zero advertised history maximum is rejected before gap network I/O and a smaller fake advertised maximum is used exactly; capability-only fake updates in the other contract suites must not change their pre-R08 request behavior.
+**Implementation notes:** Shared live supervision is cut over to `src/provider/runtime/live.rs`; provider files retain only protocol adapters/sockets and internal policy hooks. No duplicate provider live engine, generation/reconciliation state-machine type, provider-local `GAP_PAGE_LIMIT`, or stale live-engine export remains. The single public required capability contract is implemented by Binance, Hyperliquid, and all four owned fake providers; Binance advertises every timeframe and Hyperliquid excludes 1s/6h. Both live suites prove zero advertised maxima fail before socket/history I/O. Hyperliquid live coverage drives the real shared gap engine and provider adapter with an advertised maximum of `7`, requiring the actual candle-snapshot network window to equal exactly seven 1-minute intervals before a reconcile batch can be emitted. Capability-only fake updates in the other suites retain their pre-R08 request behavior. All six formatted gates passed.
+
+- [x] Verify: `cargo test --locked --test provider_contract --no-default-features --features test-transport` (10 passed).
+- [x] Verify: `cargo test --locked --test history_coordinator --no-default-features --features test-transport` (21 passed).
+- [x] Verify: `cargo test --locked --test snapshot_runner --no-default-features --features test-transport` (6 passed).
+- [x] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport` (41 passed).
+- [x] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport` (29 passed).
+- [x] Verify: `cargo test --locked --test app_live_contract --no-default-features --features test-transport` (51 passed).
 
 ### R06 — Migrate shared live contract tests
 
@@ -317,12 +319,12 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 | R02 | [x] | R01 | no | Complete; formatted exact gates passed: `hyperliquid_rest` 17/17, `binance_rest` 23/23, and `binance_live` 42/42; temporal/window/order validation and exact rate-gate deadlines covered |
 | R03 | [x] | R02 | no | Complete; warning-free `cargo check` and formatted exact gates passed: `binance_ws_codec` 23/23, `hyperliquid_ws_codec` 11/11, `binance_live` 42/42, and `hyperliquid_live` 26/26; cancellation-aware close finalization and production-private codec outcomes verified |
 | R04 | [x] | R03 | no | Complete; formatted exact gates passed: `provider_runtime_websocket` 26/26, `binance_ws_codec` 4/4, `hyperliquid_ws_codec` 11/11, `binance_live` 40/40, and `hyperliquid_live` 27/27; identical-control coalescing, distinct-control blocking/resume/order, real provider saturation integrations, deterministic synchronization hooks, and queued-emergency shutdown suppression verified |
-| R05 | [ ] | R04 | yes | Ready; R04 complete. This chunk owns the permanent `ProviderCapabilities`/required-method cutover for all implementations and switches shared live gap to the sole public `history_page_limit` source; R08 only migrates remaining consumers |
-| R06 | [ ] | R05 | no | — |
+| R05 | [x] | R04 | no | Complete; formatted exact gates passed: `provider_contract` 10/10, `history_coordinator` 21/21, `snapshot_runner` 6/6, `binance_live` 41/41, `hyperliquid_live` 29/29, and `app_live_contract` 51/51. Both provider live suites reject zero advertised history maxima before socket/history I/O; the Hyperliquid live contract proves an advertised maximum of 7 produces exactly one candle-snapshot request ending at `start + 7 intervals - 1`. Public capabilities and the shared live engine are fully cut over with no duplicate limit source or provider-local engine/types/exports |
+| R06 | [ ] | R05 | yes | Dependency-ready after R05 closure |
 | R07 | [ ] | R06 | no | — |
 | R08 | [ ] | R07 | no | Completes app/snapshot/older-history and market/timeframe capability consumption after the R05 interface foundation; no second capability or live-limit source |
 | R09 | [ ] | R08 | no | — |
 | R10 | [ ] | R09 | no | — |
 | R11 | [ ] | R10 | no | — |
 
-**Next dependency-ready unchecked chunk:** R05 — extract the shared live supervision engine, permanently introduce the single public capability source for every provider/fake, and switch live gap pagination to it while preserving both provider-live integrations.
+**Next dependency-ready unchecked chunk:** R06 — migrate the shared live contract tests into the provider-neutral runtime suite.

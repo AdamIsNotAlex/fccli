@@ -6,6 +6,17 @@ pub(crate) mod runtime;
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[doc(hidden)]
 pub mod test_transport;
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+#[doc(hidden)]
+pub use runtime::live::{
+    CONTROL_CAPACITY, EMERGENCY_CONTROL_CAPACITY, FIRST_KLINE_HANDSHAKE_TIMEOUT,
+    KEYED_CANDLE_CAPACITY, LiveCompletionDisposition, LiveErrorClassification,
+    LiveErrorDisposition, LiveInBandEventDisposition, LiveInputClassification, LiveSocketEvent,
+    LiveSupervisorConfig, MARKET_EVENT_CHANNEL_CAPACITY, RECONCILE_ACK_TIMEOUT,
+    classify_live_error_for_test, classify_live_input_for_test,
+    gap_target_within_generation_span_for_test, reconciliation_distinct_key_allowed_for_test,
+    reconciliation_page_guard_for_test,
+};
 
 use futures_util::Stream;
 use std::{
@@ -19,7 +30,7 @@ use crate::{
     clock::Clock,
     error::ProviderError,
     model::{
-        Candle, GapGeneration, HistoryRequest, Instrument, InstrumentSpec, MarketEvent,
+        Candle, GapGeneration, HistoryRequest, Instrument, InstrumentSpec, Market, MarketEvent,
         MonoInstant, ProviderId, ReplayRevision, Timeframe,
     },
 };
@@ -31,8 +42,17 @@ pub type ProviderFuture<'a, T> =
 pub type MarketEventStream =
     Pin<Box<dyn Stream<Item = Result<MarketEvent, ProviderError>> + Send + 'static>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderCapabilities {
+    pub markets: &'static [Market],
+    pub timeframes: &'static [Timeframe],
+    /// Maximum rows accepted by one provider history request. Implementations must return non-zero.
+    pub history_page_limit: u16,
+}
+
 pub trait MarketDataProvider: Send + Sync {
     fn id(&self) -> ProviderId;
+    fn capabilities(&self) -> ProviderCapabilities;
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError>;
     fn history<'a>(
         &'a self,

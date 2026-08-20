@@ -11,8 +11,8 @@ use fccli::{
         RateGateState, Timeframe,
     },
     provider::{
-        LiveFeed, LiveRequest, MarketDataProvider, ProviderFuture, RateGateSender,
-        RateGateSnapshot, rate_gate_channel,
+        LiveFeed, LiveRequest, MarketDataProvider, ProviderCapabilities, ProviderFuture,
+        RateGateSender, RateGateSnapshot, rate_gate_channel,
     },
     snapshot::{NON_TTY_SNAPSHOT_SIZE, SnapshotOutputTarget, run_snapshot},
 };
@@ -45,6 +45,13 @@ impl FakeProvider {
 impl MarketDataProvider for FakeProvider {
     fn id(&self) -> ProviderId {
         ProviderId::new("fake").expect("valid provider")
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            markets: &[fccli::model::Market::Spot],
+            timeframes: &[Timeframe::Minute1],
+            history_page_limit: 1000,
+        }
     }
 
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {

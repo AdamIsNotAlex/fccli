@@ -15,9 +15,9 @@ use fccli::{
     },
     provider::{
         AcceptedWatermarkUpdateError, ExpectationUpdate, LiveFeed, LiveRequest, MarketDataProvider,
-        MarketEventStream, ProcessBlocker, ProducerCompletion, ProviderFuture, RateGateSnapshot,
-        RateGateState, ReconcileAck, ReconcileAckPublishError, ReconcileAckUpdate,
-        ReconcileExpectation, ReconcileExpectationError, WatermarkUpdate,
+        MarketEventStream, ProcessBlocker, ProducerCompletion, ProviderCapabilities,
+        ProviderFuture, RateGateSnapshot, RateGateState, ReconcileAck, ReconcileAckPublishError,
+        ReconcileAckUpdate, ReconcileExpectation, ReconcileExpectationError, WatermarkUpdate,
         accepted_watermark_channel, reconcile_ack_channel,
     },
 };
@@ -57,6 +57,13 @@ struct FakeProvider {
 impl MarketDataProvider for FakeProvider {
     fn id(&self) -> ProviderId {
         ProviderId::new("fake").expect("valid provider")
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            markets: &[Market::Spot],
+            timeframes: &[Timeframe::Minute1],
+            history_page_limit: 1000,
+        }
     }
 
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {

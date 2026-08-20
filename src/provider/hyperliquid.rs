@@ -1,12 +1,7 @@
 //! Hyperliquid Spot and Perpetual REST history and raw WebSocket transport.
 
-use std::{
-    collections::VecDeque,
-    sync::{Arc, atomic::Ordering},
-    time::Duration,
-};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
-use futures_util::{FutureExt, stream};
 use reqwest::{Client, StatusCode, Url, header::RETRY_AFTER};
 use serde::{
     Deserialize,
@@ -16,7 +11,6 @@ use serde_json::Value;
 use time::{Date, Month, OffsetDateTime};
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 use tokio::sync::Notify;
-use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
@@ -28,16 +22,18 @@ use crate::{
         SanitizedMessage, TimeoutKind,
     },
     model::{
-        Candle, ConnectionStatus, GapGeneration, HistoryRequest, HistoryRequestKind, Instrument,
-        InstrumentSpec, Market, MarketEvent, MonoInstant, ProviderId, RateGateState,
-        ReplayRevision, Timeframe, is_spot_index_token,
+        Candle, HistoryRequest, HistoryRequestKind, Instrument, InstrumentSpec, Market, ProviderId,
+        RateGateState, Timeframe, is_spot_index_token,
     },
     provider::{
-        LiveFeed, LiveRequest, MarketDataProvider, ProviderFuture, RateGateSender,
-        RateGateSnapshot, ReconcileAck, ReconcileExpectation, ReconcileExpectationError,
-        rate_gate_channel,
+        LiveFeed, LiveRequest, MarketDataProvider, ProviderCapabilities, ProviderFuture,
+        RateGateSender, RateGateSnapshot, rate_gate_channel,
         runtime::{
-            emitter::{EventEmitter, KeyedCandleBuffer, live_channel_closed},
+            live::{
+                ConnectionRotation, LiveAdapter, LiveConfig, LiveRateGate, LiveSocket,
+                LiveSocketEvent, LiveSupervisorConfig as SharedLiveSupervisorConfig,
+                ProcessBlockPolicy, ReconciliationLimits, ReconciliationPolicy,
+            },
             websocket::{
                 DecodedFrame, ReadinessInput, WsCodec, WsConfig, connect_websocket_url,
                 contextualize_websocket_configuration, validate_websocket_base,
@@ -62,35 +58,18 @@ const PRODUCTION_REST_BASE: &str = "https://api.hyperliquid.xyz";
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
 const PRODUCTION_WS_BASE: &str = "wss://api.hyperliquid.xyz/ws";
 
-pub const KEYED_CANDLE_CAPACITY: usize = 1024;
-pub const CONTROL_CAPACITY: usize = 64;
-pub const EMERGENCY_CONTROL_CAPACITY: usize = 2;
-pub const MARKET_EVENT_CHANNEL_CAPACITY: usize = 256;
-pub const FIRST_KLINE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-pub const RECONCILE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SUBSCRIBE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 pub const APPLICATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(50);
-pub const MAX_CONNECTION_AGE: Duration = Duration::from_secs(24 * 60 * 60);
-const MAX_SUPERVISOR_CAPACITY: usize = 65_536;
-const GAP_PAGE_LIMIT: u16 = 1000;
 const MAX_FUTURE_CANDLE_SKEW: Duration = Duration::from_secs(5 * 60);
 const MAX_GAP_RECONCILIATION_CANDLES: usize = 64_000;
 const MAX_GAP_RECONCILIATION_PAGES: usize = 64;
 
 #[derive(Clone, Debug)]
-pub struct LiveSupervisorConfig {
-    pub keyed_candle_capacity: usize,
-    pub control_capacity: usize,
-    pub market_event_capacity: usize,
-    pub first_kline_timeout: Duration,
+pub struct HyperliquidLiveConfig {
+    pub supervisor: SharedLiveSupervisorConfig,
     pub subscribe_ack_timeout: Duration,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub application_heartbeat_interval_for_test: Duration,
-    pub reconcile_ack_timeout: Duration,
-    pub max_connection_age: Duration,
-    pub ws_config: WsConfig,
-    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-    pub stalled_write_probe_frames: usize,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub heartbeat_test_hook: Option<HeartbeatTestHook>,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -108,24 +87,15 @@ pub struct LiveSupervisorConfig {
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub max_gap_reconciliation_candles_for_test: usize,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-    pub saturation_test_hook: Option<Arc<Notify>>,
+    pub advertised_history_page_limit: u16,
 }
-
-impl Default for LiveSupervisorConfig {
+impl Default for HyperliquidLiveConfig {
     fn default() -> Self {
         Self {
-            keyed_candle_capacity: KEYED_CANDLE_CAPACITY,
-            control_capacity: CONTROL_CAPACITY,
-            market_event_capacity: MARKET_EVENT_CHANNEL_CAPACITY,
-            first_kline_timeout: FIRST_KLINE_HANDSHAKE_TIMEOUT,
+            supervisor: SharedLiveSupervisorConfig::default(),
             subscribe_ack_timeout: SUBSCRIBE_ACK_TIMEOUT,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             application_heartbeat_interval_for_test: APPLICATION_HEARTBEAT_INTERVAL,
-            reconcile_ack_timeout: RECONCILE_ACK_TIMEOUT,
-            max_connection_age: MAX_CONNECTION_AGE,
-            ws_config: WsConfig::default(),
-            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            stalled_write_probe_frames: 0,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             heartbeat_test_hook: None,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -143,63 +113,37 @@ impl Default for LiveSupervisorConfig {
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             max_gap_reconciliation_candles_for_test: MAX_GAP_RECONCILIATION_CANDLES,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            saturation_test_hook: None,
+            advertised_history_page_limit: 1000,
         }
     }
 }
-
-impl LiveSupervisorConfig {
+impl HyperliquidLiveConfig {
     pub fn validate(&self) -> Result<(), ProviderError> {
-        for capacity in [
-            self.keyed_candle_capacity,
-            self.control_capacity,
-            self.market_event_capacity,
-        ] {
-            if !(1..=MAX_SUPERVISOR_CAPACITY).contains(&capacity) {
-                return Err(ProviderError::Configuration(
-                    "live supervisor capacity is outside 1..=65536",
-                ));
-            }
-        }
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        if self.stalled_write_probe_frames > MAX_SUPERVISOR_CAPACITY {
-            return Err(ProviderError::Configuration(
-                "live supervisor stalled-write probe is outside 0..=65536",
-            ));
-        }
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        if !(1..=MAX_GAP_RECONCILIATION_CANDLES)
-            .contains(&self.max_gap_reconciliation_candles_for_test)
-        {
-            return Err(ProviderError::Configuration(
-                "live reconciliation candle bound is outside 1..=64000",
-            ));
-        }
-        for timeout in [
-            self.first_kline_timeout,
-            self.reconcile_ack_timeout,
-            self.subscribe_ack_timeout,
-        ] {
-            if !(Duration::from_millis(1)..=Duration::from_secs(60)).contains(&timeout) {
-                return Err(ProviderError::Configuration(
-                    "live supervisor timeout is outside 1ms..=60s",
-                ));
-            }
-        }
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        self.supervisor.validate()?;
         if !(Duration::from_millis(1)..=Duration::from_secs(60))
-            .contains(&self.application_heartbeat_interval_for_test)
+            .contains(&self.subscribe_ack_timeout)
         {
             return Err(ProviderError::Configuration(
-                "application heartbeat interval is outside 1ms..=60s",
+                "subscribe acknowledgement timeout is outside 1ms..=60s",
             ));
         }
-        if self.max_connection_age.is_zero() {
-            return Err(ProviderError::Configuration(
-                "live connection max age must be positive",
-            ));
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        {
+            if !(Duration::from_millis(1)..=Duration::from_secs(60))
+                .contains(&self.application_heartbeat_interval_for_test)
+            {
+                return Err(ProviderError::Configuration(
+                    "application heartbeat interval is outside 1ms..=60s",
+                ));
+            }
+            if !(1..=MAX_GAP_RECONCILIATION_CANDLES)
+                .contains(&self.max_gap_reconciliation_candles_for_test)
+            {
+                return Err(ProviderError::Configuration(
+                    "live reconciliation candle bound is outside 1..=64000",
+                ));
+            }
         }
-        self.ws_config.validate()?;
         Ok(())
     }
 }
@@ -604,7 +548,7 @@ pub struct HyperliquidProvider {
     gate_snapshot: RateGateSnapshot,
     body_limit: usize,
     rate_limit_fallback: Duration,
-    live: LiveSupervisorConfig,
+    live: HyperliquidLiveConfig,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     ws_base_url: Option<String>,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -639,7 +583,7 @@ impl HyperliquidTestConfig {
         HyperliquidLiveTestConfig {
             rest: self,
             ws_base_url: base_url.into(),
-            live: LiveSupervisorConfig::default(),
+            live: HyperliquidLiveConfig::default(),
         }
     }
 }
@@ -649,7 +593,7 @@ impl HyperliquidTestConfig {
 pub struct HyperliquidLiveTestConfig {
     pub rest: HyperliquidTestConfig,
     pub ws_base_url: String,
-    pub live: LiveSupervisorConfig,
+    pub live: HyperliquidLiveConfig,
 }
 
 impl HyperliquidProvider {
@@ -660,7 +604,7 @@ impl HyperliquidProvider {
             REST_REQUEST_TIMEOUT,
             REST_BODY_LIMIT,
             RATE_LIMIT_FALLBACK,
-            LiveSupervisorConfig::default(),
+            HyperliquidLiveConfig::default(),
         )
     }
 
@@ -687,7 +631,7 @@ impl HyperliquidProvider {
             config.request_timeout,
             config.body_limit,
             config.rate_limit_fallback,
-            LiveSupervisorConfig::default(),
+            HyperliquidLiveConfig::default(),
             None,
             config.now_ms,
         )
@@ -719,7 +663,7 @@ impl HyperliquidProvider {
         request_timeout: Duration,
         body_limit: usize,
         rate_limit_fallback: Duration,
-        live: LiveSupervisorConfig,
+        live: HyperliquidLiveConfig,
         #[cfg(all(
             feature = "test-transport",
             not(feature = "production-transport")
@@ -917,968 +861,6 @@ impl HyperliquidProvider {
             status: response.status().as_u16(),
         })
     }
-
-    async fn connect_live_socket(
-        &self,
-        instrument: &Instrument,
-        timeframe: Timeframe,
-    ) -> Result<RawWebSocket, ProviderError> {
-        #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-        {
-            connect_websocket(instrument, timeframe, self.live.ws_config).await
-        }
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        {
-            let base = self
-                .ws_base_url
-                .as_deref()
-                .ok_or(ProviderError::Configuration(
-                    "test WebSocket base URL is required for live feeds",
-                ))?;
-            connect_test_websocket(base, instrument, timeframe, self.live.ws_config).await
-        }
-        #[cfg(all(feature = "production-transport", feature = "test-transport"))]
-        {
-            let _ = (instrument, timeframe);
-            unreachable!("mutually exclusive transport features are rejected by src/lib.rs")
-        }
-    }
-
-    async fn supervise_live(
-        self,
-        mut request: LiveRequest,
-        sender: EventEmitter,
-    ) -> Result<(), ProviderError> {
-        let mut generation_number = 0_u64;
-        let mut backoff_index = 0_usize;
-        loop {
-            if request.cancellation.is_cancelled() {
-                sender.shutdown().await;
-                return Ok(());
-            }
-            if matches!(
-                self.gate_snapshot.current(),
-                Ok(RateGateState::ProcessBlocked(_))
-            ) {
-                return Err(ProviderError::Invariant(
-                    "Hyperliquid rate gate cannot be process-blocked",
-                ));
-            }
-            generation_number = generation_number
-                .checked_add(1)
-                .ok_or(ProviderError::Invariant("gap generation overflow"))?;
-            let generation = GapGeneration(generation_number);
-            send_market(
-                &sender,
-                &request.cancellation,
-                MarketEvent::Status {
-                    generation: Some(generation),
-                    status: ConnectionStatus::Connecting,
-                },
-            )
-            .await?;
-            let connect_result = {
-                let connect_instrument = request.instrument.clone();
-                let connect_timeframe = request.timeframe;
-                let connect = self.connect_live_socket(&connect_instrument, connect_timeframe);
-                tokio::pin!(connect);
-                let mut gate = self.gate_snapshot.clone();
-                loop {
-                    tokio::select! {
-                        biased;
-                        () = request.cancellation.cancelled() => {
-                            sender.shutdown().await;
-                            return Ok(());
-                        }
-                        changed = request.accepted_watermark_rx.changed() => {
-                            if changed.is_err() {
-                                break Err(control_channel_closed(&request.instrument, request.timeframe));
-                            }
-                        }
-                        ack = request.reconcile_ack_rx.changed() => {
-                            if ack.is_err() {
-                                break Err(control_channel_closed(&request.instrument, request.timeframe));
-                            }
-                        }
-                        changed = gate.changed() => match changed {
-                            Err(_) => break Err(ProviderError::Invariant("rate gate closed")),
-                            Ok(RateGateState::ProcessBlocked(_)) => {
-                                return Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked"));
-                            }
-                            Ok(RateGateState::Open | RateGateState::TimedUntil(_)) => {}
-                        },
-                        result = &mut connect => break result,
-                    }
-                }
-            };
-            let mut socket = match connect_result {
-                Ok(socket) => socket,
-                Err(error) if is_terminal_live_error(&error) => {
-                    sender.invalidate_generation(generation);
-                    send_market(
-                        &sender,
-                        &request.cancellation,
-                        MarketEvent::TerminalError(error.clone()),
-                    )
-                    .await?;
-                    return Err(error);
-                }
-                Err(error) => {
-                    sender.invalidate_generation(generation);
-                    self.recover_and_backoff(
-                        &sender,
-                        &mut request,
-                        Some(generation),
-                        error,
-                        &mut backoff_index,
-                    )
-                    .await?;
-                    continue;
-                }
-            };
-            let age_deadline = checked_deadline(self.clock.now(), self.live.max_connection_age)
-                .map_err(|_| ProviderError::Invariant("live connection age deadline overflow"))?;
-            let outcome = self
-                .run_generation(&mut request, &sender, &mut socket, generation, age_deadline)
-                .await;
-            drop(socket);
-            if !matches!(&outcome, Ok(GenerationOutcome::Cancelled)) {
-                sender.invalidate_generation(generation);
-            }
-            match outcome {
-                Ok(GenerationOutcome::Cancelled) => {
-                    sender.shutdown().await;
-                    return Ok(());
-                }
-                Ok(GenerationOutcome::AcknowledgedReconnect(error)) => {
-                    if sender.connected_delivered(generation) {
-                        backoff_index = 0;
-                    }
-                    self.recover_and_backoff(
-                        &sender,
-                        &mut request,
-                        Some(generation),
-                        error,
-                        &mut backoff_index,
-                    )
-                    .await?;
-                }
-                Ok(GenerationOutcome::Reconnect(error)) => {
-                    self.recover_and_backoff(
-                        &sender,
-                        &mut request,
-                        Some(generation),
-                        error,
-                        &mut backoff_index,
-                    )
-                    .await?;
-                }
-                Err(error) if is_terminal_live_error(&error) => {
-                    send_market(
-                        &sender,
-                        &request.cancellation,
-                        MarketEvent::TerminalError(error.clone()),
-                    )
-                    .await?;
-                    return Err(error);
-                }
-                Err(error) => {
-                    self.recover_and_backoff(
-                        &sender,
-                        &mut request,
-                        Some(generation),
-                        error,
-                        &mut backoff_index,
-                    )
-                    .await?
-                }
-            }
-        }
-    }
-
-    async fn run_generation(
-        &self,
-        request: &mut LiveRequest,
-        sender: &EventEmitter,
-        socket: &mut RawWebSocket,
-        generation: GapGeneration,
-        age_deadline: MonoInstant,
-    ) -> Result<GenerationOutcome, ProviderError> {
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        if self.live.stalled_write_probe_frames != 0 {
-            let payload_size = self
-                .live
-                .ws_config
-                .write_buffer_size
-                .min(self.live.ws_config.max_frame_size)
-                .min(self.live.ws_config.max_message_size)
-                .max(1);
-            let payload = Message::Binary(vec![0; payload_size].into());
-            for _ in 0..self.live.stalled_write_probe_frames {
-                tokio::select! {
-                    biased;
-                    () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
-                    result = socket.send(payload.clone()) => result?,
-                }
-            }
-        }
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        {
-            socket.subscribe_flush_test_hook = self.live.subscribe_flush_test_hook.clone();
-        }
-        let subscribe = subscribe_message(&request.instrument, request.timeframe);
-        tokio::select! {
-            biased;
-            () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
-            result = socket.send(Message::Text(subscribe.into())) => result?,
-        }
-        let ack_deadline = checked_deadline(self.clock.now(), self.live.subscribe_ack_timeout)
-            .map_err(|_| ProviderError::Invariant("subscribe-ack deadline overflow"))?;
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        {
-            socket.readiness_inactivity_test_hook =
-                self.live.readiness_inactivity_test_hook.clone();
-            socket.readiness_decoded_ack_test_hook =
-                self.live.readiness_decoded_ack_test_hook.clone();
-            socket.readiness_drain_budget_test_hook =
-                self.live.readiness_drain_budget_test_hook.clone();
-            socket.close_flush_test_hook = self.live.close_flush_test_hook.clone();
-            socket.force_stalled_write_after_readiness_frame =
-                self.live.force_stalled_write_after_readiness_frame;
-        }
-        loop {
-            let inactivity_deadline = socket.inactivity_deadline();
-            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            let readiness_inactivity_test_hook = socket.readiness_inactivity_test_hook.clone();
-            tokio::select! {
-                biased;
-                () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
-                input = socket.read_readiness() => match input {
-                    ReadinessInput::Error(error) => return Ok(GenerationOutcome::Reconnect(error)),
-                    ReadinessInput::Frame(DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted)) => break,
-                    ReadinessInput::Frame(DecodedFrame::Ignored | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong)) => {
-                        if self.clock.now() >= ack_deadline {
-                            return Ok(GenerationOutcome::Reconnect(Self::subscribe_ack_timeout(request)));
-                        }
-                    }
-                    ReadinessInput::Frame(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => {
-                        let reconnect = live_protocol_error(request, "WebSocket peer requested reconnect");
-                        tokio::select! {
-                            biased;
-                            () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
-                            result = socket.finalize_peer_close() => {
-                                if let Err(error) = result {
-                                    return Ok(GenerationOutcome::Reconnect(error));
-                                }
-                            }
-                        }
-                        return Ok(GenerationOutcome::Reconnect(reconnect));
-                    }
-                    ReadinessInput::Frame(DecodedFrame::ProviderError(error)) => return Ok(GenerationOutcome::Reconnect(error)),
-                    ReadinessInput::Frame(DecodedFrame::Provider(HyperliquidDecoded::Candle(_))) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "Hyperliquid candle arrived before subscribe acknowledgement"))),
-                },
-                () = self.clock.sleep_until(ack_deadline) => {
-                    return Ok(GenerationOutcome::Reconnect(Self::subscribe_ack_timeout(request)));
-                },
-                () = async move {
-                    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-                    if let Some(hook) = readiness_inactivity_test_hook {
-                        hook.notified().await;
-                        return;
-                    }
-                    tokio::time::sleep_until(inactivity_deadline).await;
-                } => {
-                    return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout {
-                        context: ErrorContext::operation(ErrorOperation::WebSocket)
-                            .with_market(&request.instrument, request.timeframe),
-                        kind: TimeoutKind::WebSocketInactivity,
-                    }));
-                }
-            }
-        }
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        {
-            socket.heartbeat_test_hook = self.live.heartbeat_test_hook.clone();
-        }
-        #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-        socket.start_application_heartbeat(APPLICATION_HEARTBEAT_INTERVAL);
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        socket.start_application_heartbeat(self.live.application_heartbeat_interval_for_test);
-        send_market(
-            sender,
-            &request.cancellation,
-            MarketEvent::Status {
-                generation: Some(generation),
-                status: ConnectionStatus::GapSync,
-            },
-        )
-        .await?;
-        let mut gate = self.gate_snapshot.clone();
-        let first_deadline = checked_deadline(self.clock.now(), self.live.first_kline_timeout)
-            .map_err(|_| ProviderError::Invariant("first-kline deadline overflow"))?;
-        let first = loop {
-            tokio::select! {
-                    biased;
-                    () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
-                    changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
-                    ack = request.reconcile_ack_rx.changed() => { ack.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
-                    changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked")); },
-                    frame = socket.read() => match frame? {
-                        DecodedFrame::Provider(HyperliquidDecoded::Candle(candle)) => break candle,
-                        DecodedFrame::Ignored | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong) => {
-                            let now = self.clock.now();
-                            if now >= first_deadline {
-                                return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), kind: TimeoutKind::FirstKline }));
-                            }
-                            if now >= age_deadline {
-                                return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached")));
-                            }
-                        }
-                        DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))),
-                        DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested => return Ok(GenerationOutcome::Reconnect(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" })),
-                        DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
-                        DecodedFrame::ProviderError(error) => return Ok(GenerationOutcome::Reconnect(error)),
-                    },
-                    () = self.clock.sleep_until(age_deadline) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached"))),
-                    () = self.clock.sleep_until(first_deadline) => {
-                        return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), kind: TimeoutKind::FirstKline }));
-                    }
-            }
-        };
-        let confirmed = request
-            .accepted_watermark_rx
-            .current()
-            .map_err(|_| ProviderError::ChannelClosed {
-                context: ErrorContext::operation(ErrorOperation::Reconciliation)
-                    .with_market(&request.instrument, request.timeframe),
-            })?
-            .max(request.startup_watermark);
-        let start = confirmed.unwrap_or_else(|| first.open_time());
-        let mut target_open_time = first.open_time().max(start);
-        let mut revision = ReplayRevision(1);
-        let mut buffered = KeyedCandleBuffer::unbounded();
-        if first.open_time() >= start {
-            let _ = buffered.push(first)?;
-        }
-        let mut deferred_reconnect: Option<ProviderError> = None;
-        let mut rest_synced_through = None;
-        let mut reconciliation_pages = 0_usize;
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        let max_reconciliation_successors = self.live.max_gap_reconciliation_candles_for_test;
-        #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-        let max_reconciliation_successors = MAX_GAP_RECONCILIATION_CANDLES;
-
-        loop {
-            let mut cursor = match rest_synced_through {
-                Some(last) => next_gap_cursor(request.timeframe, last)?,
-                None => start,
-            };
-            while cursor <= target_open_time {
-                if !gap_target_within_generation_span(
-                    request.timeframe,
-                    start,
-                    target_open_time,
-                    max_reconciliation_successors,
-                ) {
-                    return Ok(GenerationOutcome::Reconnect(live_protocol_error(
-                        request,
-                        "Hyperliquid gap reconciliation target exceeds the per-generation span limit",
-                    )));
-                }
-                if let Err(error) = advance_reconciliation_page(
-                    &mut reconciliation_pages,
-                    ErrorContext::operation(ErrorOperation::Reconciliation)
-                        .with_market(&request.instrument, request.timeframe),
-                ) {
-                    return Ok(GenerationOutcome::Reconnect(error));
-                }
-                let request_target = target_open_time;
-                let history_request =
-                    HistoryRequest::gap(cursor, request_target, GAP_PAGE_LIMIT)
-                        .map_err(|_| ProviderError::Invariant("invalid gap history request"))?;
-                let page = {
-                    let history_instrument = request.instrument.clone();
-                    let history_timeframe = request.timeframe;
-                    let history_cancel = request.cancellation.child_token();
-                    let history = self.history(
-                        &history_instrument,
-                        history_timeframe,
-                        history_request,
-                        history_cancel,
-                    );
-                    tokio::pin!(history);
-                    enum ReconcileWake {
-                        Cancelled,
-                        AcceptedWatermark(Result<Option<i64>, ProviderError>),
-                        Ack(Result<(), ProviderError>),
-                        ConnectionAged,
-                        Gate(Result<RateGateState, ProviderError>),
-                        Socket(Result<DecodedFrame<HyperliquidDecoded>, ProviderError>),
-                        Page(Result<Vec<Candle>, ProviderError>),
-                    }
-
-                    loop {
-                        if request.cancellation.is_cancelled() {
-                            return Ok(GenerationOutcome::Cancelled);
-                        }
-                        let wake = tokio::select! {
-                            () = request.cancellation.cancelled() => ReconcileWake::Cancelled,
-                            changed = request.accepted_watermark_rx.changed() => ReconcileWake::AcceptedWatermark(changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))),
-                            ack = request.reconcile_ack_rx.changed() => ReconcileWake::Ack(ack.map(|_| ()).map_err(|_| control_channel_closed(&request.instrument, request.timeframe))),
-                            () = self.clock.sleep_until(age_deadline) => ReconcileWake::ConnectionAged,
-                            changed = gate.changed() => ReconcileWake::Gate(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))),
-                            frame = socket.read() => ReconcileWake::Socket(frame),
-                            page = &mut history => ReconcileWake::Page(page),
-                        };
-                        if request.cancellation.is_cancelled() {
-                            return Ok(GenerationOutcome::Cancelled);
-                        }
-                        match wake {
-                            ReconcileWake::Cancelled => return Ok(GenerationOutcome::Cancelled),
-                            ReconcileWake::AcceptedWatermark(changed) => {
-                                if let Some(watermark) = changed? {
-                                    if let Err(error) = advance_reconciliation_target(
-                                        &mut target_open_time,
-                                        watermark,
-                                        start,
-                                        request.timeframe,
-                                        max_reconciliation_successors,
-                                    ) {
-                                        return Ok(GenerationOutcome::Reconnect(error));
-                                    }
-                                }
-                            }
-                            ReconcileWake::Ack(changed) => changed?,
-                            ReconcileWake::ConnectionAged => {
-                                return Ok(GenerationOutcome::Reconnect(live_protocol_error(
-                                    request,
-                                    "24-hour WebSocket connection age reached",
-                                )));
-                            }
-                            ReconcileWake::Gate(changed) => {
-                                if matches!(changed?, RateGateState::ProcessBlocked(_)) {
-                                    return Err(ProviderError::Invariant(
-                                        "Hyperliquid rate gate cannot be process-blocked",
-                                    ));
-                                }
-                            }
-                            ReconcileWake::Socket(frame) => match frame {
-                                Ok(DecodedFrame::Provider(HyperliquidDecoded::Candle(candle))) => {
-                                    if let Err(error) = apply_reconciliation_candle(
-                                        &mut buffered,
-                                        candle,
-                                        &mut revision,
-                                        &mut target_open_time,
-                                        start,
-                                        request.timeframe,
-                                        max_reconciliation_successors,
-                                    ) {
-                                        return Ok(GenerationOutcome::Reconnect(error));
-                                    }
-                                }
-                                Ok(
-                                    DecodedFrame::Ignored
-                                    | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong),
-                                ) => {}
-                                Ok(DecodedFrame::Provider(
-                                    HyperliquidDecoded::SubscribeAccepted,
-                                )) => {
-                                    return Ok(GenerationOutcome::Reconnect(live_protocol_error(
-                                        request,
-                                        "duplicate Hyperliquid subscribe acknowledgement",
-                                    )));
-                                }
-                                Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => {
-                                    return Ok(GenerationOutcome::Reconnect(live_protocol_error(
-                                        request,
-                                        "WebSocket peer requested reconnect",
-                                    )));
-                                }
-                                Ok(DecodedFrame::ProviderError(error))
-                                    if is_terminal_live_error(&error) =>
-                                {
-                                    return Err(error);
-                                }
-                                Err(error) if is_terminal_live_error(&error) => return Err(error),
-                                Ok(DecodedFrame::ProviderError(error)) | Err(error) => {
-                                    return Ok(GenerationOutcome::Reconnect(error));
-                                }
-                            },
-                            ReconcileWake::Page(page) => {
-                                if request.cancellation.is_cancelled() {
-                                    return Ok(GenerationOutcome::Cancelled);
-                                }
-                                let terminal = async {
-                                tokio::select! {
-                                    biased;
-                                    () = request.cancellation.cancelled() => Ok((Some(GenerationOutcome::Cancelled), false)),
-                                    changed = request.accepted_watermark_rx.changed() => changed
-                                        .map_err(|_| control_channel_closed(&request.instrument, request.timeframe))
-                                        .map(|watermark| {
-                                            let outcome = watermark.and_then(|watermark| {
-                                                advance_reconciliation_target(
-                                                    &mut target_open_time,
-                                                    watermark,
-                                                    start,
-                                                    request.timeframe,
-                                                    max_reconciliation_successors,
-                                                )
-                                                .err()
-                                                .map(GenerationOutcome::Reconnect)
-                                            });
-                                            (outcome, true)
-                                        }),
-                                    ack = request.reconcile_ack_rx.changed() => ack
-                                        .map(|_| (None, false))
-                                        .map_err(|_| control_channel_closed(&request.instrument, request.timeframe)),
-                                    () = self.clock.sleep_until(age_deadline) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached"))), false)),
-                                    changed = gate.changed() => match changed {
-                                        Ok(RateGateState::ProcessBlocked(_)) => Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked")),
-                                        Ok(_) => Ok((None, false)),
-                                        Err(_) => Err(ProviderError::Invariant("rate gate closed")),
-                                    },
-                                    frame = socket.read() => match frame {
-                                        Ok(DecodedFrame::Provider(HyperliquidDecoded::Candle(candle))) => match apply_reconciliation_candle(
-                                            &mut buffered,
-                                            candle,
-                                            &mut revision,
-                                            &mut target_open_time,
-                                            start,
-                                            request.timeframe,
-                                            max_reconciliation_successors,
-                                        ) {
-                                            Ok(()) => Ok((None, false)),
-                                            Err(error) => Ok((Some(GenerationOutcome::Reconnect(error)), false)),
-                                        },
-                                        Ok(DecodedFrame::Ignored | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong)) => Ok((None, false)),
-                                        Ok(DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted)) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))), false)),
-                                        Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))), false)),
-                                        Ok(DecodedFrame::ProviderError(error)) | Err(error) if is_terminal_live_error(&error) => Err(error),
-                                        Ok(DecodedFrame::ProviderError(error)) | Err(error) => Ok((Some(GenerationOutcome::Reconnect(error)), false)),
-                                    },
-                                }
-                            }
-                            .now_or_never()
-                            .transpose()?;
-                                if request.cancellation.is_cancelled() {
-                                    return Ok(GenerationOutcome::Cancelled);
-                                }
-                                let watermark_consumed = match terminal {
-                                    Some((Some(outcome), _)) => return Ok(outcome),
-                                    Some((None, true)) => true,
-                                    _ => false,
-                                };
-                                if watermark_consumed {
-                                    let follow_up = async {
-                                    tokio::select! {
-                                        biased;
-                                        () = request.cancellation.cancelled() => Ok(Some(GenerationOutcome::Cancelled)),
-                                        frame = socket.read() => match frame {
-                                            Ok(DecodedFrame::Provider(HyperliquidDecoded::Candle(candle))) => match apply_reconciliation_candle(
-                                                &mut buffered,
-                                                candle,
-                                                &mut revision,
-                                                &mut target_open_time,
-                                                start,
-                                                request.timeframe,
-                                                max_reconciliation_successors,
-                                            ) {
-                                                Ok(()) => Ok(None),
-                                                Err(error) => Ok(Some(GenerationOutcome::Reconnect(error))),
-                                            },
-                                            Ok(DecodedFrame::Ignored | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong)) => Ok(None),
-                                            Ok(DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted)) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement")))),
-                                            Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect")))),
-                                            Ok(DecodedFrame::ProviderError(error)) | Err(error) if is_terminal_live_error(&error) => Err(error),
-                                            Ok(DecodedFrame::ProviderError(error)) | Err(error) => Ok(Some(GenerationOutcome::Reconnect(error))),
-                                        },
-                                        () = self.clock.sleep_until(age_deadline) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached")))),
-                                        changed = gate.changed() => match changed {
-                                            Ok(RateGateState::ProcessBlocked(_)) => Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked")),
-                                            Ok(_) => Ok(None),
-                                            Err(_) => Err(ProviderError::Invariant("rate gate closed")),
-                                        },
-                                        ack = request.reconcile_ack_rx.changed() => ack
-                                            .map(|_| None)
-                                            .map_err(|_| control_channel_closed(&request.instrument, request.timeframe)),
-                                    }
-                                }
-                                .now_or_never()
-                                .transpose()?;
-                                    if request.cancellation.is_cancelled() {
-                                        return Ok(GenerationOutcome::Cancelled);
-                                    }
-                                    if let Some(Some(outcome)) = follow_up {
-                                        return Ok(outcome);
-                                    }
-                                }
-                                break page;
-                            }
-                        }
-                    }
-                };
-                let page = page?;
-                let last = page.last().map(Candle::open_time);
-                if page.is_empty() {
-                    if confirmed.is_none() && cursor == start {
-                        break;
-                    }
-                    return Ok(GenerationOutcome::Reconnect(
-                        ProviderError::GapSyncNoProgress {
-                            target_open_time: request_target,
-                            last_open_time: None,
-                        },
-                    ));
-                }
-                if last.is_some_and(|value| value < cursor) {
-                    return Ok(GenerationOutcome::Reconnect(
-                        ProviderError::GapSyncNoProgress {
-                            target_open_time: request_target,
-                            last_open_time: last,
-                        },
-                    ));
-                }
-                let page_len = page.len();
-                let mut accepted_any = false;
-                for candle in page {
-                    accepted_any |= buffered.push(candle)?;
-                }
-                let Some(last) = last else { unreachable!() };
-                rest_synced_through = Some(last);
-                if last >= target_open_time {
-                    break;
-                }
-                if last < request_target && page_len < usize::from(GAP_PAGE_LIMIT) {
-                    return Ok(GenerationOutcome::Reconnect(
-                        ProviderError::GapSyncNoProgress {
-                            target_open_time: request_target,
-                            last_open_time: Some(last),
-                        },
-                    ));
-                }
-                if !accepted_any && last < request_target {
-                    return Ok(GenerationOutcome::Reconnect(
-                        ProviderError::GapSyncNoProgress {
-                            target_open_time: request_target,
-                            last_open_time: Some(last),
-                        },
-                    ));
-                }
-                cursor = next_gap_cursor(request.timeframe, last)?;
-            }
-            let page_candles = buffered.values().cloned().collect();
-            let expected = ReconcileExpectation {
-                generation,
-                revision,
-                target_open_time,
-            };
-            request
-                .reconcile_ack_rx
-                .register_expectation(expected)
-                .map_err(|error| match error {
-                    ReconcileExpectationError::Closed => {
-                        control_channel_closed(&request.instrument, request.timeframe)
-                    }
-                    ReconcileExpectationError::Regression | ReconcileExpectationError::Conflict => {
-                        ProviderError::Invariant("reconciliation expectation invariant violated")
-                    }
-                })?;
-            send_market(
-                sender,
-                &request.cancellation,
-                MarketEvent::ReconcileBatch {
-                    generation,
-                    revision,
-                    target_open_time,
-                    candles: page_candles,
-                },
-            )
-            .await?;
-            let ack_deadline = checked_deadline(self.clock.now(), self.live.reconcile_ack_timeout)
-                .map_err(|_| ProviderError::Invariant("ack deadline overflow"))?;
-            loop {
-                tokio::select! {
-                    biased;
-                    () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
-                    changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
-                    () = self.clock.sleep_until(age_deadline) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached"))),
-                    changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked")); },
-                    frame = socket.read(), if deferred_reconnect.is_none() => match frame? {
-                        DecodedFrame::Provider(HyperliquidDecoded::Candle(candle)) => {
-                            if let Err(error) = apply_reconciliation_candle(
-                                &mut buffered,
-                                candle,
-                                &mut revision,
-                                &mut target_open_time,
-                                start,
-                                request.timeframe,
-                                max_reconciliation_successors,
-                            ) {
-                                return Ok(GenerationOutcome::Reconnect(error));
-                            }
-                            break;
-                        }
-                        DecodedFrame::Ignored | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong) => {
-                            if let Some(ack) = request
-                                .reconcile_ack_rx
-                                .current()
-                                .map_err(|_| {
-                                    control_channel_closed(&request.instrument, request.timeframe)
-                                })?
-                                && ack.generation == generation
-                                && ack.revision == revision
-                                && ack.through >= target_open_time
-                            {
-                                return if let Some(error) = deferred_reconnect.take() {
-                                    Ok(GenerationOutcome::Reconnect(error))
-                                } else {
-                                    self.connected_loop(request, sender, socket, generation, age_deadline).await
-                                };
-                            }
-                            if self.clock.now() >= ack_deadline {
-                                return Ok(GenerationOutcome::Reconnect(ProviderError::ReconcileAckTimeout { generation, revision, target_open_time }));
-                            }
-                        }
-                        DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))),
-                        DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))),
-                        DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
-                        DecodedFrame::ProviderError(error) => deferred_reconnect = Some(error),
-                    },
-                    ack = request.reconcile_ack_rx.changed() => {
-                        let ReconcileAck { generation: ack_generation, revision: ack_revision, through } = ack.map_err(|_| ProviderError::ChannelClosed { context: ErrorContext::operation(ErrorOperation::Reconciliation).with_market(&request.instrument, request.timeframe) })?;
-                        if ack_generation == generation && ack_revision == revision && through >= target_open_time {
-                            return if let Some(error) = deferred_reconnect.take() {
-                                Ok(GenerationOutcome::Reconnect(error))
-                            } else {
-                                self.connected_loop(request, sender, socket, generation, age_deadline).await
-                            };
-                        }
-                    },
-                    () = self.clock.sleep_until(ack_deadline) => {
-                        if let Ok(Some(ack)) = request.reconcile_ack_rx.current()
-                            && ack.generation == generation
-                            && ack.revision == revision
-                            && ack.through >= target_open_time
-                        {
-                            return if let Some(error) = deferred_reconnect.take() {
-                                Ok(GenerationOutcome::Reconnect(error))
-                            } else {
-                                self.connected_loop(request, sender, socket, generation, age_deadline).await
-                            };
-                        }
-                        return Ok(GenerationOutcome::Reconnect(ProviderError::ReconcileAckTimeout { generation, revision, target_open_time }));
-                    }
-                }
-            }
-        }
-    }
-
-    async fn connected_loop(
-        &self,
-        request: &mut LiveRequest,
-        sender: &EventEmitter,
-        socket: &mut RawWebSocket,
-        generation: GapGeneration,
-        age_deadline: MonoInstant,
-    ) -> Result<GenerationOutcome, ProviderError> {
-        let mut connected_queued = false;
-        let mut pending = KeyedCandleBuffer::bounded(self.live.keyed_candle_capacity);
-        let mut gate = self.gate_snapshot.clone();
-        loop {
-            if matches!(gate.current(), Ok(RateGateState::ProcessBlocked(_))) {
-                return Err(ProviderError::Invariant(
-                    "Hyperliquid rate gate cannot be process-blocked",
-                ));
-            }
-            tokio::select! {
-                biased;
-                () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
-                changed = gate.changed() => match changed.map_err(|_| ProviderError::Invariant("rate gate closed"))? {
-                    RateGateState::ProcessBlocked(_) => return Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked")),
-                    RateGateState::Open | RateGateState::TimedUntil(_) => {}
-                },
-                changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
-                ack = request.reconcile_ack_rx.changed() => { ack.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
-                result = send_market(sender, &request.cancellation, MarketEvent::Status { generation: Some(generation), status: ConnectionStatus::Connected }), if !connected_queued => {
-                    result?;
-                    connected_queued = true;
-                },
-                permit = sender.reserve_regular(), if connected_queued && !pending.is_empty() => {
-                    let permit = permit?;
-                    let candle = pending.pop_first().expect("pending is nonempty");
-                    sender.send_reserved(permit, MarketEvent::Candle { generation, candle })?;
-                },
-                frame = socket.read() => {
-                    if self.clock.now() >= age_deadline {
-                        let error = live_protocol_error(request, "24-hour WebSocket connection age reached");
-                        return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
-                    }
-                    match frame {
-                        Ok(DecodedFrame::Provider(HyperliquidDecoded::Candle(candle))) => {
-                            if let Err(outcome) = pending.push(candle) {
-                                #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-                                if let Some(hook) = &self.live.saturation_test_hook {
-                                    hook.notify_one();
-                                }
-                                return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(outcome) } else { GenerationOutcome::Reconnect(outcome) });
-                            }
-                        }
-                        Ok(DecodedFrame::Ignored | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong)) => {}
-                        Ok(DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted)) => {
-                            let error = live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement");
-                            return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
-                        }
-                        Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => {
-                            let error = live_protocol_error(request, "WebSocket peer requested reconnect");
-                            return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
-                        }
-                        Ok(DecodedFrame::ProviderError(error)) if is_terminal_live_error(&error) => return Err(error),
-                        Err(error) if is_terminal_live_error(&error) => return Err(error),
-                        Ok(DecodedFrame::ProviderError(error)) | Err(error) => {
-                            return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
-                        }
-                    }
-                },
-                () = self.clock.sleep_until(age_deadline) => {
-                    let error = live_protocol_error(request, "24-hour WebSocket connection age reached");
-                    return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
-                },
-            }
-        }
-    }
-
-    async fn recover_and_backoff(
-        &self,
-        sender: &EventEmitter,
-        request: &mut LiveRequest,
-        generation: Option<GapGeneration>,
-        error: ProviderError,
-        backoff_index: &mut usize,
-    ) -> Result<(), ProviderError> {
-        let cancellation = request.cancellation.clone();
-        let mut gate = self.gate_snapshot.clone();
-        let initial_gate = match gate.current() {
-            Ok(state) => state,
-            Err(_) => {
-                let error = ProviderError::Invariant("rate gate closed");
-                send_market(
-                    sender,
-                    &cancellation,
-                    MarketEvent::TerminalError(error.clone()),
-                )
-                .await?;
-                return Err(error);
-            }
-        };
-        if matches!(initial_gate, RateGateState::ProcessBlocked(_)) {
-            return Err(ProviderError::Invariant(
-                "Hyperliquid rate gate cannot be process-blocked",
-            ));
-        }
-        let gate_deadline = match initial_gate {
-            RateGateState::TimedUntil(deadline) => Some(deadline),
-            RateGateState::Open | RateGateState::ProcessBlocked(_) => None,
-        };
-        let seconds = [1_u64, 2, 4, 8, 16, 30]
-            .get(*backoff_index)
-            .copied()
-            .unwrap_or(30);
-        *backoff_index = backoff_index.saturating_add(1);
-        let backoff = checked_deadline(self.clock.now(), Duration::from_secs(seconds))
-            .map_err(|_| ProviderError::Invariant("backoff deadline overflow"))?;
-        let mut deadline = gate_deadline.map_or(backoff, |value| value.max(backoff));
-        let queue_saturated = matches!(&error, ProviderError::QueueSaturated);
-        let control_generation = if queue_saturated { None } else { generation };
-        let recoverable = MarketEvent::RecoverableError {
-            generation: control_generation,
-            error,
-            rate_gate_deadline: gate_deadline,
-        };
-        let backoff_status = MarketEvent::Status {
-            generation: control_generation,
-            status: ConnectionStatus::Backoff,
-        };
-        let emergency_barrier = if queue_saturated {
-            if let Some(generation) = generation {
-                sender.invalidate_generation(generation);
-            }
-            Some(sender.queue_emergency_pair(recoverable, backoff_status)?)
-        } else {
-            send_market(sender, &cancellation, recoverable).await?;
-            send_market(sender, &cancellation, backoff_status).await?;
-            None
-        };
-        let mut deadline_elapsed = false;
-        loop {
-            let barrier_elapsed = emergency_barrier
-                .as_ref()
-                .is_none_or(|barrier| barrier.is_dequeued());
-            if deadline_elapsed && barrier_elapsed {
-                return Ok(());
-            }
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => {
-                    sender.shutdown().await;
-                    return Ok(());
-                },
-                changed = request.accepted_watermark_rx.changed() => {
-                    if changed.is_err() {
-                        let error = control_channel_closed(&request.instrument, request.timeframe);
-                        send_market(sender, &cancellation, MarketEvent::TerminalError(error.clone())).await?;
-                        return Err(error);
-                    }
-                },
-                ack = request.reconcile_ack_rx.changed() => {
-                    if ack.is_err() {
-                        let error = control_channel_closed(&request.instrument, request.timeframe);
-                        send_market(sender, &cancellation, MarketEvent::TerminalError(error.clone())).await?;
-                        return Err(error);
-                    }
-                },
-                () = sender.wait_closed() => return Err(live_channel_closed()),
-                changed = gate.changed() => match changed {
-                    Err(_) => {
-                        let error = ProviderError::Invariant("rate gate closed");
-                        send_market(sender, &cancellation, MarketEvent::TerminalError(error.clone())).await?;
-                        return Err(error);
-                    }
-                    Ok(RateGateState::ProcessBlocked(_)) => {
-                        return Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked"));
-                    }
-                    Ok(RateGateState::TimedUntil(value)) => {
-                        deadline = deadline.max(value);
-                        deadline_elapsed = self.clock.now() >= deadline;
-                    }
-                    Ok(RateGateState::Open) => {}
-                },
-                () = self.clock.sleep_until(deadline), if !deadline_elapsed => {
-                    match gate.current() {
-                        Err(_) => {
-                            let error = ProviderError::Invariant("rate gate closed");
-                            send_market(sender, &cancellation, MarketEvent::TerminalError(error.clone())).await?;
-                            return Err(error);
-                        }
-                        Ok(RateGateState::ProcessBlocked(_)) => {
-                            return Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked"));
-                        }
-                        Ok(RateGateState::TimedUntil(value)) if value > deadline => deadline = value,
-                        Ok(RateGateState::Open | RateGateState::TimedUntil(_)) => deadline_elapsed = true,
-                    }
-                },
-                () = async { if let Some(barrier) = &emergency_barrier { barrier.wait_dequeued().await } }, if !barrier_elapsed => {}
-            }
-        }
-    }
-
-    fn subscribe_ack_timeout(request: &LiveRequest) -> ProviderError {
-        ProviderError::Timeout {
-            context: ErrorContext::operation(ErrorOperation::WebSocket)
-                .with_market(&request.instrument, request.timeframe),
-            kind: TimeoutKind::SubscribeAck,
-        }
-    }
-
     pub fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
         if spec.provider().as_str() != "hyperliquid" {
             return Err(ProviderError::Configuration(
@@ -1937,270 +919,292 @@ impl HyperliquidProvider {
     pub fn rate_gate(&self) -> RateGateSnapshot {
         self.gate_snapshot.clone()
     }
-}
 
-enum GenerationOutcome {
-    Cancelled,
-    AcknowledgedReconnect(ProviderError),
-    Reconnect(ProviderError),
-}
-
-async fn send_market(
-    sender: &EventEmitter,
-    cancellation: &CancellationToken,
-    event: MarketEvent,
-) -> Result<(), ProviderError> {
-    tokio::select! { biased; () = cancellation.cancelled() => Ok(()), result = sender.send_regular(event) => result }
-}
-fn advance_reconciliation_target(
-    target_open_time: &mut i64,
-    candidate: i64,
-    generation_start: i64,
-    timeframe: Timeframe,
-    maximum_successors: usize,
-) -> Result<(), ProviderError> {
-    let candidate_target = (*target_open_time).max(candidate);
-    if !gap_target_within_generation_span(
-        timeframe,
-        generation_start,
-        candidate_target,
-        maximum_successors,
-    ) {
-        return Err(ProviderError::Protocol {
-            context: ErrorContext::operation(ErrorOperation::Reconciliation),
-            detail: "Hyperliquid gap reconciliation target exceeds the per-generation span limit",
-        });
-    }
-    *target_open_time = candidate_target;
-    Ok(())
-}
-
-fn apply_reconciliation_candle(
-    pending: &mut KeyedCandleBuffer,
-    candidate: Candle,
-    revision: &mut ReplayRevision,
-    target_open_time: &mut i64,
-    generation_start: i64,
-    timeframe: Timeframe,
-    maximum_successors: usize,
-) -> Result<(), ProviderError> {
-    let open_time = candidate.open_time();
-    let distinct_key_limit = maximum_successors
-        .checked_add(1)
-        .ok_or(ProviderError::Invariant(
-            "reconciliation buffer bound overflow",
-        ))?;
-    ensure_reconciliation_buffer_capacity(pending, open_time, distinct_key_limit)?;
-    advance_reconciliation_target(
-        target_open_time,
-        open_time,
-        generation_start,
-        timeframe,
-        maximum_successors,
-    )?;
-    let _ = pending.push(candidate)?;
-    revision.0 = revision
-        .0
-        .checked_add(1)
-        .ok_or(ProviderError::Invariant("replay revision overflow"))?;
-    Ok(())
-}
-
-fn ensure_reconciliation_buffer_capacity(
-    pending: &KeyedCandleBuffer,
-    open_time: i64,
-    distinct_key_limit: usize,
-) -> Result<(), ProviderError> {
-    if !reconciliation_distinct_key_allowed(
-        pending.len(),
-        pending.contains_key(open_time),
-        distinct_key_limit,
-    ) {
-        return Err(ProviderError::Protocol {
-            context: ErrorContext::operation(ErrorOperation::Reconciliation),
-            detail: "Hyperliquid gap reconciliation exceeded the distinct buffered-candle limit",
-        });
-    }
-    Ok(())
-}
-
-fn reconciliation_distinct_key_allowed(
-    existing_len: usize,
-    key_exists: bool,
-    distinct_key_limit: usize,
-) -> bool {
-    key_exists || existing_len < distinct_key_limit
-}
-
-fn advance_reconciliation_page(
-    pages: &mut usize,
-    context: ErrorContext,
-) -> Result<(), ProviderError> {
-    *pages = pages.checked_add(1).ok_or(ProviderError::Invariant(
-        "reconciliation page count overflow",
-    ))?;
-    if *pages > MAX_GAP_RECONCILIATION_PAGES {
-        return Err(ProviderError::Protocol {
-            context,
-            detail: "Hyperliquid gap reconciliation exceeded the per-generation page limit",
-        });
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-pub fn reconciliation_page_guard_for_test(pages: usize) -> Result<(), ProviderError> {
-    let mut observed = 0;
-    for _ in 0..pages {
-        advance_reconciliation_page(
-            &mut observed,
-            ErrorContext::operation(ErrorOperation::Reconciliation),
-        )?;
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-#[must_use]
-pub fn reconciliation_distinct_key_allowed_for_test(existing_len: usize, key_exists: bool) -> bool {
-    reconciliation_distinct_key_allowed(
-        existing_len,
-        key_exists,
-        MAX_GAP_RECONCILIATION_CANDLES + 1,
-    )
-}
-
-fn control_channel_closed(instrument: &Instrument, timeframe: Timeframe) -> ProviderError {
-    ProviderError::ChannelClosed {
-        context: ErrorContext::operation(ErrorOperation::Reconciliation)
-            .with_market(instrument, timeframe),
-    }
-}
-
-fn live_protocol_error(request: &LiveRequest, detail: &'static str) -> ProviderError {
-    ProviderError::Protocol {
-        context: ErrorContext::operation(ErrorOperation::WebSocket)
-            .with_market(&request.instrument, request.timeframe),
-        detail,
-    }
-}
-
-fn next_gap_cursor(_timeframe: Timeframe, value: i64) -> Result<i64, ProviderError> {
-    value
-        .checked_add(1)
-        .ok_or(ProviderError::Invariant("gap cursor overflow"))
-}
-
-#[cfg(feature = "test-transport")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LiveErrorDisposition {
-    Recoverable,
-    Terminal,
-}
-
-#[cfg(feature = "test-transport")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LiveInBandEventDisposition {
-    RecoverableInBand,
-    TerminalInBand,
-}
-
-#[cfg(feature = "test-transport")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LiveCompletionDisposition {
-    Running,
-    FinishedErr,
-}
-
-#[cfg(feature = "test-transport")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LiveErrorClassification {
-    pub disposition: LiveErrorDisposition,
-    pub event: LiveInBandEventDisposition,
-    pub completion: LiveCompletionDisposition,
-    pub retries: bool,
-}
-
-#[cfg(feature = "test-transport")]
-#[must_use]
-pub fn classify_live_error_for_test(error: &ProviderError) -> LiveErrorClassification {
-    if is_terminal_live_error(error) {
-        LiveErrorClassification {
-            disposition: LiveErrorDisposition::Terminal,
-            event: LiveInBandEventDisposition::TerminalInBand,
-            completion: LiveCompletionDisposition::FinishedErr,
-            retries: false,
+    async fn connect_live_socket(
+        &self,
+        instrument: &Instrument,
+        timeframe: Timeframe,
+    ) -> Result<RawWebSocket, ProviderError> {
+        #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+        {
+            connect_websocket(instrument, timeframe, self.live.supervisor.ws_config).await
         }
-    } else {
-        LiveErrorClassification {
-            disposition: LiveErrorDisposition::Recoverable,
-            event: LiveInBandEventDisposition::RecoverableInBand,
-            completion: LiveCompletionDisposition::Running,
-            retries: true,
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        {
+            let base = self
+                .ws_base_url
+                .as_deref()
+                .ok_or(ProviderError::Configuration(
+                    "test WebSocket base URL is required for live feeds",
+                ))?;
+            connect_test_websocket(base, instrument, timeframe, self.live.supervisor.ws_config)
+                .await
+        }
+        #[cfg(all(feature = "production-transport", feature = "test-transport"))]
+        {
+            let _ = (instrument, timeframe);
+            unreachable!("mutually exclusive transport features are rejected by src/lib.rs")
         }
     }
 }
 
-#[cfg(feature = "test-transport")]
-#[derive(Clone, Debug, PartialEq)]
-pub enum LiveInputClassification {
-    Continue,
-    Error {
-        error: ProviderError,
-        policy: LiveErrorClassification,
-    },
+pub(crate) struct HyperliquidLiveAdapter {
+    provider: HyperliquidProvider,
 }
 
-#[cfg(feature = "test-transport")]
-#[must_use]
-pub fn classify_live_input_for_test(
-    input: Result<DecodedFrame<HyperliquidDecoded>, ProviderError>,
-    instrument: &Instrument,
-    timeframe: Timeframe,
-) -> LiveInputClassification {
-    let error = match input {
-        Ok(
-            DecodedFrame::Provider(HyperliquidDecoded::Candle(_))
-            | DecodedFrame::Ignored
-            | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong),
-        ) => {
-            return LiveInputClassification::Continue;
-        }
-        Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => ProviderError::Protocol {
+impl HyperliquidLiveAdapter {
+    fn new(provider: HyperliquidProvider) -> Self {
+        Self { provider }
+    }
+
+    fn subscribe_ack_timeout(
+        &self,
+        instrument: &Instrument,
+        timeframe: Timeframe,
+    ) -> ProviderError {
+        ProviderError::Timeout {
             context: ErrorContext::operation(ErrorOperation::WebSocket)
                 .with_market(instrument, timeframe),
-            detail: "WebSocket peer requested reconnect",
-        },
-        Ok(DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted)) => {
-            ProviderError::Protocol {
-                context: ErrorContext::operation(ErrorOperation::WebSocket)
-                    .with_market(instrument, timeframe),
-                detail: "duplicate Hyperliquid subscribe acknowledgement",
-            }
+            kind: TimeoutKind::SubscribeAck,
         }
-        Ok(DecodedFrame::ProviderError(error)) | Err(error) => error,
-    };
-    LiveInputClassification::Error {
-        policy: classify_live_error_for_test(&error),
-        error,
     }
 }
 
-fn is_terminal_live_error(error: &ProviderError) -> bool {
-    matches!(
-        error,
-        ProviderError::Configuration(_)
-            | ProviderError::WebSocketConfiguration { .. }
-            | ProviderError::Invariant(_)
-            | ProviderError::ClientStatus { .. }
-            | ProviderError::InvalidSymbol { .. }
-            | ProviderError::ChannelClosed { .. }
-    )
+pub(crate) struct HyperliquidLiveSocket {
+    raw: RawWebSocket,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    stalled_write_probe_frames: usize,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    stalled_write_probe_payload_size: usize,
+}
+
+impl LiveSocket for HyperliquidLiveSocket {
+    async fn read(&mut self) -> Result<LiveSocketEvent, ProviderError> {
+        match self.raw.read().await? {
+            DecodedFrame::Provider(HyperliquidDecoded::Candle(candle)) => {
+                Ok(LiveSocketEvent::Candle(candle))
+            }
+            DecodedFrame::Ignored | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong) => {
+                Ok(LiveSocketEvent::Ignored)
+            }
+            DecodedFrame::ProviderError(error) => Ok(LiveSocketEvent::DecodedError(error)),
+            DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested => {
+                self.raw.finalize_peer_close().await?;
+                Ok(LiveSocketEvent::ReconnectRequested)
+            }
+            DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted) => {
+                Ok(LiveSocketEvent::ProtocolViolation(
+                    "duplicate Hyperliquid subscribe acknowledgement",
+                ))
+            }
+        }
+    }
+
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    async fn after_gap_sync_test_probe(&mut self) -> Result<(), ProviderError> {
+        if self.stalled_write_probe_frames == 0 {
+            return Ok(());
+        }
+        let payload = Message::Binary(vec![0; self.stalled_write_probe_payload_size].into());
+        for _ in 0..self.stalled_write_probe_frames {
+            self.raw.send(payload.clone()).await?;
+        }
+        Ok(())
+    }
+}
+
+impl LiveAdapter for HyperliquidLiveAdapter {
+    type Socket = HyperliquidLiveSocket;
+
+    fn validate_request(
+        &self,
+        _instrument: &Instrument,
+        timeframe: Timeframe,
+    ) -> Result<(), ProviderError> {
+        reject_unsupported_timeframe(timeframe)
+    }
+
+    async fn connect_ready_socket(
+        &self,
+        instrument: Instrument,
+        timeframe: Timeframe,
+    ) -> Result<Self::Socket, ProviderError> {
+        let mut raw = self
+            .provider
+            .connect_live_socket(&instrument, timeframe)
+            .await?;
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        if self.provider.live.supervisor.stalled_write_probe_frames != 0 {
+            let payload_size = self
+                .provider
+                .live
+                .supervisor
+                .ws_config
+                .write_buffer_size
+                .min(self.provider.live.supervisor.ws_config.max_frame_size)
+                .min(self.provider.live.supervisor.ws_config.max_message_size)
+                .max(1);
+            let payload = Message::Binary(vec![0; payload_size].into());
+            for _ in 0..self.provider.live.supervisor.stalled_write_probe_frames {
+                raw.send(payload.clone()).await?;
+            }
+        }
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        {
+            raw.subscribe_flush_test_hook = self.provider.live.subscribe_flush_test_hook.clone();
+        }
+        raw.send(Message::Text(
+            subscribe_message(&instrument, timeframe).into(),
+        ))
+        .await?;
+        let ack_deadline = checked_deadline(
+            self.provider.clock.now(),
+            self.provider.live.subscribe_ack_timeout,
+        )
+        .map_err(|_| ProviderError::Invariant("subscribe-ack deadline overflow"))?;
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        {
+            raw.readiness_inactivity_test_hook =
+                self.provider.live.readiness_inactivity_test_hook.clone();
+            raw.readiness_decoded_ack_test_hook =
+                self.provider.live.readiness_decoded_ack_test_hook.clone();
+            raw.readiness_drain_budget_test_hook =
+                self.provider.live.readiness_drain_budget_test_hook.clone();
+            raw.close_flush_test_hook = self.provider.live.close_flush_test_hook.clone();
+            raw.force_stalled_write_after_readiness_frame =
+                self.provider.live.force_stalled_write_after_readiness_frame;
+        }
+        loop {
+            let inactivity_deadline = raw.inactivity_deadline();
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            let readiness_inactivity_test_hook = raw.readiness_inactivity_test_hook.clone();
+            tokio::select! {
+                biased;
+                input = raw.read_readiness() => match input {
+                    ReadinessInput::Error(error) => return Err(error),
+                    ReadinessInput::Frame(DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted)) => break,
+                    ReadinessInput::Frame(DecodedFrame::Ignored | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong)) => {
+                        if self.provider.clock.now() >= ack_deadline {
+                            return Err(self.subscribe_ack_timeout(&instrument, timeframe));
+                        }
+                    }
+                    ReadinessInput::Frame(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => {
+                        raw.finalize_peer_close().await?;
+                        return Err(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&instrument, timeframe), detail: "WebSocket peer requested reconnect" });
+                    }
+                    ReadinessInput::Frame(DecodedFrame::ProviderError(error)) => return Err(error),
+                    ReadinessInput::Frame(DecodedFrame::Provider(HyperliquidDecoded::Candle(_))) => return Err(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&instrument, timeframe), detail: "Hyperliquid candle arrived before subscribe acknowledgement" }),
+                },
+                () = self.provider.clock.sleep_until(ack_deadline) => return Err(self.subscribe_ack_timeout(&instrument, timeframe)),
+                () = async move {
+                    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+                    if let Some(hook) = readiness_inactivity_test_hook { hook.notified().await; return; }
+                    tokio::time::sleep_until(inactivity_deadline).await;
+                } => return Err(ProviderError::Timeout { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&instrument, timeframe), kind: TimeoutKind::WebSocketInactivity }),
+            }
+        }
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        {
+            raw.heartbeat_test_hook = self.provider.live.heartbeat_test_hook.clone();
+        }
+        #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+        raw.start_application_heartbeat(APPLICATION_HEARTBEAT_INTERVAL);
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        raw.start_application_heartbeat(self.provider.live.application_heartbeat_interval_for_test);
+        Ok(HyperliquidLiveSocket {
+            raw,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            stalled_write_probe_frames: self.provider.live.supervisor.stalled_write_probe_frames,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            stalled_write_probe_payload_size: self
+                .provider
+                .live
+                .supervisor
+                .ws_config
+                .write_buffer_size
+                .min(self.provider.live.supervisor.ws_config.max_frame_size)
+                .min(self.provider.live.supervisor.ws_config.max_message_size)
+                .max(1),
+        })
+    }
+
+    async fn history(
+        &self,
+        instrument: Instrument,
+        timeframe: Timeframe,
+        request: HistoryRequest,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<Candle>, ProviderError> {
+        self.provider
+            .history(&instrument, timeframe, request, cancellation)
+            .await
+    }
+
+    fn rate_gate(&self) -> LiveRateGate {
+        LiveRateGate {
+            snapshot: self.provider.rate_gate(),
+            process_block: ProcessBlockPolicy::Forbidden(
+                "Hyperliquid rate gate cannot be process-blocked",
+            ),
+        }
+    }
+
+    fn live_config(&self) -> LiveConfig<'_> {
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        let max_successors = self.provider.live.max_gap_reconciliation_candles_for_test;
+        #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+        let max_successors = MAX_GAP_RECONCILIATION_CANDLES;
+        LiveConfig {
+            supervisor: &self.provider.live.supervisor,
+            reconciliation: ReconciliationPolicy::Bounded(ReconciliationLimits {
+                max_successors,
+                max_pages: MAX_GAP_RECONCILIATION_PAGES,
+                span_exceeded: "Hyperliquid gap reconciliation target exceeds the per-generation span limit",
+                page_exceeded: "Hyperliquid gap reconciliation exceeded the page limit",
+                distinct_exceeded: "Hyperliquid gap reconciliation exceeded the distinct buffered-candle limit",
+            }),
+        }
+    }
+
+    fn connection_rotation(&self) -> ConnectionRotation {
+        ConnectionRotation::Never
+    }
 }
 
 impl MarketDataProvider for HyperliquidProvider {
     fn id(&self) -> ProviderId {
         ProviderId::new("hyperliquid").expect("static provider id")
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            markets: &[Market::Spot, Market::Perpetual],
+            timeframes: &[
+                Timeframe::Minute1,
+                Timeframe::Minute3,
+                Timeframe::Minute5,
+                Timeframe::Minute15,
+                Timeframe::Minute30,
+                Timeframe::Hour1,
+                Timeframe::Hour2,
+                Timeframe::Hour4,
+                Timeframe::Hour8,
+                Timeframe::Hour12,
+                Timeframe::Day1,
+                Timeframe::Day3,
+                Timeframe::Week1,
+                Timeframe::Month1,
+            ],
+            history_page_limit: {
+                #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+                {
+                    self.live.advertised_history_page_limit
+                }
+                #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+                {
+                    1000
+                }
+            },
+        }
     }
     fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
         HyperliquidProvider::canonicalize(self, spec)
@@ -2221,67 +1225,15 @@ impl MarketDataProvider for HyperliquidProvider {
         ))
     }
     fn open_live<'a>(&'a self, request: LiveRequest) -> ProviderFuture<'a, LiveFeed> {
-        Box::pin(async move {
-            reject_unsupported_timeframe(request.timeframe)?;
-            self.live.validate()?;
-            let physical_capacity = self
-                .live
-                .market_event_capacity
-                .checked_add(2)
-                .ok_or(ProviderError::Invariant("market event capacity overflow"))?;
-            let (sender, receiver) = mpsc::channel(physical_capacity);
-            let sender = EventEmitter::new(
-                sender,
-                self.live.market_event_capacity,
-                self.live.control_capacity,
-            );
-            let invalidated_through = Arc::clone(&sender.invalidated_through);
-            let emergency_barrier = Arc::clone(&sender.emergency_barrier);
-            let cancellation = request.cancellation.clone();
-            let stream_cancellation = cancellation.clone();
-            let producer = self.clone();
-            let events = stream::unfold(receiver, move |mut receiver| {
-                let invalidated_through = Arc::clone(&invalidated_through);
-                let emergency_barrier = Arc::clone(&emergency_barrier);
-                let cancellation = stream_cancellation.clone();
-                async move {
-                    loop {
-                        let cancelled = cancellation.is_cancelled();
-                        let envelope = if cancelled {
-                            receiver.recv().await?
-                        } else {
-                            tokio::select! {
-                                biased;
-                                () = cancellation.cancelled() => continue,
-                                envelope = receiver.recv() => envelope?,
-                            }
-                        };
-                        if cancellation.is_cancelled() && !envelope.is_stopped() {
-                            drop(envelope);
-                            continue;
-                        }
-                        let invalidated = envelope.purge_on_invalidate
-                            && envelope.generation.is_some_and(|generation| {
-                                generation.0 <= invalidated_through.load(Ordering::Acquire)
-                            });
-                        let suppressed = envelope
-                            .emergency_slot
-                            .is_some_and(|slot| emergency_barrier.is_suppressed(slot));
-                        if invalidated || suppressed {
-                            drop(envelope);
-                            continue;
-                        }
-                        return Some((envelope.into_item(), receiver));
-                    }
-                }
-            });
-            Ok(LiveFeed::spawn(
-                Box::pin(events),
-                cancellation,
-                Arc::clone(&self.clock),
-                async move { producer.supervise_live(request, sender).await },
-            ))
-        })
+        let adapter = HyperliquidLiveAdapter::new(self.clone());
+        let clock = Arc::clone(&self.clock);
+        let capabilities = MarketDataProvider::capabilities(self);
+        Box::pin(crate::provider::runtime::live::open_live(
+            adapter,
+            clock,
+            capabilities,
+            request,
+        ))
     }
     fn rate_gate(&self) -> RateGateSnapshot {
         HyperliquidProvider::rate_gate(self)
@@ -2528,77 +1480,6 @@ fn validate_candle_time_window(
     Ok(())
 }
 
-fn gap_target_within_generation_span(
-    timeframe: Timeframe,
-    start: i64,
-    target: i64,
-    maximum_candles: usize,
-) -> bool {
-    if target < start {
-        return true;
-    }
-    if timeframe == Timeframe::Month1 {
-        let Some(start_month) = calendar_month_index(start) else {
-            return false;
-        };
-        let Some(target_month) = calendar_month_index(target) else {
-            return false;
-        };
-        return target_month
-            .checked_sub(start_month)
-            .and_then(|distance| usize::try_from(distance).ok())
-            .is_some_and(|distance| distance <= maximum_candles);
-    }
-    let Some(interval) = fixed_timeframe_milliseconds(timeframe) else {
-        return false;
-    };
-    if start.rem_euclid(interval) != 0 || target.rem_euclid(interval) != 0 {
-        return false;
-    }
-    target
-        .checked_sub(start)
-        .and_then(|distance| {
-            i64::try_from(maximum_candles)
-                .ok()
-                .and_then(|maximum| interval.checked_mul(maximum))
-                .map(|maximum| distance <= maximum)
-        })
-        .unwrap_or(false)
-}
-
-fn fixed_timeframe_milliseconds(timeframe: Timeframe) -> Option<i64> {
-    match timeframe {
-        Timeframe::Second1 => Some(1_000),
-        Timeframe::Minute1 => Some(60_000),
-        Timeframe::Minute3 => Some(180_000),
-        Timeframe::Minute5 => Some(300_000),
-        Timeframe::Minute15 => Some(900_000),
-        Timeframe::Minute30 => Some(1_800_000),
-        Timeframe::Hour1 => Some(3_600_000),
-        Timeframe::Hour2 => Some(7_200_000),
-        Timeframe::Hour4 => Some(14_400_000),
-        Timeframe::Hour6 => Some(21_600_000),
-        Timeframe::Hour8 => Some(28_800_000),
-        Timeframe::Hour12 => Some(43_200_000),
-        Timeframe::Day1 => Some(86_400_000),
-        Timeframe::Day3 => Some(259_200_000),
-        Timeframe::Week1 => Some(604_800_000),
-        Timeframe::Month1 => None,
-    }
-}
-
-fn calendar_month_index(open_time: i64) -> Option<i64> {
-    let timestamp =
-        OffsetDateTime::from_unix_timestamp_nanos(i128::from(open_time) * 1_000_000).ok()?;
-    if timestamp.time() != time::Time::MIDNIGHT || timestamp.day() != 1 {
-        return None;
-    }
-    let month = i64::from(u8::from(timestamp.month()));
-    i64::from(timestamp.year())
-        .checked_mul(12)?
-        .checked_add(month - 1)
-}
-
 fn timeframe_successor_open(timeframe: Timeframe, open_time: i64) -> Option<i64> {
     let fixed_milliseconds = match timeframe {
         Timeframe::Second1 => Some(1_000),
@@ -2641,15 +1522,6 @@ fn timeframe_successor_open(timeframe: Timeframe, open_time: i64) -> Option<i64>
         .unix_timestamp_nanos()
         / 1_000_000;
     i64::try_from(successor).ok()
-}
-#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-#[must_use]
-pub fn gap_target_within_generation_span_for_test(
-    timeframe: Timeframe,
-    start: i64,
-    target: i64,
-) -> bool {
-    gap_target_within_generation_span(timeframe, start, target, MAX_GAP_RECONCILIATION_CANDLES)
 }
 
 fn candle_market_matches(
@@ -2899,4 +1771,37 @@ fn remap_instrument(spec: &InstrumentSpec) -> Result<Instrument, ProviderError> 
         wire,
     )
     .map_err(|_| ProviderError::Configuration("instrument is not valid for Hyperliquid"))
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+#[must_use]
+pub fn gap_target_within_generation_span_for_test(
+    timeframe: Timeframe,
+    start: i64,
+    target: i64,
+) -> bool {
+    crate::provider::runtime::live::gap_target_within_generation_span_for_test(
+        timeframe,
+        start,
+        target,
+        MAX_GAP_RECONCILIATION_CANDLES,
+    )
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+pub fn reconciliation_page_guard_for_test(pages: usize) -> Result<(), ProviderError> {
+    crate::provider::runtime::live::reconciliation_page_guard_for_test(
+        pages,
+        MAX_GAP_RECONCILIATION_PAGES,
+    )
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+#[must_use]
+pub fn reconciliation_distinct_key_allowed_for_test(existing_len: usize, key_exists: bool) -> bool {
+    crate::provider::runtime::live::reconciliation_distinct_key_allowed_for_test(
+        existing_len,
+        key_exists,
+        MAX_GAP_RECONCILIATION_CANDLES,
+    )
 }

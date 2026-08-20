@@ -12,17 +12,15 @@ use fccli::{
         ConnectionStatus, GapGeneration, HistoryRequest, Instrument, InstrumentSpec, Market,
         MarketEvent, MonoInstant, ProviderId, RateGateState, ReplayRevision, Timeframe,
     },
-    provider::binance::{
-        BinanceProvider, BinanceTestConfig, CONTROL_CAPACITY, EMERGENCY_CONTROL_CAPACITY,
-        FIRST_KLINE_HANDSHAKE_TIMEOUT, KEYED_CANDLE_CAPACITY, LiveCompletionDisposition,
-        LiveErrorDisposition, LiveInBandEventDisposition, LiveInputClassification,
-        LiveSupervisorConfig, MARKET_EVENT_CHANNEL_CAPACITY, MAX_CONNECTION_AGE,
-        RECONCILE_ACK_TIMEOUT, classify_live_error_for_test, classify_live_input_for_test,
-    },
-    provider::test_transport::{BinanceDecoded, DecodedFrame},
+    provider::binance::{BinanceProvider, BinanceTestConfig, MAX_CONNECTION_AGE},
     provider::{
-        CancellationToken, LiveRequest, MarketDataProvider, ProducerCompletion, ProviderRegistry,
-        ReconcileAck, ReconcileAckPublishError, accepted_watermark_channel, reconcile_ack_channel,
+        CONTROL_CAPACITY, CancellationToken, EMERGENCY_CONTROL_CAPACITY,
+        FIRST_KLINE_HANDSHAKE_TIMEOUT, KEYED_CANDLE_CAPACITY, LiveCompletionDisposition,
+        LiveErrorDisposition, LiveInBandEventDisposition, LiveInputClassification, LiveRequest,
+        LiveSocketEvent, LiveSupervisorConfig, MARKET_EVENT_CHANNEL_CAPACITY, MarketDataProvider,
+        ProducerCompletion, ProviderRegistry, RECONCILE_ACK_TIMEOUT, ReconcileAck,
+        ReconcileAckPublishError, accepted_watermark_channel, classify_live_error_for_test,
+        classify_live_input_for_test, reconcile_ack_channel,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -188,8 +186,19 @@ fn provider(
     clock: Arc<dyn Clock>,
     live: LiveSupervisorConfig,
 ) -> Arc<BinanceProvider> {
+    provider_with_max_age(rest_uri, websocket_uri, clock, live, MAX_CONNECTION_AGE)
+}
+
+fn provider_with_max_age(
+    rest_uri: &str,
+    websocket_uri: &str,
+    clock: Arc<dyn Clock>,
+    live: LiveSupervisorConfig,
+    max_connection_age: Duration,
+) -> Arc<BinanceProvider> {
     let mut config = BinanceTestConfig::loopback(rest_uri).with_websocket_base(websocket_uri);
     config.live = live;
+    config.max_connection_age = max_connection_age;
     Arc::new(BinanceProvider::new_test_live(config, clock).expect("test provider"))
 }
 
@@ -317,7 +326,6 @@ fn production_constants_capacity_boundaries_and_registry_are_exact() {
     );
     assert_eq!(defaults.first_kline_timeout, FIRST_KLINE_HANDSHAKE_TIMEOUT);
     assert_eq!(defaults.reconcile_ack_timeout, RECONCILE_ACK_TIMEOUT);
-    assert_eq!(defaults.max_connection_age, MAX_CONNECTION_AGE);
     assert_eq!(EMERGENCY_CONTROL_CAPACITY, 2);
     assert!(defaults.validate().is_ok());
 
@@ -385,10 +393,11 @@ fn production_constants_capacity_boundaries_and_registry_are_exact() {
             Err(ProviderError::Configuration(_))
         ));
     }
-    let mut zero_age = defaults.clone();
+    let mut zero_age =
+        BinanceTestConfig::loopback("http://127.0.0.1:1").with_websocket_base("ws://127.0.0.1:1");
     zero_age.max_connection_age = Duration::ZERO;
     assert!(matches!(
-        zero_age.validate(),
+        BinanceProvider::new_test_live(zero_age, Arc::new(ManualClock::new(MonoInstant::ZERO))),
         Err(ProviderError::Configuration(_))
     ));
 
@@ -407,11 +416,36 @@ fn production_constants_capacity_boundaries_and_registry_are_exact() {
                 .as_str(),
             "binance"
         );
+        let capabilities = registry
+            .get(ProviderId::new("binance").expect("id"))
+            .expect("registered")
+            .capabilities();
+        assert_eq!(capabilities.markets, &[Market::Spot, Market::Perpetual]);
+        assert_eq!(capabilities.timeframes, &Timeframe::ALL);
+        assert_eq!(capabilities.history_page_limit, 1000);
         assert!(matches!(
             registry.get(ProviderId::new("other").expect("id")),
             Err(ProviderError::Configuration(_))
         ));
     });
+}
+
+#[tokio::test]
+async fn zero_advertised_history_limit_is_rejected_before_live_io() {
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
+    let mut config =
+        BinanceTestConfig::loopback("http://127.0.0.1:1").with_websocket_base("ws://127.0.0.1:1");
+    config.advertised_history_page_limit = 0;
+    let provider = BinanceProvider::new_test_live(config, clock).expect("provider");
+    let (request, _watermark, _ack) = request(None);
+    let error = match provider.open_live(request).await {
+        Ok(_) => panic!("zero advertised history limit must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        ProviderError::Configuration("provider history page limit must be non-zero")
+    );
 }
 
 #[tokio::test]
@@ -2028,11 +2062,14 @@ async fn connection_max_age_is_not_starved_by_continuously_ready_candle_frames()
         let _ = websocket.next().await;
     });
     let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
-    let live = LiveSupervisorConfig {
-        max_connection_age: Duration::from_secs(5),
-        ..LiveSupervisorConfig::default()
-    };
-    let provider = provider(&rest.uri(), &ws_uri, manual.clone(), live);
+    let live = LiveSupervisorConfig::default();
+    let provider = provider_with_max_age(
+        &rest.uri(),
+        &ws_uri,
+        manual.clone(),
+        live,
+        Duration::from_secs(5),
+    );
     let (request, _watermark_tx, ack_tx) = request(Some(OPEN_TIME));
     let mut feed = provider.open_live(request).await.expect("feed");
     assert_status(
@@ -2893,11 +2930,8 @@ async fn preconnected_max_age_and_backoff_deadlines_fire_at_exact_equality() {
     });
     let manual = Arc::new(ManualClock::new(MonoInstant::from_nanos(0)));
     let clock: Arc<dyn Clock> = manual.clone();
-    let live = LiveSupervisorConfig {
-        max_connection_age: Duration::from_secs(5),
-        ..LiveSupervisorConfig::default()
-    };
-    let provider = provider(&rest.uri(), &ws_uri, clock, live);
+    let live = LiveSupervisorConfig::default();
+    let provider = provider_with_max_age(&rest.uri(), &ws_uri, clock, live, Duration::from_secs(5));
     let (request, _watermark_tx, _ack_tx) = request(Some(OPEN_TIME));
     let mut feed = provider.open_live(request).await.expect("feed");
     assert_status(
@@ -3160,8 +3194,8 @@ fn supervisor_classifies_all_remaining_decoded_outcomes_and_errors() {
     }
 
     for (name, input) in [
-        ("close", Ok(DecodedFrame::Close(None))),
-        ("serverShutdown", Ok(DecodedFrame::ReconnectRequested)),
+        ("close", Ok(LiveSocketEvent::ReconnectRequested)),
+        ("serverShutdown", Ok(LiveSocketEvent::ReconnectRequested)),
     ] {
         let LiveInputClassification::Error { error, policy } =
             classify_live_input_for_test(input, &market, Timeframe::Minute1)
