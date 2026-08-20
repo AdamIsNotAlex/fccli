@@ -119,21 +119,23 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 
 ### R04 — Establish shared WebSocket/EventEmitter contract tests
 
-**Status:** [ ]  
+**Status:** [x]  
 **Depends on:** R03  
 **Owned files:** `tests/provider_runtime_websocket.rs` (new), `tests/binance_ws_codec.rs`, `tests/hyperliquid_ws_codec.rs`, `tests/binance_live.rs`, `tests/hyperliquid_live.rs`, `src/provider/runtime/websocket.rs`, `src/provider/runtime/emitter.rs`  
 **Parallel safety:** Sequential with R03/R05 because runtime files and provider WS/live suites overlap.  
 **Commit boundary:** `test(provider): centralize websocket runtime contracts`
 
-- [ ] Move provider-neutral socket-pump/config/control-frame cases out of `tests/binance_ws_codec.rs`: stalled write, inactivity, transport Ping/Pong, Close ordering, automatic flush, decode queue, reconnect request, cancellation priority, and loopback/config rejection. Move any provider-neutral equivalents discovered in `tests/hyperliquid_ws_codec.rs`; do not duplicate them.
-- [ ] Move provider-neutral emitter cases from live suites: keyed replacement, control saturation, emergency pair ordering/capacity, terminal-event delivery, and producer completion.
-- [ ] Retain only protocol-specific WS cases in codec/live suites: Binance hosts/paths/stream URL, payload schema and `x`, `serverShutdown`; Hyperliquid subscribe ack, JSON ping/pong, implicit finality, wire coin and symbol/interval validation. Provider-specific readiness integration stays in live suites.
-- [ ] Ensure each migrated test exercises the shared runtime once rather than once per provider.
-- [ ] Verify: `cargo test --locked --test provider_runtime_websocket --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test binance_ws_codec --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test hyperliquid_ws_codec --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport`.
+- [x] Move provider-neutral socket-pump/config/control-frame cases out of `tests/binance_ws_codec.rs`: stalled write, inactivity, transport Ping/Pong, Close ordering, automatic flush, decode queue, reconnect request, cancellation priority, and loopback/config rejection. Move any provider-neutral equivalents discovered in `tests/hyperliquid_ws_codec.rs`; do not duplicate them.
+- [x] Move provider-neutral emitter cases from live suites: keyed replacement, control saturation, emergency pair ordering/capacity, terminal-event delivery, and producer completion.
+- [x] Retain only protocol-specific WS cases in codec/live suites: Binance hosts/paths/stream URL, payload schema and `x`, `serverShutdown`; Hyperliquid subscribe ack, JSON ping/pong, implicit finality, wire coin and symbol/interval validation. Provider-specific readiness integration stays in live suites.
+- [x] Ensure each migrated test exercises the shared runtime once rather than once per provider.
+**Implementation and verification notes:** `tests/provider_runtime_websocket.rs` is the single owner of shared `WsConfig`, loopback preflight, socket-pump, decoded-queue, stalled-write, inactivity, transport Ping/Pong, automatic control flush, Close ordering, deferred terminal error, reconnect-outcome, and emitter contracts. Its emitter cases cover same-key replacement without consuming distinct-key capacity, control saturation, emergency-pair dequeue/reuse ordering and capacity, terminal saturation delivery, cancellation suppression, and receiver-drop producer completion. Inventory review found no duplicate shared socket/emitter case in either provider suite. Binance's four codec cases retain only stream URL/path, kline payload/finality, provider error payloads, and `serverShutdown`; Hyperliquid's eleven codec cases retain subscribe acknowledgement, application JSON pong, implicit finality/temporal validation, wire coin, symbol, interval, and calendar behavior. Provider-specific readiness and heartbeat integration remains intentionally in the live suites. Formatted exact gates passed: `provider_runtime_websocket` 24/24, `binance_ws_codec` 4/4, `hyperliquid_ws_codec` 11/11, `binance_live` 39/39, and `hyperliquid_live` 26/26.
+
+- [x] Verify: `cargo test --locked --test provider_runtime_websocket --no-default-features --features test-transport` (24 passed).
+- [x] Verify: `cargo test --locked --test binance_ws_codec --no-default-features --features test-transport` (4 passed).
+- [x] Verify: `cargo test --locked --test hyperliquid_ws_codec --no-default-features --features test-transport` (11 passed).
+- [x] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport` (39 passed).
+- [x] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport` (26 passed).
 
 ### R05 — Extract the shared live engine
 
@@ -310,8 +312,8 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 | R01 | [x] | — | no | Complete; formatted codec gate 11/11 and live gate 25/25, including `Month1` exact-limit, overflow, and unrepresentable-endpoint coverage |
 | R02 | [x] | R01 | no | Complete; formatted exact gates passed: `hyperliquid_rest` 17/17, `binance_rest` 23/23, and `binance_live` 42/42; temporal/window/order validation and exact rate-gate deadlines covered |
 | R03 | [x] | R02 | no | Complete; warning-free `cargo check` and formatted exact gates passed: `binance_ws_codec` 23/23, `hyperliquid_ws_codec` 11/11, `binance_live` 42/42, and `hyperliquid_live` 26/26; cancellation-aware close finalization and production-private codec outcomes verified |
-| R04 | [ ] | R03 | yes | Next dependency-ready chunk |
-| R05 | [ ] | R04 | no | — |
+| R04 | [x] | R03 | no | Complete; every shared socket/emitter contract has one owner and provider suites retain protocol/readiness cases only; formatted exact gates passed: shared runtime 24/24, Binance codec 4/4, Hyperliquid codec 11/11, Binance live 39/39, Hyperliquid live 26/26 |
+| R05 | [ ] | R04 | yes | — |
 | R06 | [ ] | R05 | no | — |
 | R07 | [ ] | R06 | no | — |
 | R08 | [ ] | R07 | no | — |
@@ -319,4 +321,4 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 | R10 | [ ] | R09 | no | — |
 | R11 | [ ] | R10 | no | — |
 
-**Next dependency-ready unchecked chunk:** R04 — establish shared WebSocket/EventEmitter contract tests.
+**Next dependency-ready unchecked chunk:** R05 — extract the shared live engine.

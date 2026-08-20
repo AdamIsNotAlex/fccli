@@ -10,6 +10,9 @@ use crate::{
     model::{ConnectionStatus, GapGeneration, MarketEvent},
 };
 
+#[cfg(feature = "test-transport")]
+use std::collections::BTreeMap;
+
 pub(crate) type StatusKey = (Option<GapGeneration>, ConnectionStatus);
 
 pub(crate) struct EventEnvelope {
@@ -134,6 +137,56 @@ pub(crate) struct EventEmitter {
     pending_controls: Arc<Mutex<Vec<StatusKey>>>,
     pub(crate) emergency_barrier: Arc<EmergencyBarrier>,
     shutdown: Arc<AtomicBool>,
+}
+#[cfg(feature = "test-transport")]
+pub struct EventEmitterTestFacade {
+    emitter: EventEmitter,
+    receiver: mpsc::Receiver<EventEnvelope>,
+    keyed_capacity: usize,
+    pending: BTreeMap<i64, crate::model::Candle>,
+    generation: GapGeneration,
+}
+
+#[cfg(feature = "test-transport")]
+impl EventEmitterTestFacade {
+    pub fn new(keyed_capacity: usize) -> Self {
+        let physical_capacity = keyed_capacity
+            .checked_add(2)
+            .expect("test emitter capacity overflow");
+        let (sender, receiver) = mpsc::channel(physical_capacity);
+        Self {
+            emitter: EventEmitter::new(sender, keyed_capacity, 1),
+            receiver,
+            keyed_capacity,
+            pending: BTreeMap::new(),
+            generation: GapGeneration(1),
+        }
+    }
+
+    pub fn queue_candle(&mut self, candle: crate::model::Candle) -> Result<(), ProviderError> {
+        let key = candle.open_time();
+        if !self.pending.contains_key(&key) && self.pending.len() == self.keyed_capacity {
+            return Err(ProviderError::QueueSaturated);
+        }
+        self.pending.insert(key, candle);
+        Ok(())
+    }
+
+    pub async fn flush(&mut self) -> Result<(), ProviderError> {
+        while let Some((_, candle)) = self.pending.pop_first() {
+            self.emitter
+                .send_regular(MarketEvent::Candle {
+                    generation: self.generation,
+                    candle,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn recv(&mut self) -> Option<Result<MarketEvent, ProviderError>> {
+        self.receiver.recv().await.map(EventEnvelope::into_item)
+    }
 }
 
 impl EventEmitter {

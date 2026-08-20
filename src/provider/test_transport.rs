@@ -1,5 +1,6 @@
 //! Integration-test-only transport harness.
 
+pub use super::runtime::emitter::EventEmitterTestFacade;
 pub use super::runtime::websocket::{
     CloseFlushTestHook, DecodedFrame, HeartbeatTestHook, ReadinessDecodedAckTestHook,
     ReadinessDrainBudgetTestHook, SubscribeFlushTestHook, WS_FRAME_SIZE, WS_MAX_WRITE_BUFFER_SIZE,
