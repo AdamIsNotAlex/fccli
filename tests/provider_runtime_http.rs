@@ -63,6 +63,29 @@ fn chunked_server(body: Vec<u8>) -> (String, thread::JoinHandle<()>) {
     });
     (format!("http://{address}"), join)
 }
+fn truncated_body_server(
+    declared_length: usize,
+    body: Vec<u8>,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncated body server");
+    let address = listener
+        .local_addr()
+        .expect("truncated body server address");
+    let join = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write response headers");
+        stream
+            .write_all(&body)
+            .expect("write partial response body");
+    });
+    (format!("http://{address}"), join)
+}
 
 fn observable_server(
     response: Option<&'static str>,
@@ -233,12 +256,13 @@ async fn request_cancellation_and_timeout_use_shared_transport_mapping() {
         .await
         .expect_err("cancelled");
     assert!(matches!(
-        cancelled,
+        &cancelled,
         ProviderError::Transport {
             cause: SanitizedCause::Cancelled,
             ..
         }
     ));
+    assert!(!cancelled.is_recoverable_for_history());
 
     let short = HttpRuntime::new(clock(), Duration::from_millis(5), 1024).expect("runtime");
     let timeout = short
@@ -250,12 +274,56 @@ async fn request_cancellation_and_timeout_use_shared_transport_mapping() {
         .await
         .expect_err("timeout");
     assert!(matches!(
-        timeout,
+        &timeout,
         ProviderError::Timeout {
             kind: TimeoutKind::Request,
             ..
         }
     ));
+    assert!(timeout.is_recoverable_for_history());
+}
+#[tokio::test]
+async fn request_and_body_io_failures_are_recoverable_connection_errors() {
+    let runtime = runtime();
+    let request_error = runtime
+        .send(
+            runtime.client().get("http://127.0.0.1:0"),
+            &CancellationToken::new(),
+            &context(),
+        )
+        .await
+        .expect_err("connection must fail before a request is sent");
+    assert!(matches!(
+        &request_error,
+        ProviderError::Transport {
+            cause: SanitizedCause::Connection,
+            ..
+        }
+    ));
+    assert!(request_error.is_recoverable_for_history());
+
+    let (url, join) = truncated_body_server(16, vec![b'x'; 1]);
+    let response = runtime
+        .send(
+            runtime.client().get(url),
+            &CancellationToken::new(),
+            &context(),
+        )
+        .await
+        .expect("response headers");
+    let body_error = runtime
+        .read_capped(response, &CancellationToken::new(), &context())
+        .await
+        .expect_err("truncated body must fail");
+    assert!(matches!(
+        &body_error,
+        ProviderError::Transport {
+            cause: SanitizedCause::Connection,
+            ..
+        }
+    ));
+    assert!(body_error.is_recoverable_for_history());
+    join.join().expect("truncated body server");
 }
 
 #[tokio::test]
@@ -307,50 +375,73 @@ async fn body_read_cancellation_uses_shared_transport_mapping() {
 }
 
 #[tokio::test]
-async fn capped_body_rejects_declared_and_streamed_over_budget_payloads() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 17]))
-        .mount(&server)
-        .await;
+async fn capped_body_accepts_exact_limit_and_rejects_one_byte_over() {
     let runtime = runtime_with(clock(), 16);
-    let response = runtime
-        .send(
-            runtime.client().get(server.uri()),
-            &CancellationToken::new(),
-            &context(),
-        )
-        .await
-        .expect("declared response");
-    assert!(matches!(
-        runtime
-            .read_capped(response, &CancellationToken::new(), &context())
-            .await,
-        Err(ProviderError::Payload {
-            source: PayloadError::OverBudget { limit_bytes: 16 },
-            ..
-        })
-    ));
 
-    let (url, join) = chunked_server(vec![b'x'; 17]);
-    let response = runtime
-        .send(
-            runtime.client().get(url),
-            &CancellationToken::new(),
-            &context(),
-        )
-        .await
-        .expect("streamed response");
-    assert!(matches!(
-        runtime
+    for (size, accepted) in [(16, true), (17, false)] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; size]))
+            .mount(&server)
+            .await;
+        let response = runtime
+            .send(
+                runtime.client().get(server.uri()),
+                &CancellationToken::new(),
+                &context(),
+            )
+            .await
+            .expect("declared response");
+        assert_eq!(response.content_length(), Some(size as u64));
+        let result = runtime
             .read_capped(response, &CancellationToken::new(), &context())
-            .await,
-        Err(ProviderError::Payload {
-            source: PayloadError::OverBudget { limit_bytes: 16 },
-            ..
-        })
-    ));
-    join.join().expect("chunked server");
+            .await;
+        if accepted {
+            assert_eq!(
+                result.expect("exact declared limit must be accepted").len(),
+                16
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(ProviderError::Payload {
+                    source: PayloadError::OverBudget { limit_bytes: 16 },
+                    ..
+                })
+            ));
+        }
+    }
+
+    for (size, accepted) in [(16, true), (17, false)] {
+        let (url, join) = chunked_server(vec![b'x'; size]);
+        let response = runtime
+            .send(
+                runtime.client().get(url),
+                &CancellationToken::new(),
+                &context(),
+            )
+            .await
+            .expect("streamed response");
+        assert_eq!(response.content_length(), None);
+        let result = runtime
+            .read_capped(response, &CancellationToken::new(), &context())
+            .await;
+        if accepted {
+            assert_eq!(
+                result.expect("exact streamed limit must be accepted").len(),
+                16
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(ProviderError::Payload {
+                    source: PayloadError::OverBudget { limit_bytes: 16 },
+                    ..
+                })
+            ));
+        }
+        join.join().expect("chunked server");
+    }
 }
 
 #[tokio::test]
@@ -392,6 +483,7 @@ async fn common_response_handling_uses_provider_callback_only_for_client_payload
             )
             .await
             .expect_err(expected);
+        assert_eq!(error.is_recoverable_for_history(), expected == "server");
         match expected {
             "redirect" => assert!(matches!(
                 error,
