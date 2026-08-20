@@ -13,7 +13,10 @@ use std::{
 
 use futures_util::{FutureExt, Sink, Stream, stream};
 use reqwest::{Client, StatusCode, Url, header::RETRY_AFTER};
-use serde::Deserialize;
+use serde::{
+    Deserialize,
+    de::{IgnoredAny, SeqAccess, Visitor},
+};
 use serde_json::Value;
 use time::{Date, Month, OffsetDateTime};
 use tokio::{
@@ -40,7 +43,7 @@ use crate::{
     model::{
         Candle, ConnectionStatus, FinalityAuthority, GapGeneration, HistoryRequest,
         HistoryRequestKind, Instrument, InstrumentSpec, Market, MarketEvent, MonoInstant,
-        ProcessBlocker, ProviderId, RateGateState, ReplayRevision, Timeframe, is_spot_index_token,
+        ProviderId, RateGateState, ReplayRevision, Timeframe, is_spot_index_token,
     },
     provider::{
         LiveFeed, LiveRequest, MarketDataProvider, ProviderFuture, RateGateSender,
@@ -53,6 +56,7 @@ const INFO_PATH: &str = "/info";
 pub const REST_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REST_BODY_LIMIT: usize = 2 * 1024 * 1024;
 pub const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(30);
+pub const HYPERLIQUID_MAX_RESPONSE_ROWS: usize = 1001;
 const UNSUPPORTED_TIMEFRAME: &str = "Hyperliquid does not support the 1s or 6h timeframes; use 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 8h, 12h, 1d, 3d, 1w, or 1M";
 /// Locked mainnet `spotMeta` universe index for UBTC/USDC (UI-mapped BTC spot).
 const SPOT_UBTC_INDEX: &str = "@142";
@@ -344,6 +348,8 @@ struct HlCandle {
     low: Value,
     #[serde(rename = "v")]
     volume: Value,
+    #[serde(rename = "n")]
+    _trade_count: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1620,8 +1626,10 @@ impl HyperliquidProvider {
                 .map_err(|_| ProviderError::Invariant("rate gate closed"))?
             {
                 RateGateState::Open => return Ok(()),
-                RateGateState::ProcessBlocked(ProcessBlocker::InvalidBanExpiry) => {
-                    return Err(ProviderError::InvalidBanExpiry);
+                RateGateState::ProcessBlocked(_) => {
+                    return Err(ProviderError::Invariant(
+                        "Hyperliquid rate gate cannot be process-blocked",
+                    ));
                 }
                 RateGateState::TimedUntil(deadline) if deadline <= self.clock.now() => {
                     return Ok(());
@@ -1645,8 +1653,7 @@ impl HyperliquidProvider {
         response: &reqwest::Response,
         context: ErrorContext,
     ) -> Result<Vec<Candle>, ProviderError> {
-        let status = response.status();
-        let parsed = response
+        let deadline = response
             .headers()
             .get(RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
@@ -1654,37 +1661,15 @@ impl HyperliquidProvider {
             .and_then(|value| value.parse::<u64>().ok())
             .and_then(|seconds| {
                 checked_deadline(self.clock.now(), Duration::from_secs(seconds)).ok()
-            });
-
-        let deadline = if status == StatusCode::TOO_MANY_REQUESTS {
-            parsed.or_else(|| checked_deadline(self.clock.now(), self.rate_limit_fallback).ok())
-        } else {
-            parsed
-        };
-        if let Some(deadline) = deadline {
-            self.gate_sender
-                .publish(RateGateState::TimedUntil(deadline))
-                .map_err(|_| ProviderError::Invariant("rate gate closed"))?;
-        } else {
-            self.gate_sender
-                .publish(RateGateState::ProcessBlocked(
-                    ProcessBlocker::InvalidBanExpiry,
-                ))
-                .map_err(|_| ProviderError::Invariant("rate gate closed"))?;
-        }
-        let effective = self
-            .gate_snapshot
-            .current()
+            })
+            .or_else(|| checked_deadline(self.clock.now(), self.rate_limit_fallback).ok())
+            .ok_or(ProviderError::Invariant("rate-limit deadline overflow"))?;
+        self.gate_sender
+            .publish(RateGateState::TimedUntil(deadline))
             .map_err(|_| ProviderError::Invariant("rate gate closed"))?;
-        if matches!(
-            effective,
-            RateGateState::ProcessBlocked(ProcessBlocker::InvalidBanExpiry)
-        ) {
-            return Err(ProviderError::InvalidBanExpiry);
-        }
         Err(ProviderError::RateLimited {
             context,
-            status: status.as_u16(),
+            status: response.status().as_u16(),
         })
     }
 
@@ -1730,8 +1715,9 @@ impl HyperliquidProvider {
                 self.gate_snapshot.current(),
                 Ok(RateGateState::ProcessBlocked(_))
             ) {
-                self.send_invalid_ban_and_stop(&sender).await;
-                return Err(ProviderError::InvalidBanExpiry);
+                return Err(ProviderError::Invariant(
+                    "Hyperliquid rate gate cannot be process-blocked",
+                ));
             }
             generation_number = generation_number
                 .checked_add(1)
@@ -1772,8 +1758,7 @@ impl HyperliquidProvider {
                         changed = gate.changed() => match changed {
                             Err(_) => break Err(ProviderError::Invariant("rate gate closed")),
                             Ok(RateGateState::ProcessBlocked(_)) => {
-                                self.send_invalid_ban_and_stop(&sender).await;
-                                return Err(ProviderError::InvalidBanExpiry);
+                                return Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked"));
                             }
                             Ok(RateGateState::Open | RateGateState::TimedUntil(_)) => {}
                         },
@@ -1842,10 +1827,6 @@ impl HyperliquidProvider {
                         &mut backoff_index,
                     )
                     .await?;
-                }
-                Err(error) if matches!(error, ProviderError::InvalidBanExpiry) => {
-                    self.send_invalid_ban_and_stop(&sender).await;
-                    return Err(error);
                 }
                 Err(error) if is_terminal_live_error(&error) => {
                     send_market(
@@ -1984,7 +1965,7 @@ impl HyperliquidProvider {
                     () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
                     changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
                     ack = request.reconcile_ack_rx.changed() => { ack.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
-                    changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::InvalidBanExpiry); },
+                    changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked")); },
                     frame = socket.read() => match frame? {
                         DecodedFrame::Candle(candle) => break candle,
                         DecodedFrame::Ignored | DecodedFrame::ApplicationPong => {
@@ -2119,7 +2100,9 @@ impl HyperliquidProvider {
                             }
                             ReconcileWake::Gate(changed) => {
                                 if matches!(changed?, RateGateState::ProcessBlocked(_)) {
-                                    return Err(ProviderError::InvalidBanExpiry);
+                                    return Err(ProviderError::Invariant(
+                                        "Hyperliquid rate gate cannot be process-blocked",
+                                    ));
                                 }
                             }
                             ReconcileWake::Socket(frame) => match frame {
@@ -2188,7 +2171,7 @@ impl HyperliquidProvider {
                                         .map_err(|_| control_channel_closed(&request.instrument, request.timeframe)),
                                     () = self.clock.sleep_until(age_deadline) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached"))), false)),
                                     changed = gate.changed() => match changed {
-                                        Ok(RateGateState::ProcessBlocked(_)) => Err(ProviderError::InvalidBanExpiry),
+                                        Ok(RateGateState::ProcessBlocked(_)) => Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked")),
                                         Ok(_) => Ok((None, false)),
                                         Err(_) => Err(ProviderError::Invariant("rate gate closed")),
                                     },
@@ -2249,7 +2232,7 @@ impl HyperliquidProvider {
                                         },
                                         () = self.clock.sleep_until(age_deadline) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached")))),
                                         changed = gate.changed() => match changed {
-                                            Ok(RateGateState::ProcessBlocked(_)) => Err(ProviderError::InvalidBanExpiry),
+                                            Ok(RateGateState::ProcessBlocked(_)) => Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked")),
                                             Ok(_) => Ok(None),
                                             Err(_) => Err(ProviderError::Invariant("rate gate closed")),
                                         },
@@ -2357,7 +2340,7 @@ impl HyperliquidProvider {
                     () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
                     changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
                     () = self.clock.sleep_until(age_deadline) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached"))),
-                    changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::InvalidBanExpiry); },
+                    changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked")); },
                     frame = socket.read(), if deferred_reconnect.is_none() => match frame? {
                         DecodedFrame::Candle(candle) => {
                             if let Err(error) = apply_reconciliation_candle(
@@ -2441,13 +2424,15 @@ impl HyperliquidProvider {
         let mut gate = self.gate_snapshot.clone();
         loop {
             if matches!(gate.current(), Ok(RateGateState::ProcessBlocked(_))) {
-                return Err(ProviderError::InvalidBanExpiry);
+                return Err(ProviderError::Invariant(
+                    "Hyperliquid rate gate cannot be process-blocked",
+                ));
             }
             tokio::select! {
                 biased;
                 () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
                 changed = gate.changed() => match changed.map_err(|_| ProviderError::Invariant("rate gate closed"))? {
-                    RateGateState::ProcessBlocked(_) => return Err(ProviderError::InvalidBanExpiry),
+                    RateGateState::ProcessBlocked(_) => return Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked")),
                     RateGateState::Open | RateGateState::TimedUntil(_) => {}
                 },
                 changed = request.accepted_watermark_rx.changed() => { changed.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
@@ -2524,8 +2509,9 @@ impl HyperliquidProvider {
             }
         };
         if matches!(initial_gate, RateGateState::ProcessBlocked(_)) {
-            self.send_invalid_ban_and_stop(sender).await;
-            return Err(ProviderError::InvalidBanExpiry);
+            return Err(ProviderError::Invariant(
+                "Hyperliquid rate gate cannot be process-blocked",
+            ));
         }
         let gate_deadline = match initial_gate {
             RateGateState::TimedUntil(deadline) => Some(deadline),
@@ -2596,8 +2582,7 @@ impl HyperliquidProvider {
                         return Err(error);
                     }
                     Ok(RateGateState::ProcessBlocked(_)) => {
-                        self.send_invalid_ban_and_stop(sender).await;
-                        return Err(ProviderError::InvalidBanExpiry);
+                        return Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked"));
                     }
                     Ok(RateGateState::TimedUntil(value)) => {
                         deadline = deadline.max(value);
@@ -2613,8 +2598,7 @@ impl HyperliquidProvider {
                             return Err(error);
                         }
                         Ok(RateGateState::ProcessBlocked(_)) => {
-                            self.send_invalid_ban_and_stop(sender).await;
-                            return Err(ProviderError::InvalidBanExpiry);
+                            return Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked"));
                         }
                         Ok(RateGateState::TimedUntil(value)) if value > deadline => deadline = value,
                         Ok(RateGateState::Open | RateGateState::TimedUntil(_)) => deadline_elapsed = true,
@@ -2631,22 +2615,6 @@ impl HyperliquidProvider {
                 .with_market(&request.instrument, request.timeframe),
             kind: TimeoutKind::SubscribeAck,
         }
-    }
-
-    async fn send_invalid_ban_and_stop(&self, sender: &EventEmitter) {
-        let _ = sender
-            .queue_terminal_pair(
-                MarketEvent::RecoverableError {
-                    generation: None,
-                    error: ProviderError::InvalidBanExpiry,
-                    rate_gate_deadline: None,
-                },
-                MarketEvent::Status {
-                    generation: None,
-                    status: ConnectionStatus::Stopped,
-                },
-            )
-            .await;
     }
 
     pub fn canonicalize(&self, spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
@@ -3499,6 +3467,69 @@ async fn read_capped(
     Ok(body)
 }
 
+const OVERSIZED_CANDLE_ARRAY: &str = "Hyperliquid candle row limit exceeded";
+
+struct BoundedCandleVisitor<'a> {
+    kind: HistoryRequestKind,
+    requested_limit: usize,
+    instrument: &'a Instrument,
+    timeframe: Timeframe,
+    context: &'a ErrorContext,
+}
+
+impl<'de> Visitor<'de> for BoundedCandleVisitor<'_> {
+    type Value = Vec<Candle>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded array of Hyperliquid candle rows")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut candles = VecDeque::with_capacity(self.requested_limit);
+        let mut row_count = 0_usize;
+        while row_count < HYPERLIQUID_MAX_RESPONSE_ROWS {
+            let Some(raw) = sequence.next_element::<HlCandle>()? else {
+                return Ok(candles.into_iter().collect());
+            };
+            row_count += 1;
+            candle_market_matches(&raw, self.instrument, self.timeframe, self.context, "REST")
+                .map_err(serde::de::Error::custom)?;
+            let (open, high, low, close, volume) =
+                candle_ohlcv(&raw, self.context).map_err(serde::de::Error::custom)?;
+            let candle = Candle::from_rest(
+                raw.open_time,
+                raw.close_time,
+                open,
+                high,
+                low,
+                close,
+                volume,
+            )
+            .map_err(serde::de::Error::custom)?;
+            match self.kind {
+                HistoryRequestKind::Latest | HistoryRequestKind::Older => {
+                    if candles.len() == self.requested_limit {
+                        candles.pop_front();
+                    }
+                    candles.push_back(candle);
+                }
+                HistoryRequestKind::Gap => {
+                    if candles.len() < self.requested_limit {
+                        candles.push_back(candle);
+                    }
+                }
+            }
+        }
+        if sequence.next_element::<IgnoredAny>()?.is_some() {
+            return Err(serde::de::Error::custom(OVERSIZED_CANDLE_ARRAY));
+        }
+        Ok(candles.into_iter().collect())
+    }
+}
+
 fn decode_candles(
     bytes: &[u8],
     kind: HistoryRequestKind,
@@ -3507,46 +3538,44 @@ fn decode_candles(
     timeframe: Timeframe,
     context: ErrorContext,
 ) -> Result<Vec<Candle>, ProviderError> {
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|_| payload(&context, PayloadError::MalformedJson))?;
-    if let Some(error) = info_error_text(&value) {
-        return Err(invalid_hyperliquid_symbol(context, error));
-    }
-    let Some(rows) = value.as_array() else {
-        return Err(payload(&context, PayloadError::ExpectedArray));
-    };
-    let limit = usize::from(requested_limit).min(1000);
-    let mut candles = Vec::with_capacity(rows.len().min(limit));
-    for row in rows {
-        let candle: HlCandle = serde_json::from_value(row.clone())
-            .map_err(|_| payload(&context, PayloadError::MalformedProtocol))?;
-        candle_market_matches(&candle, instrument, timeframe, &context, "REST")?;
-        let (open, high, low, close, volume) = candle_ohlcv(&candle, &context)?;
-        candles.push(
-            Candle::from_rest(
-                candle.open_time,
-                candle.close_time,
-                open,
-                high,
-                low,
-                close,
-                volume,
-            )
-            .map_err(|source| ProviderError::Domain {
-                context: context.clone(),
-                source,
-            })?,
-        );
-    }
-    if candles.len() > limit {
-        match kind {
-            HistoryRequestKind::Latest | HistoryRequestKind::Older => {
-                let drop = candles.len() - limit;
-                candles.drain(..drop);
-            }
-            HistoryRequestKind::Gap => candles.truncate(limit),
+    if bytes
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        != Some(b'[')
+    {
+        let value: Value = serde_json::from_slice(bytes)
+            .map_err(|_| payload(&context, PayloadError::MalformedJson))?;
+        if let Some(error) = info_error_text(&value) {
+            return Err(invalid_hyperliquid_symbol(context, error));
         }
+        return Err(payload(&context, PayloadError::ExpectedArray));
     }
+    let requested_limit = usize::from(requested_limit);
+    if !(1..=1000).contains(&requested_limit) {
+        return Err(payload(&context, PayloadError::MalformedProtocol));
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let candles = serde::de::Deserializer::deserialize_seq(
+        &mut deserializer,
+        BoundedCandleVisitor {
+            kind,
+            requested_limit,
+            instrument,
+            timeframe,
+            context: &context,
+        },
+    )
+    .map_err(|error| {
+        if error.to_string().contains(OVERSIZED_CANDLE_ARRAY) {
+            payload(&context, PayloadError::MalformedProtocol)
+        } else {
+            payload(&context, PayloadError::MalformedProtocol)
+        }
+    })?;
+    deserializer
+        .end()
+        .map_err(|_| payload(&context, PayloadError::MalformedJson))?;
     Ok(candles)
 }
 fn validate_candle_time_window(
@@ -3747,11 +3776,7 @@ fn invalid_hyperliquid_symbol(context: ErrorContext, message: &str) -> ProviderE
     }
 }
 
-fn map_http_error(status: StatusCode, bytes: &[u8], context: ErrorContext) -> ProviderError {
-    let provider_error = serde_json::from_slice::<Value>(bytes).ok();
-    if let Some(message) = provider_error.as_ref().and_then(info_error_text) {
-        return invalid_hyperliquid_symbol(context, message);
-    }
+fn map_http_error(status: StatusCode, _bytes: &[u8], context: ErrorContext) -> ProviderError {
     if status.is_client_error() {
         ProviderError::ClientStatus {
             context,

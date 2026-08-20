@@ -6,10 +6,197 @@ use fccli::{
     clock::ManualClock,
     error::ProviderError,
     model::{
-        HistoryRequest, Instrument, InstrumentSpec, Market, MonoInstant, ProviderId, Timeframe,
+        HistoryRequest, HistoryRequestKind, Instrument, InstrumentSpec, Market, MonoInstant,
+        ProviderId, RateGateState, Timeframe,
     },
     provider::hyperliquid::{HyperliquidProvider, HyperliquidTestConfig},
 };
+fn perpetual_btc() -> Instrument {
+    Instrument::new(
+        ProviderId::new("hyperliquid").expect("provider"),
+        Market::Perpetual,
+        "BTC",
+        "USDC",
+        "BTC",
+    )
+    .expect("instrument")
+}
+
+fn candle_rows(count: usize) -> String {
+    let rows = (0..count)
+        .map(|index| {
+            let open = 1_700_000_000_000_i64 + i64::try_from(index).expect("index") * 60_000;
+            serde_json::json!({
+                "T": open + 59_999,
+                "c": "101.0",
+                "h": "102.0",
+                "i": "1m",
+                "l": "99.0",
+                "n": index,
+                "o": "100.0",
+                "s": "BTC",
+                "t": open,
+                "v": "1.0"
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&rows).expect("rows")
+}
+
+fn history_request(kind: HistoryRequestKind, limit: u16) -> HistoryRequest {
+    match kind {
+        HistoryRequestKind::Latest => HistoryRequest::latest(limit).expect("latest"),
+        HistoryRequestKind::Older => {
+            HistoryRequest::older(1_800_000_000_000, limit).expect("older")
+        }
+        HistoryRequestKind::Gap => {
+            HistoryRequest::gap(1_700_000_000_000, 1_800_000_000_000, limit).expect("gap")
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_request_kind_enforces_retention_and_absolute_row_boundaries() {
+    const LIMIT: u16 = 3;
+    for kind in [
+        HistoryRequestKind::Latest,
+        HistoryRequestKind::Older,
+        HistoryRequestKind::Gap,
+    ] {
+        for count in [usize::from(LIMIT), usize::from(LIMIT) + 1, 1001, 1002] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/info"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(candle_rows(count), "application/json"),
+                )
+                .mount(&server)
+                .await;
+            let result = provider(&server, 1_800_000_000_000)
+                .history(
+                    &perpetual_btc(),
+                    Timeframe::Minute1,
+                    history_request(kind, LIMIT),
+                    CancellationToken::new(),
+                )
+                .await;
+            if count == 1002 {
+                assert!(
+                    matches!(result, Err(ProviderError::Payload { .. })),
+                    "{kind:?}: {result:?}"
+                );
+                continue;
+            }
+            let candles = result.expect("bounded response");
+            assert_eq!(candles.len(), usize::from(LIMIT), "{kind:?} count {count}");
+            let first_index = match kind {
+                HistoryRequestKind::Latest | HistoryRequestKind::Older => {
+                    count - usize::from(LIMIT)
+                }
+                HistoryRequestKind::Gap => 0,
+            };
+            assert_eq!(
+                candles[0].open_time(),
+                1_700_000_000_000 + i64::try_from(first_index).expect("index") * 60_000,
+                "{kind:?} count {count}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn requested_limit_1000_accepts_the_1001_row_overlap() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/info"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(candle_rows(1001), "application/json"),
+        )
+        .mount(&server)
+        .await;
+    let candles = provider(&server, 1_800_000_000_000)
+        .history(
+            &perpetual_btc(),
+            Timeframe::Minute1,
+            HistoryRequest::latest(1000).expect("latest"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("1001-row overlap");
+    assert_eq!(candles.len(), 1000);
+    assert_eq!(candles[0].open_time(), 1_700_000_060_000);
+}
+
+#[tokio::test]
+async fn trade_count_is_required_and_must_be_a_non_negative_integer() {
+    for invalid_n in [
+        None,
+        Some(serde_json::Value::Null),
+        Some(serde_json::json!(-1)),
+        Some(serde_json::json!(1.5)),
+        Some(serde_json::json!("1")),
+    ] {
+        let server = MockServer::start().await;
+        let mut row = serde_json::from_str::<Vec<serde_json::Value>>(&candle_rows(1))
+            .expect("row")
+            .remove(0);
+        if let Some(invalid_n) = invalid_n {
+            row["n"] = invalid_n;
+        } else {
+            row.as_object_mut().expect("object").remove("n");
+        }
+        Mock::given(method("POST"))
+            .and(path("/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![row]))
+            .mount(&server)
+            .await;
+        let error = provider(&server, 1_800_000_000_000)
+            .history(
+                &perpetual_btc(),
+                Timeframe::Minute1,
+                HistoryRequest::latest(1).expect("latest"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("invalid n");
+        assert!(matches!(error, ProviderError::Payload { .. }), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_uses_retry_after_or_local_fallback_without_process_blocking() {
+    for retry_after in [Some("7"), None] {
+        let server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(429);
+        if let Some(value) = retry_after {
+            response = response.insert_header("Retry-After", value);
+        }
+        Mock::given(method("POST"))
+            .and(path("/info"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let provider = provider(&server, 1_800_000_000_000);
+        let error = provider
+            .history(
+                &perpetual_btc(),
+                Timeframe::Minute1,
+                HistoryRequest::latest(1).expect("latest"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("rate limited");
+        assert!(matches!(
+            error,
+            ProviderError::RateLimited { status: 429, .. }
+        ));
+        assert!(matches!(
+            provider.rate_gate().current(),
+            Ok(RateGateState::TimedUntil(_))
+        ));
+    }
+}
+
 use tokio_util::sync::CancellationToken;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -141,7 +328,13 @@ async fn unsupported_timeframes_fail_before_network() {
             "{error}"
         );
     }
-    assert!(server.received_requests().await.unwrap_or_default().is_empty());
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
 }
 
 fn extra_row_fixture() -> String {
@@ -167,7 +360,9 @@ async fn latest_truncates_extra_rows_to_newest_limit() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/info"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(extra_row_fixture(), "application/json"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(extra_row_fixture(), "application/json"),
+        )
         .mount(&server)
         .await;
 
@@ -232,10 +427,10 @@ async fn info_error_object_is_invalid_symbol() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/info"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(
-            r#"{"error":"unknown coin"}"#,
-            "application/json",
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(r#"{"error":"unknown coin"}"#, "application/json"),
+        )
         .mount(&server)
         .await;
 
@@ -261,6 +456,34 @@ async fn info_error_object_is_invalid_symbol() {
         matches!(error, ProviderError::InvalidSymbol { message, .. } if message.as_str() == "invalid symbol"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn binance_ban_status_without_metadata_cannot_block_hyperliquid() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/info"))
+        .respond_with(ResponseTemplate::new(418).set_body_json(serde_json::json!({
+            "code": -1003,
+            "msg": "banned"
+        })))
+        .mount(&server)
+        .await;
+    let provider = provider(&server, 1_800_000_000_000);
+    let error = provider
+        .history(
+            &perpetual_btc(),
+            Timeframe::Minute1,
+            HistoryRequest::latest(1).expect("latest"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("client status");
+    assert!(matches!(
+        error,
+        ProviderError::ClientStatus { status: 418, .. }
+    ));
+    assert_eq!(provider.rate_gate().current(), Ok(RateGateState::Open));
 }
 
 #[test]
