@@ -1,16 +1,17 @@
-#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-use std::future::Future;
 use std::{
     collections::VecDeque,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+use std::{future::Future, sync::Arc};
 
 use futures_util::{Sink, Stream};
 use reqwest::Url;
-use tokio::{net::TcpStream, sync::Notify};
+use tokio::net::TcpStream;
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+use tokio::sync::Notify;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
     tungstenite::{
@@ -24,7 +25,7 @@ use crate::{
     error::{
         ErrorContext, ErrorOperation, PayloadError, ProviderError, SanitizedCause, TimeoutKind,
     },
-    model::{Candle, Instrument, Timeframe},
+    model::{Instrument, Timeframe},
 };
 
 const WS_BYTE_LIMIT_MAX: usize = 16 * 1024 * 1024;
@@ -155,6 +156,7 @@ pub trait WsCodec: Send {
 
     fn readiness_priority(outcome: &Self::Outcome) -> u8;
 
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     fn is_subscribe_accepted(_outcome: &Self::Outcome) -> bool {
         false
     }
@@ -337,6 +339,7 @@ pub struct RawWebSocket<C: WsCodec> {
 }
 
 impl<C: WsCodec> RawWebSocket<C> {
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     #[must_use]
     pub const fn config(&self) -> &WsConfig {
         &self.config
@@ -352,6 +355,7 @@ impl<C: WsCodec> RawWebSocket<C> {
         self.next_application_ping = tokio::time::Instant::now().checked_add(interval);
     }
 
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     #[must_use]
     pub const fn application_heartbeat_started(&self) -> bool {
         self.next_application_ping.is_some()
@@ -378,7 +382,10 @@ impl<C: WsCodec> RawWebSocket<C> {
         loop {
             let inactivity_deadline =
                 self.last_data_message + self.config.message_inactivity_timeout;
-            let result = futures_util::future::poll_fn(|cx| {
+            let result: Result<
+                ReadinessInput<C::Outcome>,
+                std::sync::Arc<tokio::sync::Notify>,
+            > = futures_util::future::poll_fn(|cx| {
                 self.readiness_drain_yielded = false;
                 let io = self.poll_io(cx, inactivity_deadline, false, ReadinessMode::PreSubscription);
                 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -466,6 +473,7 @@ impl<C: WsCodec> RawWebSocket<C> {
         Ok(())
     }
 
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub async fn flush(&mut self) -> Result<(), ProviderError> {
         self.reject_terminal_write()?;
         if self.flush_pending || !self.outbound.is_empty() {
@@ -927,12 +935,14 @@ fn readiness_priority<C: WsCodec>(frame: &DecodedFrame<C::Outcome>) -> u8 {
     }
 }
 
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 pub async fn read_raw_websocket<C: WsCodec>(
     socket: &mut RawWebSocket<C>,
 ) -> Result<DecodedFrame<C::Outcome>, ProviderError> {
     socket.read().await
 }
 
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 pub async fn send_raw_websocket<C: WsCodec>(
     socket: &mut RawWebSocket<C>,
     message: Message,
@@ -940,6 +950,7 @@ pub async fn send_raw_websocket<C: WsCodec>(
     socket.send(message).await
 }
 
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 pub async fn flush_raw_websocket<C: WsCodec>(
     socket: &mut RawWebSocket<C>,
 ) -> Result<(), ProviderError> {

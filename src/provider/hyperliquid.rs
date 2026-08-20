@@ -14,7 +14,9 @@ use serde::{
 };
 use serde_json::Value;
 use time::{Date, Month, OffsetDateTime};
-use tokio::sync::{Notify, mpsc};
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+use tokio::sync::Notify;
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
@@ -224,13 +226,29 @@ struct HlCandle {
     _trade_count: u64,
 }
 
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[derive(Clone, Debug, Default)]
 pub struct HyperliquidWsCodec {
     retained_candle: Option<Candle>,
 }
 
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HyperliquidWsCodec {
+    retained_candle: Option<Candle>,
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[derive(Clone, Debug, PartialEq)]
 pub enum HyperliquidDecoded {
+    Candle(Candle),
+    SubscribeAccepted,
+    ApplicationPong,
+}
+
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum HyperliquidDecoded {
     Candle(Candle),
     SubscribeAccepted,
     ApplicationPong,
@@ -273,6 +291,7 @@ impl WsCodec for HyperliquidWsCodec {
         }
     }
 
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     fn is_subscribe_accepted(outcome: &Self::Outcome) -> bool {
         matches!(outcome, HyperliquidDecoded::SubscribeAccepted)
     }
@@ -317,7 +336,31 @@ fn websocket_url_from_base(
     Ok(url)
 }
 
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 pub fn decode_ws_frame(
+    codec: &mut HyperliquidWsCodec,
+    message: Message,
+    instrument: &Instrument,
+    timeframe: Timeframe,
+    config: &WsConfig,
+    outcomes: &mut VecDeque<DecodedFrame<HyperliquidDecoded>>,
+) {
+    decode_ws_frame_impl(codec, message, instrument, timeframe, config, outcomes);
+}
+
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+fn decode_ws_frame(
+    codec: &mut HyperliquidWsCodec,
+    message: Message,
+    instrument: &Instrument,
+    timeframe: Timeframe,
+    config: &WsConfig,
+    outcomes: &mut VecDeque<DecodedFrame<HyperliquidDecoded>>,
+) {
+    decode_ws_frame_impl(codec, message, instrument, timeframe, config, outcomes);
+}
+
+fn decode_ws_frame_impl(
     codec: &mut HyperliquidWsCodec,
     message: Message,
     instrument: &Instrument,
@@ -503,10 +546,15 @@ fn decode_candle_payload(
     )));
 }
 
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 pub type RawWebSocket = crate::provider::runtime::websocket::RawWebSocket<HyperliquidWsCodec>;
 
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-pub async fn connect_websocket(
+pub(crate) type RawWebSocket =
+    crate::provider::runtime::websocket::RawWebSocket<HyperliquidWsCodec>;
+
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+pub(crate) async fn connect_websocket(
     instrument: &Instrument,
     timeframe: Timeframe,
     config: WsConfig,
@@ -1111,8 +1159,14 @@ impl HyperliquidProvider {
                     }
                     ReadinessInput::Frame(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => {
                         let reconnect = live_protocol_error(request, "WebSocket peer requested reconnect");
-                        if let Err(error) = socket.finalize_peer_close().await {
-                            return Ok(GenerationOutcome::Reconnect(error));
+                        tokio::select! {
+                            biased;
+                            () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
+                            result = socket.finalize_peer_close() => {
+                                if let Err(error) = result {
+                                    return Ok(GenerationOutcome::Reconnect(error));
+                                }
+                            }
                         }
                         return Ok(GenerationOutcome::Reconnect(reconnect));
                     }

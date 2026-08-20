@@ -111,11 +111,11 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 - [x] Adapt Binance and Hyperliquid codecs/connection setup to the shared transport while keeping provider subscription and heartbeat policies separate.
 - [x] Mechanically migrate both codec suites' imports and calls from provider-local `WsConfig`, `DecodedFrame`, connector/raw-socket, and decoder test exports to the shared runtime API or provider-owned codec harness. Keep all existing test cases in place in this commit; R04 owns semantic relocation.
 - [x] Remove duplicated transport/emitter definitions and obsolete provider-local test-only exports only after both codec suites compile against their new owners; migrate all callers in the same commit.
-- Review-fix verification: production keeps `provider::runtime` crate-private; feature-gated integration callers use the narrow `provider::test_transport` facade. `WsCodec` uses a provider-specific associated outcome, leaving shared transport with only provider-neutral ignored/control/reconnect/error mechanics. Pre-subscription Close remains immediately observable and teardown performs bounded automatic close-reply finalization. Readiness and close-flush hook waits are cancellation-safe because they are owned by the active socket/read future rather than detached tasks.
+**Implementation and verification notes:** Pre-subscription peer-close finalization races cancellation with biased priority; the deterministic held-close-flush regression cancels without releasing the hook and observes prompt producer completion. Provider-specific decoded outcomes and codec entry points are public only in the mutually exclusive `test-transport` build and are re-exported through the integration-test-only `provider::test_transport` facade; production definitions and signatures remain crate-private. Warning-free `cargo check` passed. After formatting, all exact R03 gates passed.
 - [x] Verify: `cargo test --locked --test binance_ws_codec --no-default-features --features test-transport` (23 passed).
 - [x] Verify: `cargo test --locked --test hyperliquid_ws_codec --no-default-features --features test-transport` (11 passed).
 - [x] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport` (42 passed).
-- [x] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport` (25 passed).
+- [x] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport` (26 passed).
 
 ### R04 — Establish shared WebSocket/EventEmitter contract tests
 
@@ -309,8 +309,8 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 |---|---|---|---|---|
 | R01 | [x] | — | no | Complete; formatted codec gate 11/11 and live gate 25/25, including `Month1` exact-limit, overflow, and unrepresentable-endpoint coverage |
 | R02 | [x] | R01 | no | Complete; formatted exact gates passed: `hyperliquid_rest` 17/17, `binance_rest` 23/23, and `binance_live` 42/42; temporal/window/order validation and exact rate-gate deadlines covered |
-| R03 | [x] | R02 | no | Complete; formatted exact gates passed: `binance_ws_codec` 23/23, `hyperliquid_ws_codec` 11/11, `binance_live` 42/42, and `hyperliquid_live` 25/25; crate-private runtime/test facade, provider-specific outcomes, bounded close finalization, and cancellation-safe hooks verified |
-| R04 | [ ] | R03 | yes | Dependency-ready; establish shared WebSocket/EventEmitter contract tests |
+| R03 | [x] | R02 | no | Complete; warning-free `cargo check` and formatted exact gates passed: `binance_ws_codec` 23/23, `hyperliquid_ws_codec` 11/11, `binance_live` 42/42, and `hyperliquid_live` 26/26; cancellation-aware close finalization and production-private codec outcomes verified |
+| R04 | [ ] | R03 | yes | Next dependency-ready chunk |
 | R05 | [ ] | R04 | no | — |
 | R06 | [ ] | R05 | no | — |
 | R07 | [ ] | R06 | no | — |

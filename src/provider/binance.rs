@@ -231,12 +231,39 @@ fn websocket_url_from_base(
     Ok(url)
 }
 
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[derive(Clone, Debug, PartialEq)]
 pub enum BinanceDecoded {
     Candle(Candle),
 }
 
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum BinanceDecoded {
+    Candle(Candle),
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 pub fn decode_ws_frame(
+    message: Message,
+    instrument: &Instrument,
+    timeframe: Timeframe,
+    config: &WsConfig,
+) -> DecodedFrame<BinanceDecoded> {
+    decode_ws_frame_impl(message, instrument, timeframe, config)
+}
+
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+fn decode_ws_frame(
+    message: Message,
+    instrument: &Instrument,
+    timeframe: Timeframe,
+    config: &WsConfig,
+) -> DecodedFrame<BinanceDecoded> {
+    decode_ws_frame_impl(message, instrument, timeframe, config)
+}
+
+fn decode_ws_frame_impl(
     message: Message,
     instrument: &Instrument,
     timeframe: Timeframe,
@@ -253,8 +280,13 @@ pub fn decode_ws_frame(
     }
 }
 
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BinanceWsCodec;
+
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BinanceWsCodec;
 
 impl WsCodec for BinanceWsCodec {
     type Outcome = BinanceDecoded;
@@ -368,10 +400,15 @@ fn decode_ws_payload(
         Err(source) => DecodedFrame::ProviderError(ProviderError::Domain { context, source }),
     }
 }
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 pub type RawWebSocket = crate::provider::runtime::websocket::RawWebSocket<BinanceWsCodec>;
 
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
-pub async fn connect_websocket(
+pub(crate) type RawWebSocket = crate::provider::runtime::websocket::RawWebSocket<BinanceWsCodec>;
+
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+pub(crate) async fn connect_websocket(
     instrument: &Instrument,
     timeframe: Timeframe,
     config: WsConfig,

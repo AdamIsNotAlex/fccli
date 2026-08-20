@@ -452,6 +452,48 @@ async fn received_close_wins_while_automatic_close_response_flush_is_held() {
     await_server(server).await;
 }
 
+#[tokio::test]
+async fn cancellation_drops_blocked_pre_subscription_close_finalization() {
+    let (listener, ws_uri) = websocket_listener().await;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut websocket = accept_async(stream).await.expect("upgrade");
+        assert!(matches!(websocket.next().await, Some(Ok(Message::Text(_)))));
+        websocket.feed(Message::Close(None)).await.expect("close");
+        websocket.flush().await.expect("close flush");
+        let _ = websocket.next().await;
+    });
+    let blocked = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let live = LiveSupervisorConfig {
+        close_flush_test_hook: Some(CloseFlushTestHook {
+            blocked: Arc::clone(&blocked),
+            release,
+        }),
+        ..LiveSupervisorConfig::default()
+    };
+    let provider = provider(&ws_uri, clock(), live);
+    let cancellation = CancellationToken::new();
+    let mut feed = provider
+        .open_live(request(cancellation.clone()))
+        .await
+        .expect("feed");
+    let _ = next_event(&mut feed).await;
+    timeout(Duration::from_secs(2), blocked.notified())
+        .await
+        .expect("close finalization was not held");
+
+    cancellation.cancel();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), feed.producer_completion.changed())
+            .await
+            .expect("cancellation did not stop blocked close finalization")
+            .expect("producer completion"),
+        fccli::provider::ProducerCompletion::Finished(Ok(()))
+    ));
+    await_server(server).await;
+}
+
 #[test]
 fn reconciliation_page_and_distinct_buffer_bounds_include_exact_boundary() {
     assert!(reconciliation_page_guard_for_test(63).is_ok());
