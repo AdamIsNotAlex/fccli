@@ -8,6 +8,64 @@ use std::{
 
 #[cfg(feature = "test-transport")]
 use std::sync::atomic::AtomicUsize;
+#[cfg(feature = "test-transport")]
+struct ControlReservationHook {
+    enabled: AtomicBool,
+    arrivals: AtomicUsize,
+    arrival_notify: Notify,
+    released: AtomicBool,
+    release_notify: Notify,
+}
+
+#[cfg(feature = "test-transport")]
+impl ControlReservationHook {
+    fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            arrivals: AtomicUsize::new(0),
+            arrival_notify: Notify::new(),
+            released: AtomicBool::new(false),
+            release_notify: Notify::new(),
+        }
+    }
+
+    async fn hold_after_absent_fast_path(&self) {
+        if !self.enabled.load(Ordering::Acquire) {
+            return;
+        }
+        self.arrivals.fetch_add(1, Ordering::AcqRel);
+        self.arrival_notify.notify_waiters();
+        while !self.released.load(Ordering::Acquire) {
+            let notified = self.release_notify.notified();
+            if self.released.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_for_arrivals(&self, expected: usize) {
+        while self.arrivals.load(Ordering::Acquire) < expected {
+            let notified = self.arrival_notify.notified();
+            if self.arrivals.load(Ordering::Acquire) >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn enable(&self) {
+        self.arrivals.store(0, Ordering::Release);
+        self.released.store(false, Ordering::Release);
+        self.enabled.store(true, Ordering::Release);
+    }
+
+    fn release(&self) {
+        self.enabled.store(false, Ordering::Release);
+        self.released.store(true, Ordering::Release);
+        self.release_notify.notify_waiters();
+    }
+}
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::{
@@ -176,6 +234,8 @@ pub(crate) struct EventEmitter {
     control_saturation_attempts: Arc<AtomicUsize>,
     #[cfg(feature = "test-transport")]
     control_saturation_notify: Arc<Notify>,
+    #[cfg(feature = "test-transport")]
+    control_reservation_hook: Arc<ControlReservationHook>,
     shutdown: Arc<AtomicBool>,
 }
 pub(crate) struct KeyedCandleBuffer {
@@ -285,6 +345,29 @@ impl EventEmitterTestSender {
             }
             notified.await;
         }
+    }
+
+    pub fn enable_control_reservation_hook(&self) {
+        self.0.control_reservation_hook.enable();
+    }
+
+    pub async fn wait_control_reservation_arrivals(&self, expected: usize) {
+        self.0
+            .control_reservation_hook
+            .wait_for_arrivals(expected)
+            .await;
+    }
+
+    pub fn release_control_reservation_hook(&self) {
+        self.0.control_reservation_hook.release();
+    }
+
+    pub fn available_regular_permits(&self) -> usize {
+        self.0.regular_permits.available_permits()
+    }
+
+    pub fn available_control_permits(&self) -> usize {
+        self.0.control_permits.available_permits()
     }
 }
 
@@ -400,6 +483,8 @@ impl EventEmitter {
             control_saturation_attempts: Arc::new(AtomicUsize::new(0)),
             #[cfg(feature = "test-transport")]
             control_saturation_notify: Arc::new(Notify::new()),
+            #[cfg(feature = "test-transport")]
+            control_reservation_hook: Arc::new(ControlReservationHook::new()),
         }
     }
 
@@ -456,6 +541,12 @@ impl EventEmitter {
                 .contains(&key)
         }) {
             return Ok(());
+        }
+        #[cfg(feature = "test-transport")]
+        if control_key.is_some() {
+            self.control_reservation_hook
+                .hold_after_absent_fast_path()
+                .await;
         }
         let control_permit = if is_control_event(&event) {
             #[cfg(feature = "test-transport")]
