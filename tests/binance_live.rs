@@ -11,9 +11,9 @@ use fccli::{
     },
     provider::binance::{BinanceProvider, BinanceTestConfig, MAX_CONNECTION_AGE, decode_ws_frame},
     provider::{
-        LiveRequest, LiveSupervisorConfig, MarketDataProvider, ProducerCompletion, ReconcileAck,
+        LiveRequest, MarketDataProvider, ProducerCompletion, ReconcileAck,
         accepted_watermark_channel, reconcile_ack_channel,
-        test_transport::{DecodedFrame, WsConfig},
+        test_transport::{DecodedFrame, LiveSupervisorConfig, WsConfig},
     },
 };
 use futures_util::{SinkExt, StreamExt};

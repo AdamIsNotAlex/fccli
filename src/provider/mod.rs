@@ -6,17 +6,6 @@ pub(crate) mod runtime;
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[doc(hidden)]
 pub mod test_transport;
-#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-#[doc(hidden)]
-pub use runtime::live::{
-    CONTROL_CAPACITY, EMERGENCY_CONTROL_CAPACITY, FIRST_KLINE_HANDSHAKE_TIMEOUT,
-    KEYED_CANDLE_CAPACITY, LiveCompletionDisposition, LiveErrorClassification,
-    LiveErrorDisposition, LiveInBandEventDisposition, LiveInputClassification, LiveSocketEvent,
-    LiveSupervisorConfig, MARKET_EVENT_CHANNEL_CAPACITY, RECONCILE_ACK_TIMEOUT,
-    classify_live_error_for_test, classify_live_input_for_test,
-    gap_target_within_generation_span_for_test, reconciliation_distinct_key_allowed_for_test,
-    reconciliation_page_guard_for_test,
-};
 
 use futures_util::Stream;
 use std::{

@@ -18,15 +18,14 @@ use fccli::{
         MonoInstant, ProviderId, RateGateState, ReplayRevision, Timeframe,
     },
     provider::{
-        LiveCompletionDisposition, LiveErrorDisposition, LiveFeed, LiveInBandEventDisposition,
-        LiveInputClassification, LiveRequest, LiveSocketEvent, LiveSupervisorConfig,
-        ProducerCompletion, ProviderCapabilities, ReconcileAck, accepted_watermark_channel,
-        classify_live_error_for_test, classify_live_input_for_test, rate_gate_channel,
-        reconcile_ack_channel,
+        LiveFeed, LiveRequest, ProducerCompletion, ProviderCapabilities, ReconcileAck,
+        accepted_watermark_channel, rate_gate_channel, reconcile_ack_channel,
         test_transport::{
-            ConnectionRotation, LiveAdapter, LiveConfig, LiveRateGate, LiveSocket,
-            ProcessBlockPolicy, ReconciliationLimits, ReconciliationPolicy,
-            gap_target_within_generation_span_for_test, open_live,
+            ConnectionRotation, LiveAdapter, LiveCompletionDisposition, LiveConfig,
+            LiveErrorDisposition, LiveInBandEventDisposition, LiveInputClassification,
+            LiveRateGate, LiveSocket, LiveSocketEvent, LiveSupervisorConfig, ProcessBlockPolicy,
+            ReconciliationLimits, ReconciliationPolicy, classify_live_error_for_test,
+            classify_live_input_for_test, gap_target_within_generation_span_for_test, open_live,
             reconciliation_distinct_key_allowed_for_test, reconciliation_page_guard_for_test,
         },
     },
@@ -406,6 +405,7 @@ struct Harness {
     history_responses: Vec<oneshot::Sender<Result<Vec<Candle>, ProviderError>>>,
     clock: Arc<ManualClock>,
     gate_sender: fccli::provider::RateGateSender,
+    capabilities: ProviderCapabilities,
 }
 
 impl Harness {
@@ -450,7 +450,60 @@ impl Harness {
             history_responses,
             clock: Arc::new(ManualClock::new(MonoInstant::ZERO)),
             gate_sender,
+            capabilities: ProviderCapabilities {
+                markets: &[Market::Spot],
+                timeframes: &[Timeframe::Minute1],
+                history_page_limit: 1_000,
+            },
         }
+    }
+
+    fn with_limits(mut self, max_successors: usize, max_pages: usize) -> Self {
+        self.adapter.reconciliation = ReconciliationPolicy::Bounded(ReconciliationLimits {
+            max_successors,
+            max_pages,
+            span_exceeded: "runtime reconciliation span exceeded",
+            page_exceeded: "runtime reconciliation page limit exceeded",
+            distinct_exceeded: "runtime reconciliation distinct buffer exceeded",
+        });
+        self
+    }
+
+    fn with_history_page_limit(mut self, history_page_limit: u16) -> Self {
+        self.capabilities.history_page_limit = history_page_limit;
+        self
+    }
+
+    async fn open_result(
+        &self,
+        startup: Option<i64>,
+    ) -> Result<
+        (
+            LiveFeed,
+            fccli::provider::AcceptedWatermarkSender,
+            fccli::provider::ReconcileAckSender,
+            fccli::provider::CancellationToken,
+        ),
+        ProviderError,
+    > {
+        let (watermark_tx, watermark_rx) = accepted_watermark_channel(startup);
+        let (ack_tx, ack_rx) = reconcile_ack_channel();
+        let cancellation = fccli::provider::CancellationToken::new();
+        let feed = open_live(
+            self.adapter.clone(),
+            self.clock.clone(),
+            self.capabilities,
+            LiveRequest {
+                instrument: instrument(),
+                timeframe: Timeframe::Minute1,
+                startup_watermark: startup,
+                accepted_watermark_rx: watermark_rx,
+                reconcile_ack_rx: ack_rx,
+                cancellation: cancellation.clone(),
+            },
+        )
+        .await?;
+        Ok((feed, watermark_tx, ack_tx, cancellation))
     }
 
     async fn open(
@@ -462,29 +515,315 @@ impl Harness {
         fccli::provider::ReconcileAckSender,
         fccli::provider::CancellationToken,
     ) {
-        let (watermark_tx, watermark_rx) = accepted_watermark_channel(startup);
-        let (ack_tx, ack_rx) = reconcile_ack_channel();
-        let cancellation = fccli::provider::CancellationToken::new();
-        let feed = open_live(
-            self.adapter.clone(),
-            self.clock.clone(),
-            ProviderCapabilities {
-                markets: &[Market::Spot],
-                timeframes: &[Timeframe::Minute1],
-                history_page_limit: 1_000,
-            },
-            LiveRequest {
-                instrument: instrument(),
-                timeframe: Timeframe::Minute1,
-                startup_watermark: startup,
-                accepted_watermark_rx: watermark_rx,
-                reconcile_ack_rx: ack_rx,
-                cancellation: cancellation.clone(),
-            },
-        )
+        self.open_result(startup)
+            .await
+            .expect("open shared runtime")
+    }
+}
+
+async fn recoverable_error(feed: &mut LiveFeed) -> (GapGeneration, ProviderError) {
+    loop {
+        if let MarketEvent::RecoverableError {
+            generation: Some(generation),
+            error,
+            ..
+        } = event(feed).await
+        {
+            return (generation, error);
+        }
+    }
+}
+
+async fn assert_one_backoff(feed: &mut LiveFeed, generation: GapGeneration) {
+    assert_eq!(
+        event(feed).await,
+        MarketEvent::Status {
+            generation: Some(generation),
+            status: ConnectionStatus::Backoff,
+        }
+    );
+    assert_no_ready_event(feed).await;
+}
+
+#[tokio::test]
+async fn live_capability_limit_is_validated_before_io_and_used_exactly_for_gap_history() {
+    let zero = Harness::new(1, 1, LiveSupervisorConfig::default()).with_history_page_limit(0);
+    assert!(matches!(
+        zero.open_result(Some(OPEN)).await,
+        Err(ProviderError::Configuration(
+            "provider history page limit must be non-zero"
+        ))
+    ));
+    assert_eq!(zero.adapter.sockets.lock().expect("sockets").len(), 1);
+    assert_eq!(zero.adapter.history.lock().expect("history").len(), 1);
+
+    let mut harness =
+        Harness::new(1, 1, LiveSupervisorConfig::default()).with_history_page_limit(7);
+    let (mut feed, _watermark, _ack, cancellation) = harness.open(Some(OPEN)).await;
+    harness.socket_senders[0]
+        .send(Ok(LiveSocketEvent::Candle(candle(OPEN, true))))
+        .expect("first candle");
+    let request = timeout(Duration::from_secs(2), harness.history_started.remove(0))
         .await
-        .expect("open shared runtime");
-        (feed, watermark_tx, ack_tx, cancellation)
+        .expect("bounded history request")
+        .expect("history request");
+    assert_eq!(request.limit(), 7);
+    cancellation.cancel();
+    assert!(matches!(
+        event(&mut feed).await,
+        MarketEvent::Status {
+            status: ConnectionStatus::Stopped,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn reconciliation_page_limit_accepts_exact_boundary_and_rejects_overflow_before_io() {
+    let mut exact = Harness::new(1, 2, LiveSupervisorConfig::default())
+        .with_history_page_limit(1)
+        .with_limits(8, 2);
+    let (mut feed, _watermark, _ack, cancellation) = exact.open(Some(OPEN)).await;
+    exact.socket_senders[0]
+        .send(Ok(LiveSocketEvent::Candle(candle(OPEN + 120_000, true))))
+        .expect("first candle");
+    exact.history_started.remove(0).await.expect("page one");
+    exact
+        .history_responses
+        .remove(0)
+        .send(Ok(vec![rest_candle(OPEN)]))
+        .expect("page one response");
+    exact.history_started.remove(0).await.expect("page two");
+    exact
+        .history_responses
+        .remove(0)
+        .send(Ok(vec![rest_candle(OPEN + 120_000)]))
+        .expect("page two response");
+    let (_, _, target, _) = reconcile_batch(&mut feed).await;
+    assert_eq!(target, OPEN + 120_000);
+    cancellation.cancel();
+
+    let mut overflow = Harness::new(1, 3, LiveSupervisorConfig::default())
+        .with_history_page_limit(1)
+        .with_limits(8, 2);
+    let (mut feed, _watermark, _ack, cancellation) = overflow.open(Some(OPEN)).await;
+    overflow.socket_senders[0]
+        .send(Ok(LiveSocketEvent::Candle(candle(OPEN + 180_000, true))))
+        .expect("first candle");
+    overflow.history_started.remove(0).await.expect("page one");
+    overflow
+        .history_responses
+        .remove(0)
+        .send(Ok(vec![rest_candle(OPEN)]))
+        .expect("page one response");
+    overflow.history_started.remove(0).await.expect("page two");
+    overflow
+        .history_responses
+        .remove(0)
+        .send(Ok(vec![rest_candle(OPEN + 60_000)]))
+        .expect("page two response");
+    let (generation, error) = recoverable_error(&mut feed).await;
+    assert!(matches!(
+        error,
+        ProviderError::Protocol {
+            detail: "runtime reconciliation page limit exceeded",
+            ..
+        }
+    ));
+    assert_eq!(overflow.adapter.history.lock().expect("history").len(), 1);
+    assert_one_backoff(&mut feed, generation).await;
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn pending_history_enforces_distinct_buffer_bound_before_additional_io() {
+    let mut harness = Harness::new(1, 2, LiveSupervisorConfig::default()).with_limits(2, 8);
+    let (mut feed, _watermark, _ack, cancellation) = harness.open(Some(OPEN)).await;
+    harness.socket_senders[0]
+        .send(Ok(LiveSocketEvent::Candle(candle(OPEN, true))))
+        .expect("first");
+    harness
+        .history_started
+        .remove(0)
+        .await
+        .expect("held history");
+    for open_time in [OPEN + 60_000, OPEN + 120_000, OPEN + 180_000] {
+        harness.socket_senders[0]
+            .send(Ok(LiveSocketEvent::Candle(candle(open_time, true))))
+            .expect("pending candle");
+    }
+    let (_, error) = recoverable_error(&mut feed).await;
+    assert!(matches!(
+        error,
+        ProviderError::Protocol {
+            detail: "runtime reconciliation distinct buffer exceeded",
+            ..
+        }
+    ));
+    assert!((&mut harness.history_started[0]).now_or_never().is_none());
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn pending_history_enforces_candle_target_span_before_additional_io() {
+    let mut harness = Harness::new(1, 2, LiveSupervisorConfig::default()).with_limits(1, 8);
+    let (mut feed, _watermark, _ack, cancellation) = harness.open(Some(OPEN)).await;
+    harness.socket_senders[0]
+        .send(Ok(LiveSocketEvent::Candle(candle(OPEN, true))))
+        .expect("first");
+    harness
+        .history_started
+        .remove(0)
+        .await
+        .expect("held history");
+    harness.socket_senders[0]
+        .send(Ok(LiveSocketEvent::Candle(candle(OPEN + 120_000, true))))
+        .expect("span overflow");
+    let (_, error) = recoverable_error(&mut feed).await;
+    assert!(matches!(
+        error,
+        ProviderError::Protocol {
+            detail: "runtime reconciliation span exceeded",
+            ..
+        }
+    ));
+    assert!((&mut harness.history_started[0]).now_or_never().is_none());
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn pending_history_enforces_watermark_target_span_before_additional_io() {
+    let mut harness = Harness::new(1, 2, LiveSupervisorConfig::default()).with_limits(1, 8);
+    let (mut feed, watermark, _ack, cancellation) = harness.open(Some(OPEN)).await;
+    harness.socket_senders[0]
+        .send(Ok(LiveSocketEvent::Candle(candle(OPEN, true))))
+        .expect("first");
+    harness
+        .history_started
+        .remove(0)
+        .await
+        .expect("held history");
+    watermark
+        .publish(Some(OPEN + 120_000))
+        .expect("watermark overflow");
+    let (_, error) = recoverable_error(&mut feed).await;
+    assert!(matches!(
+        error,
+        ProviderError::Protocol {
+            detail: "runtime reconciliation span exceeded",
+            ..
+        }
+    ));
+    assert!((&mut harness.history_started[0]).now_or_never().is_none());
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn cancellation_is_prompt_during_large_in_bound_pending_history_sequence() {
+    const COUNT: usize = 8_192;
+    let mut harness = Harness::new(1, 1, LiveSupervisorConfig::default()).with_limits(COUNT + 1, 8);
+    let (mut feed, _watermark, _ack, cancellation) = harness.open(Some(OPEN)).await;
+    harness.socket_senders[0]
+        .send(Ok(LiveSocketEvent::Candle(candle(OPEN, true))))
+        .expect("first");
+    harness
+        .history_started
+        .remove(0)
+        .await
+        .expect("held history");
+    for successor in 1..=COUNT {
+        harness.socket_senders[0]
+            .send(Ok(LiveSocketEvent::Candle(candle(
+                OPEN + successor as i64 * 60_000,
+                true,
+            ))))
+            .expect("in-bound candle");
+    }
+    cancellation.cancel();
+    assert!(matches!(
+        event(&mut feed).await,
+        MarketEvent::Status {
+            status: ConnectionStatus::Stopped,
+            ..
+        }
+    ));
+    assert_eq!(
+        timeout(Duration::from_secs(2), feed.producer_completion.changed())
+            .await
+            .expect("prompt completion")
+            .expect("completion"),
+        ProducerCompletion::Finished(Ok(()))
+    );
+}
+
+#[tokio::test]
+async fn terminal_socket_precedes_simultaneously_ready_page_and_watermark() {
+    let mut harness = Harness::new(1, 1, LiveSupervisorConfig::default()).with_limits(8, 8);
+    let (mut feed, watermark, _ack, cancellation) = harness.open(Some(OPEN)).await;
+    harness.socket_senders[0]
+        .send(Ok(LiveSocketEvent::Candle(candle(OPEN, true))))
+        .expect("first");
+    harness
+        .history_started
+        .remove(0)
+        .await
+        .expect("held history");
+    harness
+        .history_responses
+        .remove(0)
+        .send(Ok(vec![rest_candle(OPEN)]))
+        .expect("ready page");
+    watermark
+        .publish(Some(OPEN + 60_000))
+        .expect("ready watermark");
+    harness.socket_senders[0]
+        .send(Ok(LiveSocketEvent::ReconnectRequested))
+        .expect("terminal socket");
+    let (_, error) = recoverable_error(&mut feed).await;
+    assert!(matches!(
+        error,
+        ProviderError::Protocol {
+            detail: "WebSocket peer requested reconnect",
+            ..
+        }
+    ));
+    assert!(!matches!(
+        feed.events.next().now_or_never(),
+        Some(Some(Ok(MarketEvent::ReconcileBatch { .. })))
+    ));
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn empty_and_short_pages_emit_exact_no_progress_and_one_backoff() {
+    for (page, expected_last) in [(Vec::new(), None), (vec![rest_candle(OPEN)], Some(OPEN))] {
+        let mut harness = Harness::new(1, 1, LiveSupervisorConfig::default())
+            .with_history_page_limit(3)
+            .with_limits(8, 8);
+        let (mut feed, _watermark, _ack, cancellation) = harness.open(Some(OPEN)).await;
+        harness.socket_senders[0]
+            .send(Ok(LiveSocketEvent::Candle(candle(OPEN + 120_000, true))))
+            .expect("first candle");
+        harness
+            .history_started
+            .remove(0)
+            .await
+            .expect("history request");
+        harness
+            .history_responses
+            .remove(0)
+            .send(Ok(page))
+            .expect("history response");
+        let (generation, error) = recoverable_error(&mut feed).await;
+        assert_eq!(
+            error,
+            ProviderError::GapSyncNoProgress {
+                target_open_time: OPEN + 120_000,
+                last_open_time: expected_last,
+            }
+        );
+        assert_one_backoff(&mut feed, generation).await;
+        cancellation.cancel();
     }
 }
 

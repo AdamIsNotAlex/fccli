@@ -5,8 +5,12 @@ pub use super::runtime::http::{
     HttpRuntime, RateLimitDecision, StatusDisposition, classify_status, is_cancelled,
 };
 pub use super::runtime::live::{
-    ConnectionRotation, LiveAdapter, LiveConfig, LiveRateGate, LiveSocket, LiveSupervisorConfig,
-    ProcessBlockPolicy, ReconciliationLimits, ReconciliationPolicy,
+    CONTROL_CAPACITY, ConnectionRotation, EMERGENCY_CONTROL_CAPACITY,
+    FIRST_KLINE_HANDSHAKE_TIMEOUT, KEYED_CANDLE_CAPACITY, LiveAdapter, LiveCompletionDisposition,
+    LiveConfig, LiveErrorClassification, LiveErrorDisposition, LiveInBandEventDisposition,
+    LiveInputClassification, LiveRateGate, LiveSocket, LiveSocketEvent, LiveSupervisorConfig,
+    MARKET_EVENT_CHANNEL_CAPACITY, ProcessBlockPolicy, RECONCILE_ACK_TIMEOUT, ReconciliationLimits,
+    ReconciliationPolicy, classify_live_error_for_test, classify_live_input_for_test,
     gap_target_within_generation_span_for_test, open_live,
     reconciliation_distinct_key_allowed_for_test, reconciliation_page_guard_for_test,
 };
