@@ -52,8 +52,7 @@ const INFO_PATH: &str = "/info";
 pub const REST_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REST_BODY_LIMIT: usize = 2 * 1024 * 1024;
 pub const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(30);
-const UNSUPPORTED_TIMEFRAME: &str =
-    "Hyperliquid does not support the 1s or 6h timeframes; use 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 8h, 12h, 1d, 3d, 1w, or 1M";
+const UNSUPPORTED_TIMEFRAME: &str = "Hyperliquid does not support the 1s or 6h timeframes; use 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 8h, 12h, 1d, 3d, 1w, or 1M";
 /// Locked mainnet `spotMeta` universe index for UBTC/USDC (UI-mapped BTC spot).
 const SPOT_UBTC_INDEX: &str = "@142";
 /// Locked mainnet `spotMeta` universe index for HYPE/USDC.
@@ -78,6 +77,8 @@ pub const EMERGENCY_CONTROL_CAPACITY: usize = 2;
 pub const MARKET_EVENT_CHANNEL_CAPACITY: usize = 256;
 pub const FIRST_KLINE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RECONCILE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+pub const SUBSCRIBE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+pub const APPLICATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(50);
 pub const MAX_CONNECTION_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_SUPERVISOR_CAPACITY: usize = 65_536;
 const GAP_PAGE_LIMIT: u16 = 1000;
@@ -88,6 +89,7 @@ pub struct LiveSupervisorConfig {
     pub control_capacity: usize,
     pub market_event_capacity: usize,
     pub first_kline_timeout: Duration,
+    pub subscribe_ack_timeout: Duration,
     pub reconcile_ack_timeout: Duration,
     pub max_connection_age: Duration,
     pub ws_config: WsConfig,
@@ -102,6 +104,7 @@ impl Default for LiveSupervisorConfig {
             control_capacity: CONTROL_CAPACITY,
             market_event_capacity: MARKET_EVENT_CHANNEL_CAPACITY,
             first_kline_timeout: FIRST_KLINE_HANDSHAKE_TIMEOUT,
+            subscribe_ack_timeout: SUBSCRIBE_ACK_TIMEOUT,
             reconcile_ack_timeout: RECONCILE_ACK_TIMEOUT,
             max_connection_age: MAX_CONNECTION_AGE,
             ws_config: WsConfig::default(),
@@ -130,7 +133,11 @@ impl LiveSupervisorConfig {
                 "live supervisor stalled-write probe is outside 0..=65536",
             ));
         }
-        for timeout in [self.first_kline_timeout, self.reconcile_ack_timeout] {
+        for timeout in [
+            self.first_kline_timeout,
+            self.reconcile_ack_timeout,
+            self.subscribe_ack_timeout,
+        ] {
             if !(Duration::from_millis(1)..=Duration::from_secs(60)).contains(&timeout) {
                 return Err(ProviderError::Configuration(
                     "live supervisor timeout is outside 1ms..=60s",
@@ -247,6 +254,8 @@ impl Default for WsConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub enum DecodedFrame {
     Candle(Candle),
+    SubscribeAccepted,
+    ApplicationPong,
     Ignored,
     ProviderError(ProviderError),
     ServerShutdown,
@@ -275,15 +284,24 @@ struct HlCandle {
     volume: Value,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct HyperliquidWsCodec {
+    retained_candle: Option<Candle>,
+}
+
+impl HyperliquidWsCodec {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            retained_candle: None,
+        }
+    }
+}
+
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
 pub fn websocket_url(instrument: &Instrument, timeframe: Timeframe) -> Result<Url, ProviderError> {
-    websocket_url_from_base(
-        production_ws_base(),
-        instrument,
-        timeframe,
-        false,
-    )
-    .map_err(|error| contextualize_websocket_configuration(error, instrument, timeframe))
+    websocket_url_from_base(production_ws_base(), instrument, timeframe, false)
+        .map_err(|error| contextualize_websocket_configuration(error, instrument, timeframe))
 }
 
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -350,67 +368,132 @@ fn websocket_url_from_base(
 }
 
 pub fn decode_ws_frame(
+    codec: &mut HyperliquidWsCodec,
     message: Message,
     instrument: &Instrument,
     timeframe: Timeframe,
     config: &WsConfig,
-) -> DecodedFrame {
+    outcomes: &mut VecDeque<DecodedFrame>,
+) {
     if let Err(error) = config.validate() {
-        return DecodedFrame::ProviderError(error);
+        outcomes.push_back(DecodedFrame::ProviderError(error));
+        return;
     }
     match message {
-        Message::Text(text) => decode_ws_payload(text.as_bytes(), instrument, timeframe, config),
-        Message::Binary(bytes) => decode_ws_payload(&bytes, instrument, timeframe, config),
-        Message::Close(frame) => DecodedFrame::Close(frame.map(|frame| frame.code)),
-        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => DecodedFrame::Ignored,
+        Message::Text(text) => {
+            decode_ws_payload(
+                codec,
+                text.as_bytes(),
+                instrument,
+                timeframe,
+                config,
+                outcomes,
+            );
+        }
+        Message::Binary(bytes) => {
+            decode_ws_payload(codec, &bytes, instrument, timeframe, config, outcomes);
+        }
+        Message::Close(frame) => {
+            outcomes.push_back(DecodedFrame::Close(frame.map(|frame| frame.code)));
+        }
+        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
+            outcomes.push_back(DecodedFrame::Ignored);
+        }
     }
 }
 
 fn decode_ws_payload(
+    codec: &mut HyperliquidWsCodec,
     bytes: &[u8],
     instrument: &Instrument,
     timeframe: Timeframe,
     config: &WsConfig,
-) -> DecodedFrame {
+    outcomes: &mut VecDeque<DecodedFrame>,
+) {
     let context =
         ErrorContext::operation(ErrorOperation::WebSocket).with_market(instrument, timeframe);
     if bytes.len() > config.max_message_size {
-        return DecodedFrame::ProviderError(payload(
+        outcomes.push_back(DecodedFrame::ProviderError(payload(
             &context,
             PayloadError::OverBudget {
                 limit_bytes: config.max_message_size,
             },
-        ));
+        )));
+        return;
     }
     let value: Value = match serde_json::from_slice(bytes) {
         Ok(value) => value,
         Err(_) => {
-            return DecodedFrame::ProviderError(payload(&context, PayloadError::MalformedProtocol));
+            outcomes.push_back(DecodedFrame::ProviderError(payload(
+                &context,
+                PayloadError::MalformedProtocol,
+            )));
+            return;
         }
     };
-    let channel = value.get("channel").and_then(Value::as_str);
-    if channel != Some("candle") {
-        return DecodedFrame::Ignored;
+    match value.get("channel").and_then(Value::as_str) {
+        Some("subscriptionResponse") => {
+            let valid = value.get("data").is_some_and(|data| {
+                data.get("method").and_then(Value::as_str) == Some("subscribe")
+                    && data.get("subscription").is_some_and(|subscription| {
+                        subscription.get("type").and_then(Value::as_str) == Some("candle")
+                            && subscription.get("coin").and_then(Value::as_str)
+                                == Some(instrument.provider_symbol())
+                            && subscription.get("interval").and_then(Value::as_str)
+                                == Some(timeframe.as_str())
+                    })
+            });
+            outcomes.push_back(if valid {
+                DecodedFrame::SubscribeAccepted
+            } else {
+                DecodedFrame::ProviderError(payload(&context, PayloadError::MalformedProtocol))
+            });
+        }
+        Some("pong") => outcomes.push_back(DecodedFrame::ApplicationPong),
+        Some("candle") => {
+            decode_candle_payload(codec, &value, instrument, timeframe, &context, outcomes)
+        }
+        _ => outcomes.push_back(DecodedFrame::Ignored),
     }
+}
+
+fn decode_candle_payload(
+    codec: &mut HyperliquidWsCodec,
+    value: &Value,
+    instrument: &Instrument,
+    timeframe: Timeframe,
+    context: &ErrorContext,
+    outcomes: &mut VecDeque<DecodedFrame>,
+) {
     let Some(data) = value.get("data") else {
-        return DecodedFrame::ProviderError(payload(&context, PayloadError::MalformedProtocol));
+        outcomes.push_back(DecodedFrame::ProviderError(payload(
+            context,
+            PayloadError::MalformedProtocol,
+        )));
+        return;
     };
     let kline: HlCandle = match serde_json::from_value(data.clone()) {
         Ok(kline) => kline,
         Err(_) => {
-            return DecodedFrame::ProviderError(payload(&context, PayloadError::MalformedProtocol));
+            outcomes.push_back(DecodedFrame::ProviderError(payload(
+                context,
+                PayloadError::MalformedProtocol,
+            )));
+            return;
         }
     };
-    if let Err(error) = candle_market_matches(&kline, instrument, timeframe, &context, "WebSocket")
-    {
-        return DecodedFrame::ProviderError(error);
+    if let Err(error) = candle_market_matches(&kline, instrument, timeframe, context, "WebSocket") {
+        outcomes.push_back(DecodedFrame::ProviderError(error));
+        return;
     }
-    let (open, high, low, close, volume) = match candle_ohlcv(&kline, &context) {
+    let (open, high, low, close, volume) = match candle_ohlcv(&kline, context) {
         Ok(ohlcv) => ohlcv,
-        Err(error) => return DecodedFrame::ProviderError(error),
+        Err(error) => {
+            outcomes.push_back(DecodedFrame::ProviderError(error));
+            return;
+        }
     };
-    let closed = kline.close_time < unix_now_ms().unwrap_or(kline.close_time);
-    match Candle::from_ws(
+    let candidate = match Candle::from_ws(
         kline.open_time,
         kline.close_time,
         open,
@@ -418,13 +501,47 @@ fn decode_ws_payload(
         low,
         close,
         volume,
-        closed,
+        false,
     ) {
-        Ok(candle) => DecodedFrame::Candle(candle),
-        Err(source) => DecodedFrame::ProviderError(ProviderError::Domain { context, source }),
+        Ok(candle) => candle,
+        Err(source) => {
+            outcomes.push_back(DecodedFrame::ProviderError(ProviderError::Domain {
+                context: context.clone(),
+                source,
+            }));
+            return;
+        }
+    };
+    let Some(retained) = codec.retained_candle.as_ref() else {
+        codec.retained_candle = Some(candidate.clone());
+        outcomes.push_back(DecodedFrame::Candle(candidate));
+        return;
+    };
+    if candidate.open_time() < retained.open_time() || candidate == *retained {
+        return;
     }
+    if candidate.open_time() == retained.open_time() {
+        codec.retained_candle = Some(candidate.clone());
+        outcomes.push_back(DecodedFrame::Candle(candidate));
+        return;
+    }
+    let closed = Candle::from_ws(
+        retained.open_time(),
+        retained.close_time(),
+        retained.open(),
+        retained.high(),
+        retained.low(),
+        retained.close(),
+        retained.base_volume(),
+        true,
+    )
+    .expect("retained validated candle remains valid when closed");
+    codec.retained_candle = Some(candidate.clone());
+    outcomes.push_back(DecodedFrame::Candle(closed));
+    outcomes.push_back(DecodedFrame::Candle(candidate));
 }
 const MAX_RETAINED_DECODED_OUTCOMES: usize = 64;
+const MAX_DECODED_OUTCOMES_PER_FRAME: usize = 2;
 
 pub struct RawWebSocket {
     stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -432,7 +549,8 @@ pub struct RawWebSocket {
     context: ErrorContext,
     instrument: Instrument,
     timeframe: Timeframe,
-    decoded: VecDeque<Result<DecodedFrame, ProviderError>>,
+    codec: HyperliquidWsCodec,
+    decoded: VecDeque<DecodedFrame>,
     outbound: VecDeque<Message>,
     flush_pending: bool,
     write_stall_deadline: Option<tokio::time::Instant>,
@@ -440,6 +558,7 @@ pub struct RawWebSocket {
     terminal_io: bool,
     pending_terminal_error: Option<ProviderError>,
     stalled_write_error: Option<ProviderError>,
+    next_application_ping: Option<tokio::time::Instant>,
     peer_close_outcome: Option<DecodedFrame>,
 }
 
@@ -449,17 +568,35 @@ impl RawWebSocket {
         &self.config
     }
 
+    pub fn start_application_heartbeat(&mut self) {
+        self.next_application_ping =
+            tokio::time::Instant::now().checked_add(APPLICATION_HEARTBEAT_INTERVAL);
+    }
+
+    #[must_use]
+    pub const fn application_heartbeat_started(&self) -> bool {
+        self.next_application_ping.is_some()
+    }
+
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    pub fn force_application_heartbeat_due_for_test(&mut self) {
+        assert!(
+            self.application_heartbeat_started(),
+            "heartbeat must be enabled first"
+        );
+        self.next_application_ping = Some(tokio::time::Instant::now());
+    }
     pub async fn read(&mut self) -> Result<DecodedFrame, ProviderError> {
         loop {
             if self.stalled_write_error.is_some() {
                 if let Some(outcome) = self.decoded.pop_front() {
-                    return outcome;
+                    return Ok(outcome);
                 }
             } else if !self.flush_pending
                 && self.outbound.is_empty()
                 && let Some(outcome) = self.decoded.pop_front()
             {
-                return outcome;
+                return Ok(outcome);
             }
             if let Some(error) = self.pending_terminal_error.take() {
                 return Err(error);
@@ -538,7 +675,7 @@ impl RawWebSocket {
     ) -> Result<(), ProviderError> {
         let error = self.stalled_write_error.clone().unwrap_or(error);
         if let Some(close) = self.peer_close_outcome.take() {
-            self.decoded.push_back(Ok(close));
+            self.decoded.push_back(close);
         }
         self.finish_terminal_io();
         if !self.decoded.is_empty() {
@@ -581,6 +718,7 @@ impl RawWebSocket {
             self.ensure_write_stall_deadline();
         }
         let inactivity_deadline = self.last_data_message + self.config.message_inactivity_timeout;
+        let heartbeat_deadline = self.next_application_ping;
         let write_stall_deadline = self.write_stall_deadline;
         if write_stall_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             let error = ProviderError::Timeout {
@@ -609,6 +747,12 @@ impl RawWebSocket {
                 };
                 self.fail_write_and_drain(error)
             },
+            () = tokio::time::sleep_until(heartbeat_deadline.unwrap_or(inactivity_deadline)), if heartbeat_deadline.is_some() => {
+                self.outbound.push_back(Message::Text(r#"{"method":"ping"}"#.into()));
+                self.next_application_ping = tokio::time::Instant::now().checked_add(APPLICATION_HEARTBEAT_INTERVAL);
+                self.ensure_write_stall_deadline();
+                Ok(())
+            },
         }
     }
 
@@ -629,7 +773,7 @@ impl RawWebSocket {
             return Poll::Ready(self.fail_write_and_drain(error));
         }
         let mut made_progress = false;
-        if self.decoded.len() < MAX_RETAINED_DECODED_OUTCOMES {
+        if self.decoded.len() <= MAX_RETAINED_DECODED_OUTCOMES - MAX_DECODED_OUTCOMES_PER_FRAME {
             match Stream::poll_next(Pin::new(&mut self.stream), cx) {
                 Poll::Ready(Some(Ok(message))) => {
                     let is_data = matches!(message, Message::Text(_) | Message::Binary(_));
@@ -646,13 +790,21 @@ impl RawWebSocket {
                     if self.stalled_write_error.is_none() {
                         self.ensure_write_stall_deadline();
                     }
-                    let decoded =
-                        decode_ws_frame(message, &self.instrument, self.timeframe, &self.config);
-                    if matches!(&decoded, DecodedFrame::Close(_)) {
+                    decode_ws_frame(
+                        &mut self.codec,
+                        message,
+                        &self.instrument,
+                        self.timeframe,
+                        &self.config,
+                        &mut self.decoded,
+                    );
+                    if let Some(close_index) = self
+                        .decoded
+                        .iter()
+                        .position(|decoded| matches!(decoded, DecodedFrame::Close(_)))
+                    {
                         self.outbound.clear();
-                        self.peer_close_outcome = Some(decoded);
-                    } else {
-                        self.decoded.push_back(Ok(decoded));
+                        self.peer_close_outcome = self.decoded.remove(close_index);
                     }
                     made_progress = true;
                 }
@@ -701,7 +853,7 @@ impl RawWebSocket {
             Poll::Ready(Ok(())) => {
                 self.flush_pending = false;
                 if let Some(close) = self.peer_close_outcome.take() {
-                    self.decoded.push_back(Ok(close));
+                    self.decoded.push_back(close);
                     let error = ProviderError::Transport {
                         context: self.context.clone(),
                         cause: SanitizedCause::Closed,
@@ -772,6 +924,7 @@ async fn connect_websocket_url(
         context,
         instrument: instrument.clone(),
         timeframe,
+        codec: HyperliquidWsCodec::new(),
         decoded: VecDeque::new(),
         outbound: VecDeque::new(),
         flush_pending: false,
@@ -780,6 +933,7 @@ async fn connect_websocket_url(
         terminal_io: false,
         pending_terminal_error: None,
         stalled_write_error: None,
+        next_application_ping: None,
         peer_close_outcome: None,
     })
 }
@@ -938,7 +1092,10 @@ impl HyperliquidProvider {
         base_url: impl AsRef<str>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, ProviderError> {
-        Self::new_test_with_config_and_clock(HyperliquidTestConfig::loopback(base_url.as_ref()), clock)
+        Self::new_test_with_config_and_clock(
+            HyperliquidTestConfig::loopback(base_url.as_ref()),
+            clock,
+        )
     }
 
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -991,10 +1148,7 @@ impl HyperliquidProvider {
             not(feature = "production-transport")
         ))]
         ws_base_url: Option<String>,
-        #[cfg(all(
-            feature = "test-transport",
-            not(feature = "production-transport")
-        ))]
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         now_ms: Option<i64>,
     ) -> Result<Self, ProviderError> {
         if request_timeout.is_zero() || body_limit == 0 || rate_limit_fallback.is_zero() {
@@ -1389,15 +1543,6 @@ impl HyperliquidProvider {
         generation: GapGeneration,
         age_deadline: MonoInstant,
     ) -> Result<GenerationOutcome, ProviderError> {
-        send_market(
-            sender,
-            &request.cancellation,
-            MarketEvent::Status {
-                generation: Some(generation),
-                status: ConnectionStatus::GapSync,
-            },
-        )
-        .await?;
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         if self.live.stalled_write_probe_frames != 0 {
             let payload_size = self
@@ -1422,6 +1567,44 @@ impl HyperliquidProvider {
             () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
             result = socket.send(Message::Text(subscribe.into())) => result?,
         }
+        let ack_deadline = checked_deadline(self.clock.now(), self.live.subscribe_ack_timeout)
+            .map_err(|_| ProviderError::Invariant("subscribe-ack deadline overflow"))?;
+        loop {
+            tokio::select! {
+                biased;
+                () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
+                frame = socket.read() => match frame {
+                    Err(ProviderError::Timeout { kind: TimeoutKind::WebSocketInactivity, .. }) if self.clock.now() >= ack_deadline => {
+                        return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout {
+                            context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe),
+                            kind: TimeoutKind::SubscribeAck,
+                        }));
+                    }
+                    Err(error) => return Ok(GenerationOutcome::Reconnect(error)),
+                    Ok(DecodedFrame::SubscribeAccepted) => break,
+                    Ok(DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => {}
+                    Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))),
+                    Ok(DecodedFrame::ProviderError(error)) => return Ok(GenerationOutcome::Reconnect(error)),
+                    Ok(DecodedFrame::Candle(_)) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "Hyperliquid candle arrived before subscribe acknowledgement"))),
+                },
+                () = self.clock.sleep_until(ack_deadline) => {
+                    return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout {
+                        context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe),
+                        kind: TimeoutKind::SubscribeAck,
+                    }));
+                }
+            }
+        }
+        socket.start_application_heartbeat();
+        send_market(
+            sender,
+            &request.cancellation,
+            MarketEvent::Status {
+                generation: Some(generation),
+                status: ConnectionStatus::GapSync,
+            },
+        )
+        .await?;
         let mut gate = self.gate_snapshot.clone();
         let first_deadline = checked_deadline(self.clock.now(), self.live.first_kline_timeout)
             .map_err(|_| ProviderError::Invariant("first-kline deadline overflow"))?;
@@ -1434,7 +1617,7 @@ impl HyperliquidProvider {
                 changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::InvalidBanExpiry); },
                 frame = socket.read() => match frame? {
                     DecodedFrame::Candle(candle) => break candle,
-                    DecodedFrame::Ignored => {
+                    DecodedFrame::Ignored | DecodedFrame::ApplicationPong => {
                         let now = self.clock.now();
                         if now >= first_deadline {
                             return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), kind: TimeoutKind::FirstKline }));
@@ -1443,6 +1626,7 @@ impl HyperliquidProvider {
                             return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached")));
                         }
                     }
+                    DecodedFrame::SubscribeAccepted => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))),
                     DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => return Ok(GenerationOutcome::Reconnect(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" })),
                     DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
                     DecodedFrame::ProviderError(error) => return Ok(GenerationOutcome::Reconnect(error)),
@@ -1546,7 +1730,13 @@ impl HyperliquidProvider {
                                         &mut target_open_time,
                                     )?;
                                 }
-                                Ok(DecodedFrame::Ignored) => {}
+                                Ok(DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => {}
+                                Ok(DecodedFrame::SubscribeAccepted) => {
+                                    return Ok(GenerationOutcome::Reconnect(live_protocol_error(
+                                        request,
+                                        "duplicate Hyperliquid subscribe acknowledgement",
+                                    )));
+                                }
                                 Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => {
                                     return Ok(GenerationOutcome::Reconnect(live_protocol_error(
                                         request,
@@ -1593,7 +1783,8 @@ impl HyperliquidProvider {
                                             apply_reconciliation_candle(&mut buffered, candle, &mut revision, &mut target_open_time)?;
                                             Ok((None, false))
                                         }
-                                        Ok(DecodedFrame::Ignored) => Ok((None, false)),
+                                        Ok(DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => Ok((None, false)),
+                                        Ok(DecodedFrame::SubscribeAccepted) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))), false)),
                                         Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))), false)),
                                         Ok(DecodedFrame::ProviderError(error)) | Err(error) if is_terminal_live_error(&error) => Err(error),
                                         Ok(DecodedFrame::ProviderError(error)) | Err(error) => Ok((Some(GenerationOutcome::Reconnect(error)), false)),
@@ -1620,7 +1811,8 @@ impl HyperliquidProvider {
                                                 apply_reconciliation_candle(&mut buffered, candle, &mut revision, &mut target_open_time)?;
                                                 Ok(None)
                                             }
-                                            Ok(DecodedFrame::Ignored) => Ok(None),
+                                            Ok(DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => Ok(None),
+                                            Ok(DecodedFrame::SubscribeAccepted) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement")))),
                                             Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect")))),
                                             Ok(DecodedFrame::ProviderError(error)) | Err(error) if is_terminal_live_error(&error) => Err(error),
                                             Ok(DecodedFrame::ProviderError(error)) | Err(error) => Ok(Some(GenerationOutcome::Reconnect(error))),
@@ -1741,7 +1933,7 @@ impl HyperliquidProvider {
                             apply_reconciliation_candle(&mut buffered, candle, &mut revision, &mut target_open_time)?;
                             break;
                         }
-                        DecodedFrame::Ignored => {
+                        DecodedFrame::Ignored | DecodedFrame::ApplicationPong => {
                             if let Some(ack) = request
                                 .reconcile_ack_rx
                                 .current()
@@ -1762,6 +1954,7 @@ impl HyperliquidProvider {
                                 return Ok(GenerationOutcome::Reconnect(ProviderError::ReconcileAckTimeout { generation, revision, target_open_time }));
                             }
                         }
+                        DecodedFrame::SubscribeAccepted => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))),
                         DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))),
                         DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
                         DecodedFrame::ProviderError(error) => deferred_reconnect = Some(error),
@@ -1843,7 +2036,11 @@ impl HyperliquidProvider {
                             }
                             coalesce_candle(&mut pending, candle);
                         }
-                        Ok(DecodedFrame::Ignored) => {}
+                        Ok(DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => {}
+                        Ok(DecodedFrame::SubscribeAccepted) => {
+                            let error = live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement");
+                            return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
+                        }
                         Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => {
                             let error = live_protocol_error(request, "WebSocket peer requested reconnect");
                             return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
@@ -2578,13 +2775,18 @@ pub fn classify_live_input_for_test(
     timeframe: Timeframe,
 ) -> LiveInputClassification {
     let error = match input {
-        Ok(DecodedFrame::Candle(_) | DecodedFrame::Ignored) => {
+        Ok(DecodedFrame::Candle(_) | DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => {
             return LiveInputClassification::Continue;
         }
         Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => ProviderError::Protocol {
             context: ErrorContext::operation(ErrorOperation::WebSocket)
                 .with_market(instrument, timeframe),
             detail: "WebSocket peer requested reconnect",
+        },
+        Ok(DecodedFrame::SubscribeAccepted) => ProviderError::Protocol {
+            context: ErrorContext::operation(ErrorOperation::WebSocket)
+                .with_market(instrument, timeframe),
+            detail: "duplicate Hyperliquid subscribe acknowledgement",
         },
         Ok(DecodedFrame::ProviderError(error)) | Err(error) => error,
     };
@@ -3003,9 +3205,8 @@ fn json_decimal(value: &Value) -> Option<f64> {
 }
 
 fn remap_instrument(spec: &InstrumentSpec) -> Result<Instrument, ProviderError> {
-    let local = canonicalize_instrument(spec).map_err(|_| {
-        ProviderError::Configuration("instrument is not valid for Hyperliquid")
-    })?;
+    let local = canonicalize_instrument(spec)
+        .map_err(|_| ProviderError::Configuration("instrument is not valid for Hyperliquid"))?;
     if let Some(dex) = spec.venue() {
         return Instrument::new(
             spec.provider().clone(),
