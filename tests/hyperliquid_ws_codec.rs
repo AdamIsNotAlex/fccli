@@ -6,7 +6,8 @@ use fccli::{
     error::{PayloadError, ProviderError},
     model::{FinalityAuthority, Instrument, Market, ProviderId, Timeframe},
     provider::hyperliquid::{
-        DecodedFrame, HyperliquidWsCodec, WsConfig, decode_ws_frame, test_websocket_url,
+        DecodedFrame, HyperliquidWsCodec, WsConfig, decode_ws_frame,
+        gap_target_within_generation_span_for_test, test_websocket_url,
     },
 };
 use serde_json::{Value, json};
@@ -213,6 +214,57 @@ fn invalid_temporal_frames_do_not_finalize_or_poison_retained_state() {
     };
     assert_eq!(closed.open_time(), CURRENT);
     assert_eq!(open.open_time(), CURRENT + 60_000);
+}
+
+#[test]
+fn far_future_first_and_successor_are_rejected_without_poisoning_state() {
+    const CURRENT: i64 = 1_704_067_200_000;
+    const FAR_FUTURE: i64 = 4_102_444_800_000;
+
+    let mut first_codec = HyperliquidWsCodec::new();
+    assert!(matches!(
+        decode(&mut first_codec, candle(FAR_FUTURE, "99999.00")).as_slice(),
+        [DecodedFrame::ProviderError(ProviderError::Payload {
+            source: PayloadError::MalformedProtocol,
+            ..
+        })]
+    ));
+    assert!(matches!(
+        decode(&mut first_codec, candle(CURRENT, "42075.75")).as_slice(),
+        [DecodedFrame::Candle(candle)] if candle.open_time() == CURRENT
+    ));
+
+    let mut successor_codec = HyperliquidWsCodec::new();
+    let _ = decode(&mut successor_codec, candle(CURRENT, "42075.75"));
+    assert!(matches!(
+        decode(&mut successor_codec, candle(FAR_FUTURE, "99999.00")).as_slice(),
+        [DecodedFrame::ProviderError(_)]
+    ));
+    let legitimate_skipped = decode(
+        &mut successor_codec,
+        candle(CURRENT + 3 * 60_000, "42100.00"),
+    );
+    let [DecodedFrame::Candle(closed), DecodedFrame::Candle(open)] = legitimate_skipped.as_slice()
+    else {
+        panic!("expected retained close then legitimate skipped successor");
+    };
+    assert_eq!(closed.open_time(), CURRENT);
+    assert_eq!(open.open_time(), CURRENT + 3 * 60_000);
+}
+
+#[test]
+fn reconciliation_span_accepts_skips_and_rejects_forged_targets() {
+    const START: i64 = 1_704_067_200_000;
+    assert!(gap_target_within_generation_span_for_test(
+        Timeframe::Minute1,
+        START,
+        START + 3 * 60_000,
+    ));
+    assert!(!gap_target_within_generation_span_for_test(
+        Timeframe::Minute1,
+        START,
+        START + 64_001 * 60_000,
+    ));
 }
 
 #[test]

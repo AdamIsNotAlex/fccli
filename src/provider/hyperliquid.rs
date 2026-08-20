@@ -83,6 +83,9 @@ pub const APPLICATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(50);
 pub const MAX_CONNECTION_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_SUPERVISOR_CAPACITY: usize = 65_536;
 const GAP_PAGE_LIMIT: u16 = 1000;
+const MAX_FUTURE_CANDLE_SKEW: Duration = Duration::from_secs(5 * 60);
+const MAX_GAP_RECONCILIATION_CANDLES: usize = 64_000;
+const MAX_GAP_RECONCILIATION_PAGES: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct LiveSupervisorConfig {
@@ -102,6 +105,12 @@ pub struct LiveSupervisorConfig {
     pub heartbeat_test_hook: Option<HeartbeatTestHook>,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub readiness_inactivity_test_hook: Option<Arc<Notify>>,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    pub readiness_decoded_ack_test_hook: Option<ReadinessDecodedAckTestHook>,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    pub subscribe_flush_test_hook: Option<SubscribeFlushTestHook>,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    pub force_stalled_write_after_readiness_frame: bool,
 }
 
 impl Default for LiveSupervisorConfig {
@@ -123,6 +132,12 @@ impl Default for LiveSupervisorConfig {
             heartbeat_test_hook: None,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             readiness_inactivity_test_hook: None,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            readiness_decoded_ack_test_hook: None,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            subscribe_flush_test_hook: None,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            force_stalled_write_after_readiness_frame: false,
         }
     }
 }
@@ -314,6 +329,20 @@ struct HlCandle {
 #[derive(Clone, Debug, Default)]
 pub struct HyperliquidWsCodec {
     retained_candle: Option<Candle>,
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+#[derive(Clone, Debug)]
+pub struct ReadinessDecodedAckTestHook {
+    pub observed: Arc<Notify>,
+    pub release: Arc<Notify>,
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+#[derive(Clone, Debug)]
+pub struct SubscribeFlushTestHook {
+    pub blocked: Arc<Notify>,
+    pub release: Arc<Notify>,
 }
 
 impl HyperliquidWsCodec {
@@ -597,6 +626,12 @@ pub struct RawWebSocket {
     heartbeat_test_hook: Option<HeartbeatTestHook>,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     readiness_inactivity_test_hook: Option<Arc<Notify>>,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    readiness_decoded_ack_test_hook: Option<ReadinessDecodedAckTestHook>,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    force_stalled_write_after_readiness_frame: bool,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    subscribe_flush_test_hook: Option<SubscribeFlushTestHook>,
 }
 
 impl RawWebSocket {
@@ -644,6 +679,31 @@ impl RawWebSocket {
             if self.readiness_drain_yielded {
                 return Poll::Pending;
             }
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            if let Some(hook) = &self.readiness_decoded_ack_test_hook
+                && self
+                    .decoded
+                    .iter()
+                    .any(|frame| matches!(frame, DecodedFrame::SubscribeAccepted))
+            {
+                hook.observed.notify_one();
+                let release = Arc::clone(&hook.release);
+                let waker = cx.waker().clone();
+                self.readiness_decoded_ack_test_hook = None;
+                tokio::spawn(async move {
+                    release.notified().await;
+                    waker.wake();
+                });
+                return Poll::Pending;
+            }
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            if self.force_stalled_write_after_readiness_frame && !self.decoded.is_empty() {
+                self.force_stalled_write_after_readiness_frame = false;
+                self.stalled_write_error = Some(ProviderError::Timeout {
+                    context: self.context.clone(),
+                    kind: TimeoutKind::StalledWrite,
+                });
+            }
             if let Some(input) = take_prioritized_readiness(
                 &mut self.decoded,
                 self.pending_terminal_error.take(),
@@ -685,6 +745,11 @@ impl RawWebSocket {
     pub async fn send(&mut self, message: Message) -> Result<(), ProviderError> {
         self.reject_terminal_write()?;
         self.outbound.push_back(message);
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        if let Some(hook) = self.subscribe_flush_test_hook.take() {
+            hook.blocked.notify_one();
+            hook.release.notified().await;
+        }
         self.ensure_write_stall_deadline();
         while !self.outbound.is_empty() || self.flush_pending {
             self.pump(true).await?;
@@ -1051,7 +1116,13 @@ async fn connect_websocket_url(
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         heartbeat_test_hook: None,
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        subscribe_flush_test_hook: None,
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         readiness_inactivity_test_hook: None,
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        readiness_decoded_ack_test_hook: None,
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        force_stalled_write_after_readiness_frame: false,
     })
 }
 fn coalesce_readiness_outcomes(decoded: &mut VecDeque<DecodedFrame>) {
@@ -1739,6 +1810,10 @@ impl HyperliquidProvider {
                 }
             }
         }
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        {
+            socket.subscribe_flush_test_hook = self.live.subscribe_flush_test_hook.clone();
+        }
         let subscribe = subscribe_message(&request.instrument, request.timeframe);
         tokio::select! {
             biased;
@@ -1751,6 +1826,10 @@ impl HyperliquidProvider {
         {
             socket.readiness_inactivity_test_hook =
                 self.live.readiness_inactivity_test_hook.clone();
+            socket.readiness_decoded_ack_test_hook =
+                self.live.readiness_decoded_ack_test_hook.clone();
+            socket.force_stalled_write_after_readiness_frame =
+                self.live.force_stalled_write_after_readiness_frame;
         }
         loop {
             let inactivity_deadline = socket.inactivity_deadline();
@@ -1856,6 +1935,7 @@ impl HyperliquidProvider {
         }
         let mut deferred_reconnect: Option<ProviderError> = None;
         let mut rest_synced_through = None;
+        let mut reconciliation_pages = 0_usize;
 
         loop {
             let mut cursor = match rest_synced_through {
@@ -1863,6 +1943,24 @@ impl HyperliquidProvider {
                 None => start,
             };
             while cursor <= target_open_time {
+                if !gap_target_within_generation_span(
+                    request.timeframe,
+                    cursor,
+                    target_open_time,
+                    MAX_GAP_RECONCILIATION_CANDLES,
+                ) {
+                    return Ok(GenerationOutcome::Reconnect(live_protocol_error(
+                        request,
+                        "Hyperliquid gap reconciliation target exceeds the per-generation span limit",
+                    )));
+                }
+                reconciliation_pages += 1;
+                if reconciliation_pages > MAX_GAP_RECONCILIATION_PAGES {
+                    return Ok(GenerationOutcome::Reconnect(live_protocol_error(
+                        request,
+                        "Hyperliquid gap reconciliation exceeded the per-generation page limit",
+                    )));
+                }
                 let request_target = target_open_time;
                 let history_request =
                     HistoryRequest::gap(cursor, request_target, GAP_PAGE_LIMIT)
@@ -3209,7 +3307,6 @@ fn decode_candles(
     }
     Ok(candles)
 }
-
 fn validate_candle_time_window(
     candle: &HlCandle,
     timeframe: Timeframe,
@@ -3217,10 +3314,36 @@ fn validate_candle_time_window(
 ) -> Result<(), ProviderError> {
     let expected_close = timeframe_successor_open(timeframe, candle.open_time)
         .and_then(|successor| successor.checked_sub(1));
-    if expected_close != Some(candle.close_time) {
+    let future_ceiling = unix_now_ms().ok().and_then(|now| {
+        i64::try_from(MAX_FUTURE_CANDLE_SKEW.as_millis())
+            .ok()
+            .and_then(|skew| now.checked_add(skew))
+    });
+    if expected_close != Some(candle.close_time)
+        || future_ceiling.is_none_or(|ceiling| candle.open_time > ceiling)
+    {
         return Err(payload(context, PayloadError::MalformedProtocol));
     }
     Ok(())
+}
+
+fn gap_target_within_generation_span(
+    timeframe: Timeframe,
+    start: i64,
+    target: i64,
+    maximum_candles: usize,
+) -> bool {
+    let mut cursor = start;
+    for _ in 0..maximum_candles {
+        if cursor >= target {
+            return true;
+        }
+        let Some(next) = timeframe_successor_open(timeframe, cursor) else {
+            return false;
+        };
+        cursor = next;
+    }
+    cursor >= target
 }
 
 fn timeframe_successor_open(timeframe: Timeframe, open_time: i64) -> Option<i64> {
@@ -3238,6 +3361,7 @@ fn timeframe_successor_open(timeframe: Timeframe, open_time: i64) -> Option<i64>
         Timeframe::Hour8 => Some(28_800_000),
         Timeframe::Hour12 => Some(43_200_000),
         Timeframe::Day1 => Some(86_400_000),
+
         Timeframe::Day3 => Some(259_200_000),
         Timeframe::Week1 => Some(604_800_000),
         Timeframe::Month1 => None,
@@ -3264,6 +3388,15 @@ fn timeframe_successor_open(timeframe: Timeframe, open_time: i64) -> Option<i64>
         .unix_timestamp_nanos()
         / 1_000_000;
     i64::try_from(successor).ok()
+}
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+#[must_use]
+pub fn gap_target_within_generation_span_for_test(
+    timeframe: Timeframe,
+    start: i64,
+    target: i64,
+) -> bool {
+    gap_target_within_generation_span(timeframe, start, target, MAX_GAP_RECONCILIATION_CANDLES)
 }
 
 fn candle_market_matches(
