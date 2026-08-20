@@ -2,7 +2,7 @@
 
 - 权威实施清单与进度记录：[`refactor.todo.md`](./refactor.todo.md)。后续会话应按其中的依赖和 accounting 表选择第一个 ready chunk；本文保留论证和协议背景，不作为完成状态来源。
 - 规划基线：分支 `feat/abstration`，提交 `3f6b379`；基线工作树干净，provider runtime 重构尚未开始。这里记录的是恢复实施时的假设，不应在实现后继续当作当前状态证据。
-- 实施约束：先锁定 provider 协议契约，再依次抽取 WebSocket/EventEmitter、live engine、HTTP runtime，之后加入 capabilities/policy 并通用化 registry；`binance.rs` 与 `hyperliquid.rs` 默认顺序修改。
+- 实施约束：先锁定 provider 协议契约，再抽取 WebSocket/EventEmitter；抽 live engine 时永久加入最小公共 capabilities 基础并让 live gap 使用其唯一 page-limit 来源，随后抽 HTTP runtime，再完成其余 capability/policy 消费迁移并通用化 registry；`binance.rs` 与 `hyperliquid.rs` 默认顺序修改。
 - 明确不适用的机制（动态 Binance subscribe、跨 provider 心跳/finality/rate-limit 语义移植、Hyperliquid 严格 over-limit 拒绝等）是约束，不是待实现功能；完整记录见 tracker 的 C-01—C-10。
 
 ---
@@ -321,7 +321,8 @@ struct ProviderCapabilities {
 - live gap engine 不再硬编码 `GAP_PAGE_LIMIT = 1000`。
 - 第三个 provider 不需要在不同调用入口重复做 capability check。
 
-能力切换的公共接口决定也固定下来：`MarketDataProvider::capabilities()` 是**无默认实现的必需方法**。实现范围包括 Binance、Hyperliquid，以及 `tests/provider_contract.rs`、`tests/app_live_contract.rs`、`tests/history_coordinator.rs`、`tests/snapshot_runner.rs` 中全部 fake provider。`history_page_limit` 的语义是 provider 单次 history 请求所允许的**非零最大行数**，不是所有调用入口都必须请求的精确行数。消费范围包括 `src/app.rs` 的初始启动和交互切换、`src/snapshot.rs`、`src/history.rs` 的 older-page 请求，以及 shared live gap engine；这些入口必须在网络前验证 market/timeframe 和非零上限。初始 app/交互切换继续以 `INITIAL_HISTORY_LIMIT = 500` 为期望行数，snapshot 继续以 `SNAPSHOT_HISTORY_LIMIT = 500` 为期望行数，但实际请求量必须在网络 I/O 前计算为 `min(desired_limit, capabilities.history_page_limit)`；保留这两个表达产品意图的常量及其调用入口测试。older-history 与 shared live gap 没有独立的产品期望值，直接使用 advertised maximum。删除 provider-local `GAP_PAGE_LIMIT` 和 `history::HISTORY_PAGE_LIMIT`，不能保留第二套 provider maximum 来源；provider decoder/request validation 继续作为 defense in depth。
+能力切换的公共接口决定也固定下来：`MarketDataProvider::capabilities()` 是**无默认实现的必需方法**。实现范围包括 Binance、Hyperliquid，以及 `tests/provider_contract.rs`、`tests/app_live_contract.rs`、`tests/history_coordinator.rs`、`tests/snapshot_runner.rs` 中全部 fake provider。`history_page_limit` 的语义是 provider 单次 history 请求所允许的**非零最大行数**，不是所有调用入口都必须请求的精确行数。消费范围包括 `src/app.rs` 的初始启动和交互切换、`src/snapshot.rs`、`src/history.rs` 的 older-page 请求，以及 shared live gap engine；这些入口必须在网络前验证适用于该入口的 market/timeframe 和非零上限。初始 app/交互切换继续以 `INITIAL_HISTORY_LIMIT = 500` 为期望行数，snapshot 继续以 `SNAPSHOT_HISTORY_LIMIT = 500` 为期望行数，但实际请求量必须在网络 I/O 前计算为 `min(desired_limit, capabilities.history_page_limit)`；保留这两个表达产品意图的常量及其调用入口测试。older-history 与 shared live gap 没有独立的产品期望值，直接使用 advertised maximum。删除 provider-local `GAP_PAGE_LIMIT` 和 `history::HISTORY_PAGE_LIMIT`；保留 provider decoder/request validation 作为 defense in depth。
+为保持每个 chunk 都是单一来源且可独立通过，能力接口分两步落地，但不是临时 shim：抽 shared live engine 的同一 chunk 先永久引入上述完整 `ProviderCapabilities` 类型和无默认 `capabilities()` 方法，给两个生产 provider 与全部现有 fake provider 提供显式实现，并让 shared live gap 立即只从该公共能力读取、在任何 gap network I/O 前拒绝零值、且精确使用较小的 advertised maximum。该 chunk 是 shared-live `history_page_limit` 消费及其零值/较小上限合同的唯一实现与测试所有者，不创建内部 history-limit hook，也不保留第二份 live page-limit policy。后续 capability-consumer chunk 只把已经存在的同一公共能力接到 app、snapshot、older-history 和这些入口 genuinely new 的 market/timeframe preflight，补齐对应的跨入口合同测试并删除届时失去用途的 caller-local 常量；它不重新定义接口、不修改或重新测试 shared-live page-limit 合同，也不迁移 live engine 的所有权。未修改的 provider-live suites 只可作为回归 gate。
 
 Binance 实现简单返回全部周期即可。
 
@@ -471,7 +472,7 @@ live_config()
 connection_rotation()
 ```
 
-`connection_rotation()` 只属于 live runtime 的内部 provider policy/hook，不出现在公共 `ProviderCapabilities` 中。shared live gap 从公共 capabilities 读取并验证非零 `history_page_limit`，再将它作为单次 history 请求的最大行数。
+`ProviderCapabilities`、无默认 `capabilities()`、两个生产实现和全部现有 fake 实现在 shared live engine chunk 中先永久落地；shared live gap 从该唯一公共来源读取，在 gap network I/O 前验证非零 `history_page_limit`，再将它作为单次 history 请求的最大行数，并由该 chunk 独占零值拒绝和较小 advertised maximum 精确消费的合同测试。绝不增加内部 `history_page_limit` hook，也不保留 provider-local live page-limit policy。`connection_rotation()` 只属于 live runtime 的内部 provider policy/hook，不出现在公共 `ProviderCapabilities` 中。后续 capability-consumer chunk 仅迁移 app、snapshot、older-history 与这些入口 genuinely new 的 market/timeframe preflight；不再拥有 shared-live page-limit 行为或测试，未改动的 provider-live suites 仅作为回归 gate。
 
 其中 `connect_ready_socket()` 的语义必须是：
 
@@ -643,9 +644,9 @@ Hyperliquid 保留：
 
 1. **先补 Hyperliquid 协议测试**：subscribe ack、JSON heartbeat、finality、rate-limit。
 2. **抽 WebSocket transport 和 EventEmitter**：几乎纯机械移动，风险最低。
-3. **抽 live reconciliation engine**：以现有 Binance 42 个 live tests 作为迁移保护。
+3. **抽 live reconciliation engine，并同时永久引入最小公共 ProviderCapabilities 基础**：完整类型/必需方法/所有实现一次落地，shared live gap 当场切到唯一的 `history_page_limit` 来源；以现有 Binance live tests 作为迁移保护。
 4. **抽 HTTP runtime 和 rate-limit policy**。
-5. **加入 ProviderCapabilities**。
+5. **完成 ProviderCapabilities 消费迁移**：接入 app、snapshot、older-history 与 market/timeframe preflight，删除旧调用端常量；不重新定义接口。
 6. **最后通用化 Registry**。
 7. 新增第三个 provider 时，只实现 endpoint、codec、canonicalization 和 protocol policy。
 

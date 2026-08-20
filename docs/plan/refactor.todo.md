@@ -141,15 +141,21 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 
 **Status:** [ ]  
 **Depends on:** R04  
-**Owned files:** `src/provider/runtime/live.rs` (new), `src/provider/runtime/mod.rs`, `src/provider/binance.rs`, `src/provider/hyperliquid.rs`, `tests/binance_live.rs`, `tests/hyperliquid_live.rs`  
-**Parallel safety:** Sequential; highest overlap across both providers and both live suites.  
-**Commit boundary:** `refactor(provider): share live supervision engine`
+**Owned files:** `src/provider/mod.rs`, `src/provider/runtime/live.rs` (new), `src/provider/runtime/mod.rs`, `src/provider/binance.rs`, `src/provider/hyperliquid.rs`, `tests/provider_contract.rs`, `tests/app_live_contract.rs`, `tests/history_coordinator.rs`, `tests/snapshot_runner.rs`, `tests/binance_live.rs`, `tests/hyperliquid_live.rs`  
+**Parallel safety:** Sequential; highest overlap across both providers, both live suites, the provider trait, and every current fake provider needed for a green required-method cutover.  
+**Commit boundary:** `refactor(provider): share live supervision engine and capability source`
 
 - [ ] Move `LiveSupervisorConfig`, supervision, generation lifecycle, connected loop, gap REST/WS reconciliation, accepted-watermark pursuit, revision/ack gate, backoff, generation invalidation/purge, queue saturation handling, emergency barrier, classifications, cancellation precedence, and filtered event stream into `runtime/live.rs`.
-- [ ] Define only the minimal internal hooks needed for request validation, ready socket connection, history, rate gate, live config, history page limit, and connection rotation.
+- [ ] Permanently add public `ProviderCapabilities { markets, timeframes, history_page_limit }` and required, no-default `MarketDataProvider::capabilities()`. Define `history_page_limit` as a non-zero provider maximum per history request, not an exact caller request size.
+- [ ] Implement explicit capabilities for Binance, Hyperliquid, and every current fake provider in `provider_contract`, `app_live_contract`, `history_coordinator`, and `snapshot_runner` so the trait cutover is complete and this commit is green. Binance advertises all supported timeframes; Hyperliquid excludes 1s/6h. Do not yet migrate non-live consumer behavior owned by R08.
+- [ ] Define only the minimal internal hooks needed for request validation, ready socket connection, history, rate gate, live config, and connection rotation. Do not define an internal history-page-limit hook: shared live gap must read, validate as non-zero before network I/O, and use `capabilities().history_page_limit` as its sole maximum; remove provider-local live `GAP_PAGE_LIMIT` ownership in this commit.
 - [ ] Enforce that `connect_ready_socket()` returns only after provider-specific subscription establishment; Binance URL handshake and Hyperliquid subscribe ack remain provider-owned.
 - [ ] Preserve REST concurrency during WS activity, first-candle timeout semantics, rate-gate/backoff deadline combination, reconnect generation purge, and terminal/recoverable error precedence.
 - [ ] Migrate every provider caller and both live suites' imports; remove duplicated live state-machine code/types/test exports in the same commit. Keep semantic test relocation for R06.
+- [ ] Add/adjust live contract coverage proving a zero advertised history maximum is rejected before gap network I/O and a smaller fake advertised maximum is used exactly; capability-only fake updates in the other contract suites must not change their pre-R08 request behavior.
+- [ ] Verify: `cargo test --locked --test provider_contract --no-default-features --features test-transport`.
+- [ ] Verify: `cargo test --locked --test history_coordinator --no-default-features --features test-transport`.
+- [ ] Verify: `cargo test --locked --test snapshot_runner --no-default-features --features test-transport`.
 - [ ] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport`.
 - [ ] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport`.
 - [ ] Verify: `cargo test --locked --test app_live_contract --no-default-features --features test-transport`.
@@ -190,28 +196,26 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 - [ ] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport`.
 - [ ] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport`.
 
-### R08 — Add capabilities and internal protocol policy
+### R08 — Complete capability consumers and internal protocol policy
 
 **Status:** [ ]  
 **Depends on:** R07  
-**Owned files:** `src/provider/mod.rs`, `src/provider/runtime/live.rs`, `src/provider/binance.rs`, `src/provider/hyperliquid.rs`, `src/app.rs`, `src/history.rs`, `src/snapshot.rs`, `tests/provider_contract.rs`, `tests/app_live_contract.rs`, `tests/history_coordinator.rs`, `tests/snapshot_runner.rs`, `tests/provider_runtime_live.rs`, `tests/binance_live.rs`, `tests/hyperliquid_live.rs`  
-**Parallel safety:** Sequential; overlaps both providers, live runtime, every caller-visible capability consumer, and every current fake `MarketDataProvider`.  
-**Commit boundary:** `feat(provider): expose capabilities and isolate protocol policy`
+**Owned files:** `src/app.rs`, `src/history.rs`, `src/snapshot.rs`, `tests/provider_contract.rs`, `tests/app_live_contract.rs`, `tests/history_coordinator.rs`, `tests/snapshot_runner.rs`  
+**Parallel safety:** Sequential with chunks touching app, history, snapshot, or their contract suites; it does not own either provider implementation, shared live runtime, or provider-live suite.  
+**Commit boundary:** `feat(provider): complete capability consumers and isolate protocol policy`
 
-- [ ] Add `fn capabilities(&self) -> ProviderCapabilities` as a required `MarketDataProvider` method with no default. `ProviderCapabilities` exposes supported markets, supported timeframes, and a non-zero `history_page_limit` whose contract is the provider maximum rows accepted by one history request; it is not an exact size every caller must request. Protocol-only policy remains internal.
-- [ ] Implement the required method for Binance, Hyperliquid, and every current fake provider in `provider_contract`, `app_live_contract`, `history_coordinator`, and `snapshot_runner`; fake capabilities must be explicit per test so maximum-size/preflight assertions cannot accidentally inherit production defaults. Validate/reject a zero advertised history maximum before network I/O.
-- [ ] Implement Binance capabilities with all supported timeframes and Hyperliquid capabilities with 1s/6h excluded.
-- [ ] Route initial app startup, interactive switch preparation, snapshot startup, `HistoryCoordinator` older-page requests, and shared live gap requests through capabilities before network I/O. Preserve `INITIAL_HISTORY_LIMIT = 500` for initial app/switch requests and `SNAPSHOT_HISTORY_LIMIT = 500` for snapshot requests as desired product request sizes; each actual request must use `min(desired_limit, capabilities.history_page_limit)`. Older-history and shared live gap requests use the advertised maximum directly. Remove provider-local `GAP_PAGE_LIMIT`, `history::HISTORY_PAGE_LIMIT`, and duplicated Hyperliquid timeframe-preflight callsites once every caller consumes the advertised maximum; retain the two intentional 500-row desired-size constants and provider decoder/request validation as defense in depth.
-- [ ] Keep subscription style, heartbeat, finality evidence, rate-limit semantics, connection rotation, and payload retention as internal policies/hooks rather than public trait fields. In particular, expose no `connection_rotation` field in `ProviderCapabilities`; the shared live runtime obtains rotation only through its internal provider policy/hook.
-- [ ] Add contract tests for pre-network rejection at initial app/snapshot/switch/live/history entry points, including a zero advertised maximum; complete Binance support; and Hyperliquid exclusions. In `app_live_contract` and `snapshot_runner`, assert the retained desired size is 500 when the provider maximum is at least 500 and is capped to a smaller fake maximum before any request. In `history_coordinator` and the shared/provider live contract suites, assert older-history and gap requests use the fake advertised maximum exactly. In `provider_contract`, assert capabilities describe a provider maximum and contain no protocol-policy field.
-- [ ] Verify: `cargo test --locked --test provider_contract --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test history_coordinator --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test snapshot_runner --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test app_live_contract --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test binance_rest --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test hyperliquid_rest --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport`.
+- [ ] Reuse the single public `ProviderCapabilities` type and required `MarketDataProvider::capabilities()` introduced by R05; do not redefine them, add a compatibility method, or introduce another history-limit source. Confirm through `provider_contract` that the public contract remains supported markets, supported timeframes, and a non-zero provider maximum per history request, with no protocol-policy field.
+- [ ] Route initial app startup, interactive switch preparation, snapshot startup, and `HistoryCoordinator` older-page requests through capabilities before network I/O. Do not modify shared live gap consumption: R05 solely owns its `history_page_limit` behavior and the zero/smaller-limit contracts.
+- [ ] Preserve `INITIAL_HISTORY_LIMIT = 500` for initial app/switch requests and `SNAPSHOT_HISTORY_LIMIT = 500` for snapshot requests as desired product request sizes; each actual request uses `min(desired_limit, capabilities.history_page_limit)`. Older-history uses the advertised maximum directly. R05 already makes shared live gap use that maximum directly.
+- [ ] Add market/timeframe preflight to each newly migrated app, switch, snapshot, and older-history consumer, including Binance support and Hyperliquid 1s/6h exclusions, and reject a zero advertised history maximum at those consumers before network I/O. Remove `history::HISTORY_PAGE_LIMIT` and duplicated consumer-side Hyperliquid timeframe-preflight callsites once these remaining consumers use capabilities; R05 has already removed provider-local live `GAP_PAGE_LIMIT` ownership. Retain the two intentional 500-row desired-size constants and provider decoder/request validation as defense in depth.
+- [ ] Preserve subscription style, heartbeat, finality evidence, rate-limit semantics, connection rotation, and payload retention as internal policies/hooks rather than public trait fields. In particular, expose no `connection_rotation` field in `ProviderCapabilities`; R08 does not change the shared live runtime or provider policy implementations.
+- [ ] Add contract tests for pre-network market/timeframe/zero-limit rejection at the newly migrated initial app, snapshot, switch, and older-history entry points; complete Binance support; and Hyperliquid exclusions. In `app_live_contract` and `snapshot_runner`, assert the retained desired size is 500 when the provider maximum is at least 500 and is capped to a smaller fake maximum before any request. In `history_coordinator`, assert older-history uses the fake advertised maximum exactly. In `provider_contract`, assert capabilities describe a provider maximum and contain no protocol-policy field. Do not duplicate R05's shared-live zero-limit or exact gap-limit tests in any R08-owned suite.
+- [ ] Verify owned test: `cargo test --locked --test provider_contract --no-default-features --features test-transport`.
+- [ ] Verify owned test: `cargo test --locked --test history_coordinator --no-default-features --features test-transport`.
+- [ ] Verify owned test: `cargo test --locked --test snapshot_runner --no-default-features --features test-transport`.
+- [ ] Verify owned test: `cargo test --locked --test app_live_contract --no-default-features --features test-transport`.
+- [ ] Regression gate only (suite unchanged by R08): `cargo test --locked --test binance_live --no-default-features --features test-transport`.
+- [ ] Regression gate only (suite unchanged by R08): `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport`.
 
 ### R09 — Generalize ProviderRegistry
 
@@ -313,12 +317,12 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 | R02 | [x] | R01 | no | Complete; formatted exact gates passed: `hyperliquid_rest` 17/17, `binance_rest` 23/23, and `binance_live` 42/42; temporal/window/order validation and exact rate-gate deadlines covered |
 | R03 | [x] | R02 | no | Complete; warning-free `cargo check` and formatted exact gates passed: `binance_ws_codec` 23/23, `hyperliquid_ws_codec` 11/11, `binance_live` 42/42, and `hyperliquid_live` 26/26; cancellation-aware close finalization and production-private codec outcomes verified |
 | R04 | [x] | R03 | no | Complete; formatted exact gates passed: `provider_runtime_websocket` 26/26, `binance_ws_codec` 4/4, `hyperliquid_ws_codec` 11/11, `binance_live` 40/40, and `hyperliquid_live` 27/27; identical-control coalescing, distinct-control blocking/resume/order, real provider saturation integrations, deterministic synchronization hooks, and queued-emergency shutdown suppression verified |
-| R05 | [ ] | R04 | yes | Ready; R04 complete |
+| R05 | [ ] | R04 | yes | Ready; R04 complete. This chunk owns the permanent `ProviderCapabilities`/required-method cutover for all implementations and switches shared live gap to the sole public `history_page_limit` source; R08 only migrates remaining consumers |
 | R06 | [ ] | R05 | no | — |
 | R07 | [ ] | R06 | no | — |
-| R08 | [ ] | R07 | no | — |
+| R08 | [ ] | R07 | no | Completes app/snapshot/older-history and market/timeframe capability consumption after the R05 interface foundation; no second capability or live-limit source |
 | R09 | [ ] | R08 | no | — |
 | R10 | [ ] | R09 | no | — |
 | R11 | [ ] | R10 | no | — |
 
-**Next dependency-ready unchecked chunk:** R05 — extract the shared live supervision engine while preserving both provider-live integrations.
+**Next dependency-ready unchecked chunk:** R05 — extract the shared live supervision engine, permanently introduce the single public capability source for every provider/fake, and switch live gap pagination to it while preserving both provider-live integrations.
