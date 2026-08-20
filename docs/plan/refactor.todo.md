@@ -86,13 +86,13 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 **Commit boundary:** `fix(provider): bound Hyperliquid REST and separate rate limits`
 
 - [x] Replace whole-response `Value` plus per-row clone decoding with a Hyperliquid streaming bounded array visitor. Define `HYPERLIQUID_MAX_RESPONSE_ROWS = 1001` independently from `requested_limit` (which remains `1..=1000`); the existing capped HTTP body remains an additional byte bound, not the row-count contract.
-- [x] Validate required candle field `n` as a non-negative integer while retaining number/string decimal parsing, symbol/interval validation, and malformed-row rejection.
+- [x] Validate required candle field `n` as a non-negative integer while retaining number/string decimal parsing, symbol/interval validation, and malformed-row rejection. Validate every REST row before retention, including discarded `Gap` overlap rows, for timeframe-grid alignment, exact close boundary, response-window membership, and strict increasing/non-duplicate order.
 - [x] Exact retention/absolute-limit behavior: for `N = requested_limit`, arrays of `0..=N` rows are accepted unchanged; arrays of `N+1..=1001` valid rows are accepted and truncated while streaming (`Latest`/`Older` retain the newest N with an N-slot ring/deque, `Gap` retains the earliest N and validates but does not retain later rows); row 1002 causes a protocol/payload oversized-array error with no partial result. Thus the documented 1001-row overlap is valid even when `N == 1000`, while 1002 rows is resource/protocol abuse. Add boundary tests for `N`, `N+1`, 1001, and 1002 for every request kind.
 - [x] Add/retain Binance contracts for strict 12-field rows, over-requested-limit rejection, `-1121`, 429 fallback/Retry-After, and 418 valid-expiry versus invalid/missing-expiry process block.
-- [x] Remove Hyperliquid’s Binance-only invalid-ban/process-block branches; test 429 valid Retry-After or local fallback and prove absent Binance ban metadata never causes permanent block.
+- [x] Remove Hyperliquid’s Binance-only invalid-ban/process-block branches; test exact ManualClock deadlines for 429 valid `Retry-After`, missing/invalid-header local fallback, and prove absent Binance ban metadata never causes permanent block.
 
-**Implementation and verification notes:** Hyperliquid REST now deserializes through a bounded array visitor with an independent 1,001-row absolute ceiling, validates every streamed row including required non-negative integer `n`, retains newest-N for `Latest`/`Older` and earliest-N for `Gap`, and rejects row 1,002 without returning a partial result. Focused REST coverage exercises N, N+1, 1,001, and 1,002 for every request kind, the 1,000-request/1,001-overlap case, invalid `n`, and 429 `Retry-After`/fallback behavior. Hyperliquid 429 handling only publishes a timed gate and no longer creates or emits Binance invalid-ban/process-block outcomes. Existing Binance strict-row, over-limit, `-1121`, 429, and 418 contracts remain unchanged. The orchestrator passed the formatted exact gates: `hyperliquid_rest` 12/12, `binance_rest` 23/23, and `binance_live` 42/42.
-- [x] Verify: `cargo test --locked --test hyperliquid_rest --no-default-features --features test-transport` (12 passed).
+**Implementation and verification notes:** Hyperliquid REST passes bounded response-window context into its streaming decoder and validates every row before retention for timeframe-grid alignment, exact close boundary, response-window membership, and strict increasing/non-duplicate order. Focused regressions cover off-grid opens, inconsistent closes, out-of-window rows, duplicate/regressive ordering, and malformed discarded `Gap` rows. Boundary coverage preserves the documented 1,001-row overlap while rejecting row 1,002. Hyperliquid 429 tests assert exact ManualClock deadlines for `Retry-After: 7`, missing-header fallback, and invalid-header fallback, and Hyperliquid remains free of Binance-only permanent-ban behavior. Formatted exact gates passed: `hyperliquid_rest` 17/17, `binance_rest` 23/23, and `binance_live` 42/42.
+- [x] Verify: `cargo test --locked --test hyperliquid_rest --no-default-features --features test-transport` (17 passed).
 - [x] Verify: `cargo test --locked --test binance_rest --no-default-features --features test-transport` (23 passed).
 - [x] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport` (42 passed).
 
@@ -307,7 +307,7 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 | ID | Status | Depends on | Ready now | Evidence / blocker |
 |---|---|---|---|---|
 | R01 | [x] | — | no | Complete; formatted codec gate 11/11 and live gate 25/25, including `Month1` exact-limit, overflow, and unrepresentable-endpoint coverage |
-| R02 | [x] | R01 | no | Complete; formatted exact gates passed: `hyperliquid_rest` 12/12, `binance_rest` 23/23, and `binance_live` 42/42 |
+| R02 | [x] | R01 | no | Complete; formatted exact gates passed: `hyperliquid_rest` 17/17, `binance_rest` 23/23, and `binance_live` 42/42; temporal/window/order validation and exact rate-gate deadlines covered |
 | R03 | [ ] | R02 | yes | Dependency satisfied |
 | R04 | [ ] | R03 | no | — |
 | R05 | [ ] | R04 | no | — |

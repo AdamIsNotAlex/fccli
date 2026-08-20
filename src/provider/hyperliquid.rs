@@ -1598,12 +1598,21 @@ impl HyperliquidProvider {
                 return Err(map_http_error(status, &bytes, context));
             }
             let bytes = read_capped(response, self.body_limit, &cancellation, &context).await?;
+            let (window_start, window_end) = response_validation_window(
+                timeframe,
+                request.kind(),
+                request.limit(),
+                start_time,
+                end_time,
+            )?;
             decode_candles(
                 &bytes,
                 request.kind(),
                 request.limit(),
                 instrument,
                 timeframe,
+                window_start,
+                window_end,
                 context,
             )
         }
@@ -3474,6 +3483,8 @@ struct BoundedCandleVisitor<'a> {
     requested_limit: usize,
     instrument: &'a Instrument,
     timeframe: Timeframe,
+    window_start: i64,
+    window_end: i64,
     context: &'a ErrorContext,
 }
 
@@ -3490,6 +3501,7 @@ impl<'de> Visitor<'de> for BoundedCandleVisitor<'_> {
     {
         let mut candles = VecDeque::with_capacity(self.requested_limit);
         let mut row_count = 0_usize;
+        let mut previous_open = None;
         while row_count < HYPERLIQUID_MAX_RESPONSE_ROWS {
             let Some(raw) = sequence.next_element::<HlCandle>()? else {
                 return Ok(candles.into_iter().collect());
@@ -3497,6 +3509,16 @@ impl<'de> Visitor<'de> for BoundedCandleVisitor<'_> {
             row_count += 1;
             candle_market_matches(&raw, self.instrument, self.timeframe, self.context, "REST")
                 .map_err(serde::de::Error::custom)?;
+            validate_rest_candle_time_window(
+                &raw,
+                self.timeframe,
+                self.window_start,
+                self.window_end,
+                previous_open,
+                self.context,
+            )
+            .map_err(serde::de::Error::custom)?;
+            previous_open = Some(raw.open_time);
             let (open, high, low, close, volume) =
                 candle_ohlcv(&raw, self.context).map_err(serde::de::Error::custom)?;
             let candle = Candle::from_rest(
@@ -3536,6 +3558,8 @@ fn decode_candles(
     requested_limit: u16,
     instrument: &Instrument,
     timeframe: Timeframe,
+    window_start: i64,
+    window_end: i64,
     context: ErrorContext,
 ) -> Result<Vec<Candle>, ProviderError> {
     if bytes
@@ -3563,6 +3587,8 @@ fn decode_candles(
             requested_limit,
             instrument,
             timeframe,
+            window_start,
+            window_end,
             context: &context,
         },
     )
@@ -3578,6 +3604,47 @@ fn decode_candles(
         .map_err(|_| payload(&context, PayloadError::MalformedJson))?;
     Ok(candles)
 }
+fn response_validation_window(
+    timeframe: Timeframe,
+    kind: HistoryRequestKind,
+    requested_limit: u16,
+    request_start: i64,
+    request_end: i64,
+) -> Result<(i64, i64), ProviderError> {
+    let overlap_rows = HYPERLIQUID_MAX_RESPONSE_ROWS.saturating_sub(usize::from(requested_limit));
+    let overlap_rows = i64::try_from(overlap_rows)
+        .map_err(|_| ProviderError::Invariant("Hyperliquid overlap row count is invalid"))?;
+    let interval = interval_ms(timeframe)?;
+    let overlap_span = interval.saturating_mul(overlap_rows);
+    Ok(match kind {
+        HistoryRequestKind::Latest | HistoryRequestKind::Older => (
+            request_start.saturating_sub(overlap_span).saturating_sub(1),
+            request_end,
+        ),
+        HistoryRequestKind::Gap => (request_start, request_end.saturating_add(overlap_span)),
+    })
+}
+
+fn validate_rest_candle_time_window(
+    candle: &HlCandle,
+    timeframe: Timeframe,
+    window_start: i64,
+    window_end: i64,
+    previous_open: Option<i64>,
+    context: &ErrorContext,
+) -> Result<(), ProviderError> {
+    let expected_close = timeframe_successor_open(timeframe, candle.open_time)
+        .and_then(|successor| successor.checked_sub(1));
+    if expected_close != Some(candle.close_time)
+        || candle.open_time < window_start
+        || candle.open_time > window_end
+        || previous_open.is_some_and(|previous| candle.open_time <= previous)
+    {
+        return Err(payload(context, PayloadError::MalformedProtocol));
+    }
+    Ok(())
+}
+
 fn validate_candle_time_window(
     candle: &HlCandle,
     timeframe: Timeframe,

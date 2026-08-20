@@ -25,7 +25,7 @@ fn perpetual_btc() -> Instrument {
 fn candle_rows(count: usize) -> String {
     let rows = (0..count)
         .map(|index| {
-            let open = 1_700_000_000_000_i64 + i64::try_from(index).expect("index") * 60_000;
+            let open = 1_700_000_040_000_i64 + i64::try_from(index).expect("index") * 60_000;
             serde_json::json!({
                 "T": open + 59_999,
                 "c": "101.0",
@@ -47,10 +47,10 @@ fn history_request(kind: HistoryRequestKind, limit: u16) -> HistoryRequest {
     match kind {
         HistoryRequestKind::Latest => HistoryRequest::latest(limit).expect("latest"),
         HistoryRequestKind::Older => {
-            HistoryRequest::older(1_800_000_000_000, limit).expect("older")
+            HistoryRequest::older(1_700_060_100_000, limit).expect("older")
         }
         HistoryRequestKind::Gap => {
-            HistoryRequest::gap(1_700_000_000_000, 1_800_000_000_000, limit).expect("gap")
+            HistoryRequest::gap(1_700_000_040_000, 1_800_000_000_000, limit).expect("gap")
         }
     }
 }
@@ -72,7 +72,7 @@ async fn every_request_kind_enforces_retention_and_absolute_row_boundaries() {
                 )
                 .mount(&server)
                 .await;
-            let result = provider(&server, 1_800_000_000_000)
+            let result = provider(&server, 1_700_060_100_000)
                 .history(
                     &perpetual_btc(),
                     Timeframe::Minute1,
@@ -97,7 +97,7 @@ async fn every_request_kind_enforces_retention_and_absolute_row_boundaries() {
             };
             assert_eq!(
                 candles[0].open_time(),
-                1_700_000_000_000 + i64::try_from(first_index).expect("index") * 60_000,
+                1_700_000_040_000 + i64::try_from(first_index).expect("index") * 60_000,
                 "{kind:?} count {count}"
             );
         }
@@ -114,7 +114,7 @@ async fn requested_limit_1000_accepts_the_1001_row_overlap() {
         )
         .mount(&server)
         .await;
-    let candles = provider(&server, 1_800_000_000_000)
+    let candles = provider(&server, 1_700_060_100_000)
         .history(
             &perpetual_btc(),
             Timeframe::Minute1,
@@ -124,7 +124,7 @@ async fn requested_limit_1000_accepts_the_1001_row_overlap() {
         .await
         .expect("1001-row overlap");
     assert_eq!(candles.len(), 1000);
-    assert_eq!(candles[0].open_time(), 1_700_000_060_000);
+    assert_eq!(candles[0].open_time(), 1_700_000_100_000);
 }
 
 #[tokio::test]
@@ -165,7 +165,17 @@ async fn trade_count_is_required_and_must_be_a_non_negative_integer() {
 
 #[tokio::test]
 async fn rate_limit_uses_retry_after_or_local_fallback_without_process_blocking() {
-    for retry_after in [Some("7"), None] {
+    for (retry_after, expected_deadline) in [
+        (
+            Some("7"),
+            MonoInstant::from_millis(7_000).expect("deadline"),
+        ),
+        (None, MonoInstant::from_millis(30_000).expect("deadline")),
+        (
+            Some("invalid"),
+            MonoInstant::from_millis(30_000).expect("deadline"),
+        ),
+    ] {
         let server = MockServer::start().await;
         let mut response = ResponseTemplate::new(429);
         if let Some(value) = retry_after {
@@ -176,7 +186,11 @@ async fn rate_limit_uses_retry_after_or_local_fallback_without_process_blocking(
             .respond_with(response)
             .mount(&server)
             .await;
-        let provider = provider(&server, 1_800_000_000_000);
+        let manual_clock = clock();
+        let mut config = HyperliquidTestConfig::loopback(server.uri());
+        config.now_ms = Some(1_800_000_000_000);
+        let provider = HyperliquidProvider::new_test_with_config_and_clock(config, manual_clock)
+            .expect("provider");
         let error = provider
             .history(
                 &perpetual_btc(),
@@ -190,11 +204,73 @@ async fn rate_limit_uses_retry_after_or_local_fallback_without_process_blocking(
             error,
             ProviderError::RateLimited { status: 429, .. }
         ));
-        assert!(matches!(
+        assert_eq!(
             provider.rate_gate().current(),
-            Ok(RateGateState::TimedUntil(_))
-        ));
+            Ok(RateGateState::TimedUntil(expected_deadline))
+        );
     }
+}
+
+async fn malformed_rows_are_rejected(rows: Vec<serde_json::Value>, limit: u16) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rows))
+        .mount(&server)
+        .await;
+    let error = provider(&server, 1_800_000_000_000)
+        .history(
+            &perpetual_btc(),
+            Timeframe::Minute1,
+            HistoryRequest::gap(1_700_000_040_000, 1_800_000_000_000, limit).expect("gap"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("malformed row");
+    assert!(matches!(error, ProviderError::Payload { .. }), "{error}");
+}
+
+fn candle_row(open: i64) -> serde_json::Value {
+    let mut row = serde_json::from_str::<Vec<serde_json::Value>>(&candle_rows(1))
+        .expect("row")
+        .remove(0);
+    row["t"] = serde_json::json!(open);
+    row["T"] = serde_json::json!(open + 59_999);
+    row
+}
+
+#[tokio::test]
+async fn rest_rejects_off_grid_candle_open() {
+    malformed_rows_are_rejected(vec![candle_row(1_700_000_040_001)], 1).await;
+}
+
+#[tokio::test]
+async fn rest_rejects_inconsistent_candle_close() {
+    let mut row = candle_row(1_700_000_040_000);
+    row["T"] = serde_json::json!(1_700_000_099_998_i64);
+    malformed_rows_are_rejected(vec![row], 1).await;
+}
+
+#[tokio::test]
+async fn rest_rejects_candle_outside_response_window() {
+    malformed_rows_are_rejected(vec![candle_row(1_699_999_980_000)], 1).await;
+}
+
+#[tokio::test]
+async fn rest_rejects_duplicate_and_regressive_rows() {
+    for rows in [
+        vec![candle_row(1_700_000_040_000), candle_row(1_700_000_040_000)],
+        vec![candle_row(1_700_000_160_000), candle_row(1_700_000_100_000)],
+    ] {
+        malformed_rows_are_rejected(rows, 2).await;
+    }
+}
+
+#[tokio::test]
+async fn gap_validates_discarded_rows_after_retention_limit() {
+    let mut discarded = candle_row(1_700_000_100_000);
+    discarded["T"] = serde_json::json!(1_700_000_159_998_i64);
+    malformed_rows_are_rejected(vec![candle_row(1_700_000_040_000), discarded], 1).await;
 }
 
 use tokio_util::sync::CancellationToken;
@@ -339,7 +415,7 @@ async fn unsupported_timeframes_fail_before_network() {
 
 fn extra_row_fixture() -> String {
     let newer = serde_json::json!({
-        "T": 1_704_067_265_999_i64,
+        "T": 1_704_067_319_999_i64,
         "c": "42100.00",
         "h": "42150.00",
         "i": "1m",
