@@ -17,9 +17,10 @@ use fccli::{
             reconciliation_distinct_key_allowed_for_test, reconciliation_page_guard_for_test,
         },
         reconcile_ack_channel,
-        runtime::websocket::{
-            CloseFlushTestHook, DecodedFrame, HeartbeatTestHook, ReadinessDecodedAckTestHook,
-            ReadinessDrainBudgetTestHook, SubscribeFlushTestHook, WsConfig, read_raw_websocket,
+        test_transport::{
+            CloseFlushTestHook, DecodedFrame, HeartbeatTestHook, HyperliquidDecoded,
+            ReadinessDecodedAckTestHook, ReadinessDrainBudgetTestHook, SubscribeFlushTestHook,
+            WsConfig, read_raw_websocket,
         },
     },
 };
@@ -412,14 +413,17 @@ async fn received_close_wins_while_automatic_close_response_flush_is_held() {
             .expect("malformed ack");
         websocket.feed(Message::Close(None)).await.expect("close");
         websocket.flush().await.expect("readiness batch");
-        std::future::pending::<()>().await;
+        assert!(matches!(
+            websocket.next().await,
+            Some(Ok(Message::Close(_)))
+        ));
     });
     let blocked = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let live = LiveSupervisorConfig {
         close_flush_test_hook: Some(CloseFlushTestHook {
             blocked: Arc::clone(&blocked),
-            release,
+            release: Arc::clone(&release),
         }),
         ..LiveSupervisorConfig::default()
     };
@@ -433,6 +437,7 @@ async fn received_close_wins_while_automatic_close_response_flush_is_held() {
     timeout(Duration::from_secs(2), blocked.notified())
         .await
         .expect("close flush was not held");
+    release.notify_one();
     assert!(matches!(
         next_event(&mut feed).await,
         MarketEvent::RecoverableError {
@@ -444,7 +449,7 @@ async fn received_close_wins_while_automatic_close_response_flush_is_held() {
         }
     ));
     cancellation.cancel();
-    server.abort();
+    await_server(server).await;
 }
 
 #[test]

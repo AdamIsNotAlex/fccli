@@ -2,8 +2,10 @@
 
 pub mod binance;
 pub mod hyperliquid;
+pub(crate) mod runtime;
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[doc(hidden)]
-pub mod runtime;
+pub mod test_transport;
 
 use futures_util::Stream;
 use std::{

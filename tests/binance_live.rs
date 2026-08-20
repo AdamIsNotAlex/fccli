@@ -19,7 +19,7 @@ use fccli::{
         LiveSupervisorConfig, MARKET_EVENT_CHANNEL_CAPACITY, MAX_CONNECTION_AGE,
         RECONCILE_ACK_TIMEOUT, classify_live_error_for_test, classify_live_input_for_test,
     },
-    provider::runtime::websocket::DecodedFrame,
+    provider::test_transport::{BinanceDecoded, DecodedFrame},
     provider::{
         CancellationToken, LiveRequest, MarketDataProvider, ProducerCompletion, ProviderRegistry,
         ReconcileAck, ReconcileAckPublishError, accepted_watermark_channel, reconcile_ack_channel,

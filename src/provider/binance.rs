@@ -231,12 +231,17 @@ fn websocket_url_from_base(
     Ok(url)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum BinanceDecoded {
+    Candle(Candle),
+}
+
 pub fn decode_ws_frame(
     message: Message,
     instrument: &Instrument,
     timeframe: Timeframe,
     config: &WsConfig,
-) -> DecodedFrame {
+) -> DecodedFrame<BinanceDecoded> {
     if let Err(error) = config.validate() {
         return DecodedFrame::ProviderError(error);
     }
@@ -252,15 +257,23 @@ pub fn decode_ws_frame(
 pub struct BinanceWsCodec;
 
 impl WsCodec for BinanceWsCodec {
+    type Outcome = BinanceDecoded;
+
     fn decode(
         &mut self,
         message: Message,
         instrument: &Instrument,
         timeframe: Timeframe,
         config: &WsConfig,
-        output: &mut VecDeque<DecodedFrame>,
+        output: &mut VecDeque<DecodedFrame<Self::Outcome>>,
     ) {
         output.push_back(decode_ws_frame(message, instrument, timeframe, config));
+    }
+
+    fn readiness_priority(outcome: &Self::Outcome) -> u8 {
+        match outcome {
+            BinanceDecoded::Candle(_) => 1,
+        }
     }
 }
 
@@ -269,7 +282,7 @@ fn decode_ws_payload(
     instrument: &Instrument,
     timeframe: Timeframe,
     config: &WsConfig,
-) -> DecodedFrame {
+) -> DecodedFrame<BinanceDecoded> {
     let context =
         ErrorContext::operation(ErrorOperation::WebSocket).with_market(instrument, timeframe);
     if bytes.len() > config.max_message_size {
@@ -351,7 +364,7 @@ fn decode_ws_payload(
         volume,
         kline.closed,
     ) {
-        Ok(candle) => DecodedFrame::Candle(candle),
+        Ok(candle) => DecodedFrame::Provider(BinanceDecoded::Candle(candle)),
         Err(source) => DecodedFrame::ProviderError(ProviderError::Domain { context, source }),
     }
 }
@@ -922,10 +935,8 @@ impl BinanceProvider {
                 ack = request.reconcile_ack_rx.changed() => { ack.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
                 changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::InvalidBanExpiry); },
                 frame = socket.read() => match frame? {
-                    DecodedFrame::Candle(candle) => break candle,
-                    DecodedFrame::Ignored
-                    | DecodedFrame::SubscribeAccepted
-                    | DecodedFrame::ApplicationPong => {
+                    DecodedFrame::Provider(BinanceDecoded::Candle(candle)) => break candle,
+                    DecodedFrame::Ignored => {
                         let now = self.clock.now();
                         if now >= first_deadline {
                             return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), kind: TimeoutKind::FirstKline }));
@@ -989,7 +1000,7 @@ impl BinanceProvider {
                         Ack(Result<(), ProviderError>),
                         ConnectionAged,
                         Gate(Result<RateGateState, ProviderError>),
-                        Socket(Result<DecodedFrame, ProviderError>),
+                        Socket(Result<DecodedFrame<BinanceDecoded>, ProviderError>),
                         Page(Result<Vec<Candle>, ProviderError>),
                     }
 
@@ -1029,7 +1040,7 @@ impl BinanceProvider {
                                 }
                             }
                             ReconcileWake::Socket(frame) => match frame {
-                                Ok(DecodedFrame::Candle(candle)) => {
+                                Ok(DecodedFrame::Provider(BinanceDecoded::Candle(candle))) => {
                                     apply_reconciliation_candle(
                                         &mut buffered,
                                         candle,
@@ -1037,11 +1048,7 @@ impl BinanceProvider {
                                         &mut target_open_time,
                                     )?;
                                 }
-                                Ok(
-                                    DecodedFrame::Ignored
-                                    | DecodedFrame::SubscribeAccepted
-                                    | DecodedFrame::ApplicationPong,
-                                ) => {}
+                                Ok(DecodedFrame::Ignored) => {}
                                 Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => {
                                     return Ok(GenerationOutcome::Reconnect(live_protocol_error(
                                         request,
@@ -1084,15 +1091,11 @@ impl BinanceProvider {
                                         Err(_) => Err(ProviderError::Invariant("rate gate closed")),
                                     },
                                     frame = socket.read() => match frame {
-                                        Ok(DecodedFrame::Candle(candle)) => {
+                                        Ok(DecodedFrame::Provider(BinanceDecoded::Candle(candle))) => {
                                             apply_reconciliation_candle(&mut buffered, candle, &mut revision, &mut target_open_time)?;
                                             Ok((None, false))
                                         }
-                                        Ok(
-                                            DecodedFrame::Ignored
-                                            | DecodedFrame::SubscribeAccepted
-                                            | DecodedFrame::ApplicationPong,
-                                        ) => Ok((None, false)),
+                                        Ok(DecodedFrame::Ignored) => Ok((None, false)),
                                         Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))), false)),
                                         Ok(DecodedFrame::ProviderError(error)) | Err(error) if is_terminal_live_error(&error) => Err(error),
                                         Ok(DecodedFrame::ProviderError(error)) | Err(error) => Ok((Some(GenerationOutcome::Reconnect(error)), false)),
@@ -1115,15 +1118,11 @@ impl BinanceProvider {
                                         biased;
                                         () = request.cancellation.cancelled() => Ok(Some(GenerationOutcome::Cancelled)),
                                         frame = socket.read() => match frame {
-                                            Ok(DecodedFrame::Candle(candle)) => {
+                                            Ok(DecodedFrame::Provider(BinanceDecoded::Candle(candle))) => {
                                                 apply_reconciliation_candle(&mut buffered, candle, &mut revision, &mut target_open_time)?;
                                                 Ok(None)
                                             }
-                                            Ok(
-                                                DecodedFrame::Ignored
-                                                | DecodedFrame::SubscribeAccepted
-                                                | DecodedFrame::ApplicationPong,
-                                            ) => Ok(None),
+                                            Ok(DecodedFrame::Ignored) => Ok(None),
                                             Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect")))),
                                             Ok(DecodedFrame::ProviderError(error)) | Err(error) if is_terminal_live_error(&error) => Err(error),
                                             Ok(DecodedFrame::ProviderError(error)) | Err(error) => Ok(Some(GenerationOutcome::Reconnect(error))),
@@ -1240,13 +1239,11 @@ impl BinanceProvider {
                     () = self.clock.sleep_until(age_deadline) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached"))),
                     changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::InvalidBanExpiry); },
                     frame = socket.read(), if deferred_reconnect.is_none() => match frame? {
-                        DecodedFrame::Candle(candle) => {
+                        DecodedFrame::Provider(BinanceDecoded::Candle(candle)) => {
                             apply_reconciliation_candle(&mut buffered, candle, &mut revision, &mut target_open_time)?;
                             break;
                         }
-                        DecodedFrame::Ignored
-                        | DecodedFrame::SubscribeAccepted
-                        | DecodedFrame::ApplicationPong => {
+                        DecodedFrame::Ignored => {
                             if let Some(ack) = request
                                 .reconcile_ack_rx
                                 .current()
@@ -1340,7 +1337,7 @@ impl BinanceProvider {
                         return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
                     }
                     match frame {
-                        Ok(DecodedFrame::Candle(candle)) => {
+                        Ok(DecodedFrame::Provider(BinanceDecoded::Candle(candle))) => {
                             let is_new_key = !pending.contains_key(&candle.open_time());
                             if is_new_key && pending.len() == self.live.keyed_candle_capacity {
                                 let outcome = ProviderError::QueueSaturated;
@@ -1348,11 +1345,7 @@ impl BinanceProvider {
                             }
                             coalesce_candle(&mut pending, candle);
                         }
-                        Ok(
-                            DecodedFrame::Ignored
-                            | DecodedFrame::SubscribeAccepted
-                            | DecodedFrame::ApplicationPong,
-                        ) => {}
+                        Ok(DecodedFrame::Ignored) => {}
                         Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => {
                             let error = live_protocol_error(request, "WebSocket peer requested reconnect");
                             return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
@@ -1672,17 +1665,12 @@ pub enum LiveInputClassification {
 #[cfg(feature = "test-transport")]
 #[must_use]
 pub fn classify_live_input_for_test(
-    input: Result<DecodedFrame, ProviderError>,
+    input: Result<DecodedFrame<BinanceDecoded>, ProviderError>,
     instrument: &Instrument,
     timeframe: Timeframe,
 ) -> LiveInputClassification {
     let error = match input {
-        Ok(
-            DecodedFrame::Candle(_)
-            | DecodedFrame::Ignored
-            | DecodedFrame::SubscribeAccepted
-            | DecodedFrame::ApplicationPong,
-        ) => {
+        Ok(DecodedFrame::Ignored | DecodedFrame::Provider(BinanceDecoded::Candle(_))) => {
             return LiveInputClassification::Continue;
         }
         Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => ProviderError::Protocol {

@@ -1,3 +1,5 @@
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+use std::future::Future;
 use std::{
     collections::VecDeque,
     pin::Pin,
@@ -131,10 +133,8 @@ impl Default for WsConfig {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum DecodedFrame {
-    Candle(Candle),
-    SubscribeAccepted,
-    ApplicationPong,
+pub enum DecodedFrame<O> {
+    Provider(O),
     Ignored,
     ProviderError(ProviderError),
     ReconnectRequested,
@@ -142,14 +142,22 @@ pub enum DecodedFrame {
 }
 
 pub trait WsCodec: Send {
+    type Outcome: Clone + std::fmt::Debug + PartialEq + Send;
+
     fn decode(
         &mut self,
         message: Message,
         instrument: &Instrument,
         timeframe: Timeframe,
         config: &WsConfig,
-        output: &mut VecDeque<DecodedFrame>,
+        output: &mut VecDeque<DecodedFrame<Self::Outcome>>,
     );
+
+    fn readiness_priority(outcome: &Self::Outcome) -> u8;
+
+    fn is_subscribe_accepted(_outcome: &Self::Outcome) -> bool {
+        false
+    }
 }
 
 pub(crate) fn validate_websocket_base(
@@ -290,14 +298,14 @@ impl ReadinessMode {
     }
 }
 
-pub struct RawWebSocket<C> {
+pub struct RawWebSocket<C: WsCodec> {
     stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     config: WsConfig,
     context: ErrorContext,
     instrument: Instrument,
     timeframe: Timeframe,
     codec: C,
-    decoded: VecDeque<DecodedFrame>,
+    decoded: VecDeque<DecodedFrame<C::Outcome>>,
     outbound: VecDeque<Message>,
     flush_pending: bool,
     write_stall_deadline: Option<tokio::time::Instant>,
@@ -324,6 +332,8 @@ pub struct RawWebSocket<C> {
     pub(crate) subscribe_flush_test_hook: Option<SubscribeFlushTestHook>,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub(crate) close_flush_test_hook: Option<CloseFlushTestHook>,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    close_flush_test_waiter: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
 impl<C: WsCodec> RawWebSocket<C> {
@@ -363,84 +373,65 @@ impl<C: WsCodec> RawWebSocket<C> {
         );
         self.next_application_ping = Some(tokio::time::Instant::now());
     }
-    pub(crate) async fn read_readiness(&mut self) -> ReadinessInput {
-        let inactivity_deadline = self.last_data_message + self.config.message_inactivity_timeout;
-        futures_util::future::poll_fn(|cx| {
-            self.readiness_drain_yielded = false;
-            let io = self.poll_io(
-                cx,
-                inactivity_deadline,
-                false,
-                ReadinessMode::PreSubscription,
-            );
-            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            if self.readiness_drain_yielded
-                && let Some(hook) = self.readiness_drain_budget_test_hook.take()
-            {
-                hook.observed.notify_one();
-                let waker = cx.waker().clone();
-                tokio::spawn(async move {
-                    hook.release.notified().await;
-                    waker.wake();
-                });
-                return Poll::Pending;
-            }
-            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            if let Some(hook) = &self.readiness_decoded_ack_test_hook
-                && self
-                    .decoded
-                    .iter()
-                    .any(|frame| matches!(frame, DecodedFrame::SubscribeAccepted))
-            {
-                hook.observed.notify_one();
-                let release = Arc::clone(&hook.release);
-                let waker = cx.waker().clone();
-                self.readiness_decoded_ack_test_hook = None;
-                tokio::spawn(async move {
-                    release.notified().await;
-                    waker.wake();
-                });
-                return Poll::Pending;
-            }
-            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            if self.force_stalled_write_after_readiness_frame && !self.decoded.is_empty() {
-                self.force_stalled_write_after_readiness_frame = false;
-                self.stalled_write_error = Some(ProviderError::Timeout {
-                    context: self.context.clone(),
-                    kind: TimeoutKind::StalledWrite,
-                });
-            }
-            if !self.readiness_drain_yielded
-                || has_actionable_readiness(
-                    &self.decoded,
-                    self.pending_terminal_error.as_ref(),
-                    self.stalled_write_error.as_ref(),
-                )
-            {
-                if let Some(input) = take_prioritized_readiness(
-                    &mut self.decoded,
-                    self.pending_terminal_error.take(),
-                    self.stalled_write_error.clone(),
-                ) {
-                    return Poll::Ready(input);
+
+    pub(crate) async fn read_readiness(&mut self) -> ReadinessInput<C::Outcome> {
+        loop {
+            let inactivity_deadline =
+                self.last_data_message + self.config.message_inactivity_timeout;
+            let result = futures_util::future::poll_fn(|cx| {
+                self.readiness_drain_yielded = false;
+                let io = self.poll_io(cx, inactivity_deadline, false, ReadinessMode::PreSubscription);
+                #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+                if self.readiness_drain_yielded
+                    && let Some(hook) = self.readiness_drain_budget_test_hook.take()
+                {
+                    hook.observed.notify_one();
+                    return Poll::Ready(Err(hook.release));
                 }
+                #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+                if self.readiness_decoded_ack_test_hook.is_some()
+                    && self.decoded.iter().any(|frame| {
+                        matches!(frame, DecodedFrame::Provider(outcome) if C::is_subscribe_accepted(outcome))
+                    })
+                {
+                    let hook = self.readiness_decoded_ack_test_hook.take().expect("observed hook exists");
+                    hook.observed.notify_one();
+                    return Poll::Ready(Err(hook.release));
+                }
+                #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+                if self.force_stalled_write_after_readiness_frame && !self.decoded.is_empty() {
+                    self.force_stalled_write_after_readiness_frame = false;
+                    self.stalled_write_error = Some(ProviderError::Timeout {
+                        context: self.context.clone(),
+                        kind: TimeoutKind::StalledWrite,
+                    });
+                }
+                if (!self.readiness_drain_yielded
+                    || has_actionable_readiness::<C>(&self.decoded, self.pending_terminal_error.as_ref(), self.stalled_write_error.as_ref()))
+                    && let Some(input) = take_prioritized_readiness::<C>(&mut self.decoded, self.pending_terminal_error.take(), self.stalled_write_error.clone())
+                {
+                    return Poll::Ready(Ok(input));
+                }
+                if self.readiness_drain_yielded {
+                    return Poll::Pending;
+                }
+                match io {
+                    Poll::Ready(Err(error)) => Poll::Ready(Ok(ReadinessInput::Error(error))),
+                    Poll::Ready(Ok(())) | Poll::Pending => Poll::Pending,
+                }
+            }).await;
+            match result {
+                Ok(input) => return input,
+                Err(release) => release.notified().await,
             }
-            if self.readiness_drain_yielded {
-                return Poll::Pending;
-            }
-            match io {
-                Poll::Ready(Err(error)) => Poll::Ready(ReadinessInput::Error(error)),
-                Poll::Ready(Ok(())) | Poll::Pending => Poll::Pending,
-            }
-        })
-        .await
+        }
     }
 
     pub(crate) fn inactivity_deadline(&self) -> tokio::time::Instant {
         self.last_data_message + self.config.message_inactivity_timeout
     }
 
-    pub async fn read(&mut self) -> Result<DecodedFrame, ProviderError> {
+    pub async fn read(&mut self) -> Result<DecodedFrame<C::Outcome>, ProviderError> {
         loop {
             if self.stalled_write_error.is_some()
                 && let Some(outcome) = self.decoded.front()
@@ -500,6 +491,43 @@ impl<C: WsCodec> RawWebSocket<C> {
                 context: self.context.clone(),
                 cause: SanitizedCause::Closed,
             }))
+    }
+
+    pub(crate) async fn finalize_peer_close(&mut self) -> Result<(), ProviderError> {
+        if !self.peer_close_received {
+            return Ok(());
+        }
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        if let Some(waiter) = self.close_flush_test_waiter.as_mut() {
+            let deadline = tokio::time::Instant::now()
+                .checked_add(self.config.stalled_write_timeout)
+                .unwrap_or_else(tokio::time::Instant::now);
+            if tokio::time::timeout_at(deadline, waiter).await.is_err() {
+                return Err(ProviderError::Timeout {
+                    context: self.context.clone(),
+                    kind: TimeoutKind::StalledWrite,
+                });
+            }
+            self.close_flush_test_waiter = None;
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.config.stalled_write_timeout)
+            .unwrap_or_else(tokio::time::Instant::now);
+        let result =
+            tokio::time::timeout_at(deadline, futures_util::SinkExt::flush(&mut self.stream)).await;
+        match result {
+            Ok(Ok(())) => {
+                self.peer_close_received = false;
+                self.flush_pending = false;
+                self.write_stall_deadline = None;
+                Ok(())
+            }
+            Ok(Err(error)) => Err(map_websocket_error(error, &self.context)),
+            Err(_) => Err(ProviderError::Timeout {
+                context: self.context.clone(),
+                kind: TimeoutKind::StalledWrite,
+            }),
+        }
     }
 
     fn enter_stalled_write_drain(&mut self, error: ProviderError) {
@@ -694,7 +722,7 @@ impl<C: WsCodec> RawWebSocket<C> {
                     }
                     made_progress = true;
                     if readiness_mode.drains_readiness_frames() {
-                        coalesce_readiness_outcomes(&mut self.decoded);
+                        coalesce_readiness_outcomes::<C>(&mut self.decoded);
                         readiness_frames += 1;
                     }
                 }
@@ -747,18 +775,26 @@ impl<C: WsCodec> RawWebSocket<C> {
         }
 
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        if self.peer_close_received
-            && let Some(hook) = self.close_flush_test_hook.take()
-        {
-            hook.blocked.notify_one();
-            let waker = cx.waker().clone();
-            tokio::spawn(async move {
-                hook.release.notified().await;
-                waker.wake();
-            });
-            return Poll::Pending;
+        if self.peer_close_received {
+            if self.close_flush_test_waiter.is_none()
+                && let Some(hook) = self.close_flush_test_hook.take()
+            {
+                hook.blocked.notify_one();
+                self.close_flush_test_waiter = Some(Box::pin(async move {
+                    hook.release.notified().await;
+                }));
+            }
+            if let Some(waiter) = self.close_flush_test_waiter.as_mut()
+                && waiter.as_mut().poll(cx).is_pending()
+            {
+                return if made_progress {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                };
+            }
+            self.close_flush_test_waiter = None;
         }
-
         match Sink::<Message>::poll_flush(Pin::new(&mut self.stream), cx) {
             Poll::Ready(Ok(())) => {
                 self.flush_pending = false;
@@ -789,7 +825,7 @@ impl<C: WsCodec> RawWebSocket<C> {
     }
     fn readiness_mode_allows_delivery(
         &self,
-        outcome: &DecodedFrame,
+        outcome: &DecodedFrame<C::Outcome>,
         readiness_mode: ReadinessMode,
     ) -> bool {
         readiness_mode.exposes_close_before_reply_flush()
@@ -845,6 +881,8 @@ pub(crate) async fn connect_websocket_url<C: WsCodec>(
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         close_flush_test_hook: None,
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        close_flush_test_waiter: None,
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         readiness_inactivity_test_hook: None,
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         readiness_decoded_ack_test_hook: None,
@@ -854,13 +892,12 @@ pub(crate) async fn connect_websocket_url<C: WsCodec>(
         force_stalled_write_after_readiness_frame: false,
     })
 }
-fn coalesce_readiness_outcomes(decoded: &mut VecDeque<DecodedFrame>) {
-    let mut best: Option<DecodedFrame> = None;
+fn coalesce_readiness_outcomes<C: WsCodec>(decoded: &mut VecDeque<DecodedFrame<C::Outcome>>) {
+    let mut best: Option<DecodedFrame<C::Outcome>> = None;
     while let Some(frame) = decoded.pop_front() {
-        if best
-            .as_ref()
-            .is_none_or(|retained| readiness_priority(&frame) < readiness_priority(retained))
-        {
+        if best.as_ref().is_none_or(|retained| {
+            readiness_priority::<C>(&frame) < readiness_priority::<C>(retained)
+        }) {
             best = Some(frame);
         }
     }
@@ -869,30 +906,30 @@ fn coalesce_readiness_outcomes(decoded: &mut VecDeque<DecodedFrame>) {
     }
 }
 
-fn has_actionable_readiness(
-    decoded: &VecDeque<DecodedFrame>,
+fn has_actionable_readiness<C: WsCodec>(
+    decoded: &VecDeque<DecodedFrame<C::Outcome>>,
     terminal_error: Option<&ProviderError>,
     stalled_write_error: Option<&ProviderError>,
 ) -> bool {
     terminal_error.is_some()
         || stalled_write_error.is_some()
-        || decoded
-            .iter()
-            .any(|frame| readiness_priority(frame) < readiness_priority(&DecodedFrame::Ignored))
+        || decoded.iter().any(|frame| {
+            readiness_priority::<C>(frame) < readiness_priority::<C>(&DecodedFrame::Ignored)
+        })
 }
 
-fn readiness_priority(frame: &DecodedFrame) -> u8 {
+fn readiness_priority<C: WsCodec>(frame: &DecodedFrame<C::Outcome>) -> u8 {
     match frame {
         DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested => 0,
-        DecodedFrame::ProviderError(_) | DecodedFrame::Candle(_) => 1,
-        DecodedFrame::SubscribeAccepted => 2,
-        DecodedFrame::Ignored | DecodedFrame::ApplicationPong => 3,
+        DecodedFrame::ProviderError(_) => 1,
+        DecodedFrame::Provider(outcome) => C::readiness_priority(outcome),
+        DecodedFrame::Ignored => u8::MAX,
     }
 }
 
 pub async fn read_raw_websocket<C: WsCodec>(
     socket: &mut RawWebSocket<C>,
-) -> Result<DecodedFrame, ProviderError> {
+) -> Result<DecodedFrame<C::Outcome>, ProviderError> {
     socket.read().await
 }
 
@@ -924,11 +961,11 @@ pub(crate) fn contextualize_websocket_configuration(
     }
 }
 
-fn take_prioritized_readiness(
-    decoded: &mut VecDeque<DecodedFrame>,
+fn take_prioritized_readiness<C: WsCodec>(
+    decoded: &mut VecDeque<DecodedFrame<C::Outcome>>,
     terminal_error: Option<ProviderError>,
     stalled_write_error: Option<ProviderError>,
-) -> Option<ReadinessInput> {
+) -> Option<ReadinessInput<C::Outcome>> {
     if let Some(index) = decoded.iter().position(|frame| {
         matches!(
             frame,
@@ -947,19 +984,14 @@ fn take_prioritized_readiness(
     let index = decoded
         .iter()
         .enumerate()
-        .min_by_key(|(_, frame)| match frame {
-            DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested => 0,
-            DecodedFrame::ProviderError(_) | DecodedFrame::Candle(_) => 1,
-            DecodedFrame::SubscribeAccepted => 2,
-            DecodedFrame::Ignored | DecodedFrame::ApplicationPong => 3,
-        })
+        .min_by_key(|(_, frame)| readiness_priority::<C>(frame))
         .map(|(index, _)| index)?;
     Some(ReadinessInput::Frame(
         decoded.remove(index).expect("readiness frame index"),
     ))
 }
 
-pub(crate) enum ReadinessInput {
-    Frame(DecodedFrame),
+pub(crate) enum ReadinessInput<O> {
+    Frame(DecodedFrame<O>),
     Error(ProviderError),
 }

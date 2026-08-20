@@ -10,7 +10,7 @@ use fccli::{
             HyperliquidWsCodec, decode_ws_frame, gap_target_within_generation_span_for_test,
             test_websocket_url,
         },
-        runtime::websocket::{DecodedFrame, WsConfig},
+        test_transport::{DecodedFrame, HyperliquidDecoded, WsConfig},
     },
 };
 use serde_json::{Value, json};
@@ -31,7 +31,7 @@ fn decode_for(
     codec: &mut HyperliquidWsCodec,
     timeframe: Timeframe,
     value: Value,
-) -> Vec<DecodedFrame> {
+) -> Vec<DecodedFrame<HyperliquidDecoded>> {
     let mut outcomes = VecDeque::new();
     decode_ws_frame(
         codec,
@@ -44,7 +44,7 @@ fn decode_for(
     outcomes.into_iter().collect()
 }
 
-fn decode(codec: &mut HyperliquidWsCodec, value: Value) -> Vec<DecodedFrame> {
+fn decode(codec: &mut HyperliquidWsCodec, value: Value) -> Vec<DecodedFrame<HyperliquidDecoded>> {
     decode_for(codec, Timeframe::Minute1, value)
 }
 
@@ -87,7 +87,9 @@ fn test_websocket_url_has_no_stream_path() {
 fn matching_subscribe_ack_is_accepted() {
     assert_eq!(
         decode(&mut HyperliquidWsCodec::new(), subscribe_ack()),
-        vec![DecodedFrame::SubscribeAccepted]
+        vec![DecodedFrame::Provider(
+            HyperliquidDecoded::SubscribeAccepted
+        )]
     );
 }
 
@@ -120,7 +122,7 @@ fn application_pong_is_distinct_from_transport_control_frames() {
     let mut codec = HyperliquidWsCodec::new();
     assert_eq!(
         decode(&mut codec, json!({"channel": "pong"})),
-        vec![DecodedFrame::ApplicationPong]
+        vec![DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong)]
     );
     for frame in [
         Message::Ping(vec![1, 2, 3].into()),
@@ -143,13 +145,13 @@ fn application_pong_is_distinct_from_transport_control_frames() {
 fn successor_finality_state_machine_is_exact() {
     let mut codec = HyperliquidWsCodec::new();
     let first = decode(&mut codec, candle(1_704_067_200_000, "42075.75"));
-    let [DecodedFrame::Candle(first)] = first.as_slice() else {
+    let [DecodedFrame::Provider(HyperliquidDecoded::Candle(first))] = first.as_slice() else {
         panic!("expected first open candle: {first:?}");
     };
     assert_eq!(first.authority(), FinalityAuthority::WsAuthoritativeOpen);
 
     let changed = decode(&mut codec, candle(1_704_067_200_000, "42080.00"));
-    let [DecodedFrame::Candle(changed)] = changed.as_slice() else {
+    let [DecodedFrame::Provider(HyperliquidDecoded::Candle(changed))] = changed.as_slice() else {
         panic!("expected changed open candle: {changed:?}");
     };
     assert_eq!(changed.close(), 42_080.0);
@@ -157,7 +159,11 @@ fn successor_finality_state_machine_is_exact() {
     assert!(decode(&mut codec, candle(1_704_067_200_000, "42080.00")).is_empty());
 
     let successor = decode(&mut codec, candle(1_704_067_260_000, "42090.00"));
-    let [DecodedFrame::Candle(closed), DecodedFrame::Candle(open)] = successor.as_slice() else {
+    let [
+        DecodedFrame::Provider(HyperliquidDecoded::Candle(closed)),
+        DecodedFrame::Provider(HyperliquidDecoded::Candle(open)),
+    ] = successor.as_slice()
+    else {
         panic!("expected close then open: {successor:?}");
     };
     assert_eq!(closed.open_time(), 1_704_067_200_000);
@@ -167,7 +173,11 @@ fn successor_finality_state_machine_is_exact() {
     assert_eq!(open.authority(), FinalityAuthority::WsAuthoritativeOpen);
 
     let skipped = decode(&mut codec, candle(1_704_067_380_000, "42100.00"));
-    let [DecodedFrame::Candle(closed), DecodedFrame::Candle(open)] = skipped.as_slice() else {
+    let [
+        DecodedFrame::Provider(HyperliquidDecoded::Candle(closed)),
+        DecodedFrame::Provider(HyperliquidDecoded::Candle(open)),
+    ] = skipped.as_slice()
+    else {
         panic!("expected skipped successor close then open: {skipped:?}");
     };
     assert_eq!(closed.open_time(), 1_704_067_260_000);
@@ -177,7 +187,10 @@ fn successor_finality_state_machine_is_exact() {
     assert!(decode(&mut codec, candle(1_704_067_320_000, "42095.00")).is_empty());
 
     let after_regression = decode(&mut codec, candle(1_704_067_440_000, "42110.00"));
-    let [DecodedFrame::Candle(closed), DecodedFrame::Candle(open)] = after_regression.as_slice()
+    let [
+        DecodedFrame::Provider(HyperliquidDecoded::Candle(closed)),
+        DecodedFrame::Provider(HyperliquidDecoded::Candle(open)),
+    ] = after_regression.as_slice()
     else {
         panic!("expected retained close then successor: {after_regression:?}");
     };
@@ -212,7 +225,11 @@ fn invalid_temporal_frames_do_not_finalize_or_poison_retained_state() {
     }
 
     let legitimate = decode(&mut codec, candle(CURRENT + 60_000, "42090.00"));
-    let [DecodedFrame::Candle(closed), DecodedFrame::Candle(open)] = legitimate.as_slice() else {
+    let [
+        DecodedFrame::Provider(HyperliquidDecoded::Candle(closed)),
+        DecodedFrame::Provider(HyperliquidDecoded::Candle(open)),
+    ] = legitimate.as_slice()
+    else {
         panic!("expected unpoisoned retained close then legitimate successor: {legitimate:?}");
     };
     assert_eq!(closed.open_time(), CURRENT);
@@ -234,7 +251,7 @@ fn far_future_first_and_successor_are_rejected_without_poisoning_state() {
     ));
     assert!(matches!(
         decode(&mut first_codec, candle(CURRENT, "42075.75")).as_slice(),
-        [DecodedFrame::Candle(candle)] if candle.open_time() == CURRENT
+        [DecodedFrame::Provider(HyperliquidDecoded::Candle(candle))] if candle.open_time() == CURRENT
     ));
 
     let mut successor_codec = HyperliquidWsCodec::new();
@@ -247,7 +264,10 @@ fn far_future_first_and_successor_are_rejected_without_poisoning_state() {
         &mut successor_codec,
         candle(CURRENT + 3 * 60_000, "42100.00"),
     );
-    let [DecodedFrame::Candle(closed), DecodedFrame::Candle(open)] = legitimate_skipped.as_slice()
+    let [
+        DecodedFrame::Provider(HyperliquidDecoded::Candle(closed)),
+        DecodedFrame::Provider(HyperliquidDecoded::Candle(open)),
+    ] = legitimate_skipped.as_slice()
     else {
         panic!("expected retained close then legitimate skipped successor");
     };
@@ -284,11 +304,14 @@ fn monthly_temporal_grid_uses_calendar_boundaries() {
     let mut codec = HyperliquidWsCodec::new();
     assert!(matches!(
         decode_for(&mut codec, Timeframe::Month1, monthly(JAN_2024, FEB_2024)).as_slice(),
-        [DecodedFrame::Candle(_)]
+        [DecodedFrame::Provider(HyperliquidDecoded::Candle(_))]
     ));
     assert!(matches!(
         decode_for(&mut codec, Timeframe::Month1, monthly(FEB_2024, MAR_2024)).as_slice(),
-        [DecodedFrame::Candle(_), DecodedFrame::Candle(_)]
+        [
+            DecodedFrame::Provider(HyperliquidDecoded::Candle(_)),
+            DecodedFrame::Provider(HyperliquidDecoded::Candle(_))
+        ]
     ));
     let forged_mid_month = monthly(FEB_2024 + 86_400_000, MAR_2024);
     assert!(matches!(
@@ -304,7 +327,7 @@ fn local_wall_clock_and_wire_close_time_do_not_prove_finality() {
         serde_json::from_str(include_str!("fixtures/hyperliquid_candle_closed.json"))
             .expect("fixture");
     let decoded = decode(&mut codec, payload);
-    let [DecodedFrame::Candle(candle)] = decoded.as_slice() else {
+    let [DecodedFrame::Provider(HyperliquidDecoded::Candle(candle))] = decoded.as_slice() else {
         panic!("expected candle");
     };
     assert_eq!(candle.authority(), FinalityAuthority::WsAuthoritativeOpen);

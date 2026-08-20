@@ -229,6 +229,13 @@ pub struct HyperliquidWsCodec {
     retained_candle: Option<Candle>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum HyperliquidDecoded {
+    Candle(Candle),
+    SubscribeAccepted,
+    ApplicationPong,
+}
+
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 use crate::provider::runtime::websocket::{
     CloseFlushTestHook, ReadinessDecodedAckTestHook, ReadinessDrainBudgetTestHook,
@@ -245,15 +252,29 @@ impl HyperliquidWsCodec {
 }
 
 impl WsCodec for HyperliquidWsCodec {
+    type Outcome = HyperliquidDecoded;
+
     fn decode(
         &mut self,
         message: Message,
         instrument: &Instrument,
         timeframe: Timeframe,
         config: &WsConfig,
-        output: &mut VecDeque<DecodedFrame>,
+        output: &mut VecDeque<DecodedFrame<Self::Outcome>>,
     ) {
         decode_ws_frame(self, message, instrument, timeframe, config, output);
+    }
+
+    fn readiness_priority(outcome: &Self::Outcome) -> u8 {
+        match outcome {
+            HyperliquidDecoded::Candle(_) => 1,
+            HyperliquidDecoded::SubscribeAccepted => 2,
+            HyperliquidDecoded::ApplicationPong => u8::MAX,
+        }
+    }
+
+    fn is_subscribe_accepted(outcome: &Self::Outcome) -> bool {
+        matches!(outcome, HyperliquidDecoded::SubscribeAccepted)
     }
 }
 
@@ -302,7 +323,7 @@ pub fn decode_ws_frame(
     instrument: &Instrument,
     timeframe: Timeframe,
     config: &WsConfig,
-    outcomes: &mut VecDeque<DecodedFrame>,
+    outcomes: &mut VecDeque<DecodedFrame<HyperliquidDecoded>>,
 ) {
     if let Err(error) = config.validate() {
         outcomes.push_back(DecodedFrame::ProviderError(error));
@@ -337,7 +358,7 @@ fn decode_ws_payload(
     instrument: &Instrument,
     timeframe: Timeframe,
     config: &WsConfig,
-    outcomes: &mut VecDeque<DecodedFrame>,
+    outcomes: &mut VecDeque<DecodedFrame<HyperliquidDecoded>>,
 ) {
     let context =
         ErrorContext::operation(ErrorOperation::WebSocket).with_market(instrument, timeframe);
@@ -373,12 +394,14 @@ fn decode_ws_payload(
                     })
             });
             outcomes.push_back(if valid {
-                DecodedFrame::SubscribeAccepted
+                DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted)
             } else {
                 DecodedFrame::ProviderError(payload(&context, PayloadError::MalformedProtocol))
             });
         }
-        Some("pong") => outcomes.push_back(DecodedFrame::ApplicationPong),
+        Some("pong") => {
+            outcomes.push_back(DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong))
+        }
         Some("candle") => {
             decode_candle_payload(codec, &value, instrument, timeframe, &context, outcomes)
         }
@@ -392,7 +415,7 @@ fn decode_candle_payload(
     instrument: &Instrument,
     timeframe: Timeframe,
     context: &ErrorContext,
-    outcomes: &mut VecDeque<DecodedFrame>,
+    outcomes: &mut VecDeque<DecodedFrame<HyperliquidDecoded>>,
 ) {
     let Some(data) = value.get("data") else {
         outcomes.push_back(DecodedFrame::ProviderError(payload(
@@ -447,7 +470,9 @@ fn decode_candle_payload(
     };
     let Some(retained) = codec.retained_candle.as_ref() else {
         codec.retained_candle = Some(candidate.clone());
-        outcomes.push_back(DecodedFrame::Candle(candidate));
+        outcomes.push_back(DecodedFrame::Provider(HyperliquidDecoded::Candle(
+            candidate,
+        )));
         return;
     };
     if candidate.open_time() < retained.open_time() || candidate == *retained {
@@ -455,7 +480,9 @@ fn decode_candle_payload(
     }
     if candidate.open_time() == retained.open_time() {
         codec.retained_candle = Some(candidate.clone());
-        outcomes.push_back(DecodedFrame::Candle(candidate));
+        outcomes.push_back(DecodedFrame::Provider(HyperliquidDecoded::Candle(
+            candidate,
+        )));
         return;
     }
     let closed = Candle::from_ws(
@@ -470,8 +497,10 @@ fn decode_candle_payload(
     )
     .expect("retained validated candle remains valid when closed");
     codec.retained_candle = Some(candidate.clone());
-    outcomes.push_back(DecodedFrame::Candle(closed));
-    outcomes.push_back(DecodedFrame::Candle(candidate));
+    outcomes.push_back(DecodedFrame::Provider(HyperliquidDecoded::Candle(closed)));
+    outcomes.push_back(DecodedFrame::Provider(HyperliquidDecoded::Candle(
+        candidate,
+    )));
 }
 
 pub type RawWebSocket = crate::provider::runtime::websocket::RawWebSocket<HyperliquidWsCodec>;
@@ -1074,15 +1103,21 @@ impl HyperliquidProvider {
                 () = request.cancellation.cancelled() => return Ok(GenerationOutcome::Cancelled),
                 input = socket.read_readiness() => match input {
                     ReadinessInput::Error(error) => return Ok(GenerationOutcome::Reconnect(error)),
-                    ReadinessInput::Frame(DecodedFrame::SubscribeAccepted) => break,
-                    ReadinessInput::Frame(DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => {
+                    ReadinessInput::Frame(DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted)) => break,
+                    ReadinessInput::Frame(DecodedFrame::Ignored | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong)) => {
                         if self.clock.now() >= ack_deadline {
                             return Ok(GenerationOutcome::Reconnect(Self::subscribe_ack_timeout(request)));
                         }
                     }
-                    ReadinessInput::Frame(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))),
+                    ReadinessInput::Frame(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => {
+                        let reconnect = live_protocol_error(request, "WebSocket peer requested reconnect");
+                        if let Err(error) = socket.finalize_peer_close().await {
+                            return Ok(GenerationOutcome::Reconnect(error));
+                        }
+                        return Ok(GenerationOutcome::Reconnect(reconnect));
+                    }
                     ReadinessInput::Frame(DecodedFrame::ProviderError(error)) => return Ok(GenerationOutcome::Reconnect(error)),
-                    ReadinessInput::Frame(DecodedFrame::Candle(_)) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "Hyperliquid candle arrived before subscribe acknowledgement"))),
+                    ReadinessInput::Frame(DecodedFrame::Provider(HyperliquidDecoded::Candle(_))) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "Hyperliquid candle arrived before subscribe acknowledgement"))),
                 },
                 () = self.clock.sleep_until(ack_deadline) => {
                     return Ok(GenerationOutcome::Reconnect(Self::subscribe_ack_timeout(request)));
@@ -1131,8 +1166,8 @@ impl HyperliquidProvider {
                     ack = request.reconcile_ack_rx.changed() => { ack.map_err(|_| control_channel_closed(&request.instrument, request.timeframe))?; },
                     changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked")); },
                     frame = socket.read() => match frame? {
-                        DecodedFrame::Candle(candle) => break candle,
-                        DecodedFrame::Ignored | DecodedFrame::ApplicationPong => {
+                        DecodedFrame::Provider(HyperliquidDecoded::Candle(candle)) => break candle,
+                        DecodedFrame::Ignored | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong) => {
                             let now = self.clock.now();
                             if now >= first_deadline {
                                 return Ok(GenerationOutcome::Reconnect(ProviderError::Timeout { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), kind: TimeoutKind::FirstKline }));
@@ -1141,7 +1176,7 @@ impl HyperliquidProvider {
                                 return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached")));
                             }
                         }
-                        DecodedFrame::SubscribeAccepted => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))),
+                        DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))),
                         DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested => return Ok(GenerationOutcome::Reconnect(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" })),
                         DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
                         DecodedFrame::ProviderError(error) => return Ok(GenerationOutcome::Reconnect(error)),
@@ -1220,7 +1255,7 @@ impl HyperliquidProvider {
                         Ack(Result<(), ProviderError>),
                         ConnectionAged,
                         Gate(Result<RateGateState, ProviderError>),
-                        Socket(Result<DecodedFrame, ProviderError>),
+                        Socket(Result<DecodedFrame<HyperliquidDecoded>, ProviderError>),
                         Page(Result<Vec<Candle>, ProviderError>),
                     }
 
@@ -1270,7 +1305,7 @@ impl HyperliquidProvider {
                                 }
                             }
                             ReconcileWake::Socket(frame) => match frame {
-                                Ok(DecodedFrame::Candle(candle)) => {
+                                Ok(DecodedFrame::Provider(HyperliquidDecoded::Candle(candle))) => {
                                     if let Err(error) = apply_reconciliation_candle(
                                         &mut buffered,
                                         candle,
@@ -1283,8 +1318,13 @@ impl HyperliquidProvider {
                                         return Ok(GenerationOutcome::Reconnect(error));
                                     }
                                 }
-                                Ok(DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => {}
-                                Ok(DecodedFrame::SubscribeAccepted) => {
+                                Ok(
+                                    DecodedFrame::Ignored
+                                    | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong),
+                                ) => {}
+                                Ok(DecodedFrame::Provider(
+                                    HyperliquidDecoded::SubscribeAccepted,
+                                )) => {
                                     return Ok(GenerationOutcome::Reconnect(live_protocol_error(
                                         request,
                                         "duplicate Hyperliquid subscribe acknowledgement",
@@ -1340,7 +1380,7 @@ impl HyperliquidProvider {
                                         Err(_) => Err(ProviderError::Invariant("rate gate closed")),
                                     },
                                     frame = socket.read() => match frame {
-                                        Ok(DecodedFrame::Candle(candle)) => match apply_reconciliation_candle(
+                                        Ok(DecodedFrame::Provider(HyperliquidDecoded::Candle(candle))) => match apply_reconciliation_candle(
                                             &mut buffered,
                                             candle,
                                             &mut revision,
@@ -1352,8 +1392,8 @@ impl HyperliquidProvider {
                                             Ok(()) => Ok((None, false)),
                                             Err(error) => Ok((Some(GenerationOutcome::Reconnect(error)), false)),
                                         },
-                                        Ok(DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => Ok((None, false)),
-                                        Ok(DecodedFrame::SubscribeAccepted) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))), false)),
+                                        Ok(DecodedFrame::Ignored | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong)) => Ok((None, false)),
+                                        Ok(DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted)) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))), false)),
                                         Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))), false)),
                                         Ok(DecodedFrame::ProviderError(error)) | Err(error) if is_terminal_live_error(&error) => Err(error),
                                         Ok(DecodedFrame::ProviderError(error)) | Err(error) => Ok((Some(GenerationOutcome::Reconnect(error)), false)),
@@ -1376,7 +1416,7 @@ impl HyperliquidProvider {
                                         biased;
                                         () = request.cancellation.cancelled() => Ok(Some(GenerationOutcome::Cancelled)),
                                         frame = socket.read() => match frame {
-                                            Ok(DecodedFrame::Candle(candle)) => match apply_reconciliation_candle(
+                                            Ok(DecodedFrame::Provider(HyperliquidDecoded::Candle(candle))) => match apply_reconciliation_candle(
                                                 &mut buffered,
                                                 candle,
                                                 &mut revision,
@@ -1388,8 +1428,8 @@ impl HyperliquidProvider {
                                                 Ok(()) => Ok(None),
                                                 Err(error) => Ok(Some(GenerationOutcome::Reconnect(error))),
                                             },
-                                            Ok(DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => Ok(None),
-                                            Ok(DecodedFrame::SubscribeAccepted) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement")))),
+                                            Ok(DecodedFrame::Ignored | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong)) => Ok(None),
+                                            Ok(DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted)) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement")))),
                                             Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect")))),
                                             Ok(DecodedFrame::ProviderError(error)) | Err(error) if is_terminal_live_error(&error) => Err(error),
                                             Ok(DecodedFrame::ProviderError(error)) | Err(error) => Ok(Some(GenerationOutcome::Reconnect(error))),
@@ -1506,7 +1546,7 @@ impl HyperliquidProvider {
                     () = self.clock.sleep_until(age_deadline) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "24-hour WebSocket connection age reached"))),
                     changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::Invariant("Hyperliquid rate gate cannot be process-blocked")); },
                     frame = socket.read(), if deferred_reconnect.is_none() => match frame? {
-                        DecodedFrame::Candle(candle) => {
+                        DecodedFrame::Provider(HyperliquidDecoded::Candle(candle)) => {
                             if let Err(error) = apply_reconciliation_candle(
                                 &mut buffered,
                                 candle,
@@ -1520,7 +1560,7 @@ impl HyperliquidProvider {
                             }
                             break;
                         }
-                        DecodedFrame::Ignored | DecodedFrame::ApplicationPong => {
+                        DecodedFrame::Ignored | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong) => {
                             if let Some(ack) = request
                                 .reconcile_ack_rx
                                 .current()
@@ -1541,7 +1581,7 @@ impl HyperliquidProvider {
                                 return Ok(GenerationOutcome::Reconnect(ProviderError::ReconcileAckTimeout { generation, revision, target_open_time }));
                             }
                         }
-                        DecodedFrame::SubscribeAccepted => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))),
+                        DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))),
                         DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))),
                         DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
                         DecodedFrame::ProviderError(error) => deferred_reconnect = Some(error),
@@ -1617,7 +1657,7 @@ impl HyperliquidProvider {
                         return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
                     }
                     match frame {
-                        Ok(DecodedFrame::Candle(candle)) => {
+                        Ok(DecodedFrame::Provider(HyperliquidDecoded::Candle(candle))) => {
                             let is_new_key = !pending.contains_key(&candle.open_time());
                             if is_new_key && pending.len() == self.live.keyed_candle_capacity {
                                 let outcome = ProviderError::QueueSaturated;
@@ -1625,8 +1665,8 @@ impl HyperliquidProvider {
                             }
                             coalesce_candle(&mut pending, candle);
                         }
-                        Ok(DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => {}
-                        Ok(DecodedFrame::SubscribeAccepted) => {
+                        Ok(DecodedFrame::Ignored | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong)) => {}
+                        Ok(DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted)) => {
                             let error = live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement");
                             return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
                         }
@@ -2086,12 +2126,16 @@ pub enum LiveInputClassification {
 #[cfg(feature = "test-transport")]
 #[must_use]
 pub fn classify_live_input_for_test(
-    input: Result<DecodedFrame, ProviderError>,
+    input: Result<DecodedFrame<HyperliquidDecoded>, ProviderError>,
     instrument: &Instrument,
     timeframe: Timeframe,
 ) -> LiveInputClassification {
     let error = match input {
-        Ok(DecodedFrame::Candle(_) | DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => {
+        Ok(
+            DecodedFrame::Provider(HyperliquidDecoded::Candle(_))
+            | DecodedFrame::Ignored
+            | DecodedFrame::Provider(HyperliquidDecoded::ApplicationPong),
+        ) => {
             return LiveInputClassification::Continue;
         }
         Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => ProviderError::Protocol {
@@ -2099,11 +2143,13 @@ pub fn classify_live_input_for_test(
                 .with_market(instrument, timeframe),
             detail: "WebSocket peer requested reconnect",
         },
-        Ok(DecodedFrame::SubscribeAccepted) => ProviderError::Protocol {
-            context: ErrorContext::operation(ErrorOperation::WebSocket)
-                .with_market(instrument, timeframe),
-            detail: "duplicate Hyperliquid subscribe acknowledgement",
-        },
+        Ok(DecodedFrame::Provider(HyperliquidDecoded::SubscribeAccepted)) => {
+            ProviderError::Protocol {
+                context: ErrorContext::operation(ErrorOperation::WebSocket)
+                    .with_market(instrument, timeframe),
+                detail: "duplicate Hyperliquid subscribe acknowledgement",
+            }
+        }
         Ok(DecodedFrame::ProviderError(error)) | Err(error) => error,
     };
     LiveInputClassification::Error {

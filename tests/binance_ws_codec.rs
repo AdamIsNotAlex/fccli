@@ -7,10 +7,11 @@ use fccli::{
     model::{FinalityAuthority, Instrument, Market, ProviderId, Timeframe},
     provider::{
         binance::{decode_ws_frame, test_websocket_url},
-        runtime::websocket::{
-            DecodedFrame, WS_FRAME_SIZE, WS_MAX_WRITE_BUFFER_SIZE, WS_MESSAGE_INACTIVITY_TIMEOUT,
-            WS_MESSAGE_SIZE, WS_READ_BUFFER_SIZE, WS_STALLED_WRITE_TIMEOUT, WS_WRITE_BUFFER_SIZE,
-            WsConfig, read_raw_websocket, send_raw_websocket,
+        test_transport::{
+            BinanceDecoded, DecodedFrame, WS_FRAME_SIZE, WS_MAX_WRITE_BUFFER_SIZE,
+            WS_MESSAGE_INACTIVITY_TIMEOUT, WS_MESSAGE_SIZE, WS_READ_BUFFER_SIZE,
+            WS_STALLED_WRITE_TIMEOUT, WS_WRITE_BUFFER_SIZE, WsConfig, read_raw_websocket,
+            send_raw_websocket,
         },
     },
 };
@@ -44,7 +45,7 @@ fn instrument() -> Instrument {
     .expect("instrument")
 }
 
-fn payload_error(frame: DecodedFrame) -> PayloadError {
+fn payload_error(frame: DecodedFrame<BinanceDecoded>) -> PayloadError {
     match frame {
         DecodedFrame::ProviderError(ProviderError::Payload { source, .. }) => source,
         other => panic!("expected payload error, got {other:?}"),
@@ -242,7 +243,7 @@ fn open_and_closed_fixtures_decode_to_authoritative_candles() {
         Timeframe::Minute1,
         &config,
     ) {
-        DecodedFrame::Candle(candle) => candle,
+        DecodedFrame::Provider(BinanceDecoded::Candle(candle)) => candle,
         other => panic!("expected open candle, got {other:?}"),
     };
     assert_eq!(open.open_time(), 1_700_000_040_000);
@@ -265,7 +266,7 @@ fn open_and_closed_fixtures_decode_to_authoritative_candles() {
         Timeframe::Minute1,
         &config,
     ) {
-        DecodedFrame::Candle(candle) => candle,
+        DecodedFrame::Provider(BinanceDecoded::Candle(candle)) => candle,
         other => panic!("expected closed candle, got {other:?}"),
     };
     assert_eq!(closed.open_time(), open.open_time());
@@ -637,7 +638,7 @@ async fn decoded_queue_at_capacity_recovers_after_temporary_write_backpressure()
                 .await
                 .unwrap_or_else(|_| panic!("retained candle {index} timed out"))
                 .unwrap_or_else(|error| panic!("retained candle {index} failed: {error}")),
-            DecodedFrame::Candle(_)
+            DecodedFrame::Provider(BinanceDecoded::Candle(_))
         ));
     }
     assert_eq!(
@@ -862,7 +863,7 @@ async fn stalled_write_still_flushes_one_pong_and_retains_data_and_close() {
         read_raw_websocket(&mut socket)
             .await
             .expect("retained candle"),
-        DecodedFrame::Candle(_)
+        DecodedFrame::Provider(BinanceDecoded::Candle(_))
     ));
     assert_eq!(
         read_raw_websocket(&mut socket)
@@ -1055,7 +1056,7 @@ async fn continuous_inbound_data_cannot_extend_a_stalled_write_deadline_or_lose_
             .expect("retained candle timeout")
             .expect("retained candle")
         {
-            DecodedFrame::Candle(_) => candles += 1,
+            DecodedFrame::Provider(BinanceDecoded::Candle(_)) => candles += 1,
             DecodedFrame::Ignored => {}
             other => panic!("unexpected retained outcome {other:?}"),
         }
@@ -1179,7 +1180,7 @@ async fn deferred_terminal_error_rejects_subsequent_send_without_consuming_read_
         read_raw_websocket(&mut socket)
             .await
             .expect("retained candle"),
-        DecodedFrame::Candle(_)
+        DecodedFrame::Provider(BinanceDecoded::Candle(_))
     ));
     assert_eq!(
         read_raw_websocket(&mut socket)
