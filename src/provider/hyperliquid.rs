@@ -2,16 +2,11 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    pin::Pin,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
-    },
-    task::{Context, Poll},
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 
-use futures_util::{FutureExt, Sink, Stream, stream};
+use futures_util::{FutureExt, stream};
 use reqwest::{Client, StatusCode, Url, header::RETRY_AFTER};
 use serde::{
     Deserialize,
@@ -19,18 +14,8 @@ use serde::{
 };
 use serde_json::Value;
 use time::{Date, Month, OffsetDateTime};
-use tokio::{
-    net::TcpStream,
-    sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc},
-};
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async_with_config,
-    tungstenite::{
-        Error as WebSocketError, Message,
-        error::CapacityError,
-        protocol::{WebSocketConfig, frame::coding::CloseCode},
-    },
-};
+use tokio::sync::{Notify, mpsc};
+use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -49,6 +34,13 @@ use crate::{
         LiveFeed, LiveRequest, MarketDataProvider, ProviderFuture, RateGateSender,
         RateGateSnapshot, ReconcileAck, ReconcileExpectation, ReconcileExpectationError,
         rate_gate_channel,
+        runtime::{
+            emitter::{EventEmitter, live_channel_closed},
+            websocket::{
+                DecodedFrame, ReadinessInput, WsCodec, WsConfig, connect_websocket_url,
+                contextualize_websocket_configuration, validate_websocket_base,
+            },
+        },
     },
 };
 
@@ -67,14 +59,6 @@ const SPOT_HYPE_INDEX: &str = "@107";
 const PRODUCTION_REST_BASE: &str = "https://api.hyperliquid.xyz";
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
 const PRODUCTION_WS_BASE: &str = "wss://api.hyperliquid.xyz/ws";
-const WS_BYTE_LIMIT_MAX: usize = 16 * 1024 * 1024;
-pub const WS_READ_BUFFER_SIZE: usize = 128 * 1024;
-pub const WS_MESSAGE_SIZE: usize = 1024 * 1024;
-pub const WS_FRAME_SIZE: usize = 256 * 1024;
-pub const WS_WRITE_BUFFER_SIZE: usize = 64 * 1024;
-pub const WS_MAX_WRITE_BUFFER_SIZE: usize = 1024 * 1024;
-pub const WS_STALLED_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-pub const WS_MESSAGE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub const KEYED_CANDLE_CAPACITY: usize = 1024;
 pub const CONTROL_CAPACITY: usize = 64;
@@ -214,119 +198,7 @@ impl LiveSupervisorConfig {
     }
 }
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-#[derive(Clone, Debug)]
-pub struct HeartbeatTestHook {
-    pub started: Arc<Notify>,
-    pub due: Arc<Notify>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WsConfig {
-    pub read_buffer_size: usize,
-    pub max_message_size: usize,
-    pub max_frame_size: usize,
-    pub write_buffer_size: usize,
-    pub max_write_buffer_size: usize,
-    pub stalled_write_timeout: Duration,
-    pub message_inactivity_timeout: Duration,
-}
-
-impl WsConfig {
-    #[must_use]
-    pub const fn production() -> Self {
-        Self {
-            read_buffer_size: WS_READ_BUFFER_SIZE,
-            max_message_size: WS_MESSAGE_SIZE,
-            max_frame_size: WS_FRAME_SIZE,
-            write_buffer_size: WS_WRITE_BUFFER_SIZE,
-            max_write_buffer_size: WS_MAX_WRITE_BUFFER_SIZE,
-            stalled_write_timeout: WS_STALLED_WRITE_TIMEOUT,
-            message_inactivity_timeout: WS_MESSAGE_INACTIVITY_TIMEOUT,
-        }
-    }
-
-    pub fn validate(self) -> Result<Self, ProviderError> {
-        let byte_sizes = [
-            self.read_buffer_size,
-            self.max_message_size,
-            self.max_frame_size,
-            self.write_buffer_size,
-            self.max_write_buffer_size,
-        ];
-        if byte_sizes
-            .into_iter()
-            .any(|size| !(1..=WS_BYTE_LIMIT_MAX).contains(&size))
-        {
-            return Err(ProviderError::Configuration(
-                "WebSocket byte limits must be within 1..=16 MiB",
-            ));
-        }
-        if self.max_frame_size > self.max_message_size {
-            return Err(ProviderError::Configuration(
-                "WebSocket frame limit must not exceed message limit",
-            ));
-        }
-        if self.write_buffer_size >= self.max_write_buffer_size {
-            return Err(ProviderError::Configuration(
-                "WebSocket write buffer must be smaller than max write buffer",
-            ));
-        }
-        let largest_control_payload = self.max_frame_size.min(125);
-        let required_control_headroom = self
-            .write_buffer_size
-            .checked_add(largest_control_payload + 6)
-            .ok_or(ProviderError::Configuration(
-                "WebSocket control-frame headroom overflowed",
-            ))?;
-        if self.max_write_buffer_size < required_control_headroom {
-            return Err(ProviderError::Configuration(
-                "WebSocket max write buffer lacks automatic control-frame headroom",
-            ));
-        }
-        if !(Duration::from_millis(1)..=Duration::from_secs(60))
-            .contains(&self.stalled_write_timeout)
-        {
-            return Err(ProviderError::Configuration(
-                "WebSocket stalled-write timeout must be within 1 ms..=60 s",
-            ));
-        }
-        if !(Duration::from_millis(1)..=Duration::from_secs(120))
-            .contains(&self.message_inactivity_timeout)
-        {
-            return Err(ProviderError::Configuration(
-                "WebSocket message-inactivity timeout must be within 1 ms..=120 s",
-            ));
-        }
-        Ok(self)
-    }
-
-    fn tungstenite(self) -> Result<WebSocketConfig, ProviderError> {
-        let validated = self.validate()?;
-        Ok(WebSocketConfig::default()
-            .read_buffer_size(validated.read_buffer_size)
-            .write_buffer_size(validated.write_buffer_size)
-            .max_write_buffer_size(validated.max_write_buffer_size)
-            .max_message_size(Some(validated.max_message_size))
-            .max_frame_size(Some(validated.max_frame_size)))
-    }
-}
-
-impl Default for WsConfig {
-    fn default() -> Self {
-        Self::production()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum DecodedFrame {
-    Candle(Candle),
-    SubscribeAccepted,
-    ApplicationPong,
-    Ignored,
-    ProviderError(ProviderError),
-    ServerShutdown,
-    Close(Option<CloseCode>),
-}
+use crate::provider::runtime::websocket::HeartbeatTestHook;
 
 #[derive(Deserialize)]
 struct HlCandle {
@@ -358,32 +230,10 @@ pub struct HyperliquidWsCodec {
 }
 
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-#[derive(Clone, Debug)]
-pub struct ReadinessDecodedAckTestHook {
-    pub observed: Arc<Notify>,
-    pub release: Arc<Notify>,
-}
-
-#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-#[derive(Clone, Debug)]
-pub struct ReadinessDrainBudgetTestHook {
-    pub observed: Arc<Notify>,
-    pub release: Arc<Notify>,
-}
-
-#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-#[derive(Clone, Debug)]
-pub struct SubscribeFlushTestHook {
-    pub blocked: Arc<Notify>,
-    pub release: Arc<Notify>,
-}
-
-#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-#[derive(Clone, Debug)]
-pub struct CloseFlushTestHook {
-    pub blocked: Arc<Notify>,
-    pub release: Arc<Notify>,
-}
+use crate::provider::runtime::websocket::{
+    CloseFlushTestHook, ReadinessDecodedAckTestHook, ReadinessDrainBudgetTestHook,
+    SubscribeFlushTestHook,
+};
 
 impl HyperliquidWsCodec {
     #[must_use]
@@ -391,6 +241,19 @@ impl HyperliquidWsCodec {
         Self {
             retained_candle: None,
         }
+    }
+}
+
+impl WsCodec for HyperliquidWsCodec {
+    fn decode(
+        &mut self,
+        message: Message,
+        instrument: &Instrument,
+        timeframe: Timeframe,
+        config: &WsConfig,
+        output: &mut VecDeque<DecodedFrame>,
+    ) {
+        decode_ws_frame(self, message, instrument, timeframe, config, output);
     }
 }
 
@@ -425,37 +288,7 @@ fn websocket_url_from_base(
     timeframe: Timeframe,
     loopback_only: bool,
 ) -> Result<Url, ProviderError> {
-    let url = Url::parse(base_url)
-        .map_err(|_| ProviderError::Configuration("invalid WebSocket base URL"))?;
-    let valid_scheme = if loopback_only {
-        url.scheme() == "ws"
-    } else {
-        url.scheme() == "wss"
-    };
-    if !valid_scheme || url.query().is_some() || url.fragment().is_some() {
-        return Err(ProviderError::Configuration("invalid WebSocket base URL"));
-    }
-    if loopback_only {
-        let host = url.host_str().ok_or(ProviderError::Configuration(
-            "WebSocket test URL requires a host",
-        ))?;
-        let ip_literal = host
-            .strip_prefix('[')
-            .and_then(|host| host.strip_suffix(']'))
-            .unwrap_or(host);
-        let ip = ip_literal.parse::<std::net::IpAddr>().map_err(|_| {
-            ProviderError::Configuration("WebSocket test URL must use a literal loopback host")
-        })?;
-        if !ip.is_loopback()
-            || url.port().is_none_or(|port| port == 0)
-            || !url.username().is_empty()
-            || url.password().is_some()
-        {
-            return Err(ProviderError::Configuration(
-                "WebSocket test URL must be plain WS on a literal loopback host with an explicit nonzero port",
-            ));
-        }
-    }
+    let url = validate_websocket_base(base_url, loopback_only)?;
     let _ = (instrument, timeframe);
     if url.path() != "/" && !url.path().is_empty() && url.path() != "/ws" {
         return Err(ProviderError::Configuration("invalid WebSocket base URL"));
@@ -640,496 +473,8 @@ fn decode_candle_payload(
     outcomes.push_back(DecodedFrame::Candle(closed));
     outcomes.push_back(DecodedFrame::Candle(candidate));
 }
-// Stop draining after this many continuously-ready frames; actionable retained outcomes still
-// arbitrate before cancellation and deadline branches receive their fairness poll.
-const READINESS_DRAIN_POLL_BUDGET: usize = 256;
 
-pub struct RawWebSocket {
-    stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    config: WsConfig,
-    context: ErrorContext,
-    instrument: Instrument,
-    timeframe: Timeframe,
-    codec: HyperliquidWsCodec,
-    decoded: VecDeque<DecodedFrame>,
-    outbound: VecDeque<Message>,
-    flush_pending: bool,
-    write_stall_deadline: Option<tokio::time::Instant>,
-    last_data_message: tokio::time::Instant,
-    terminal_io: bool,
-    application_heartbeat_interval: Duration,
-    pending_terminal_error: Option<ProviderError>,
-    stalled_write_error: Option<ProviderError>,
-    next_application_ping: Option<tokio::time::Instant>,
-    peer_close_received: bool,
-    readiness_drain_yielded: bool,
-    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-    heartbeat_test_hook: Option<HeartbeatTestHook>,
-    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-    readiness_inactivity_test_hook: Option<Arc<Notify>>,
-    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-    readiness_decoded_ack_test_hook: Option<ReadinessDecodedAckTestHook>,
-    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-    readiness_drain_budget_test_hook: Option<ReadinessDrainBudgetTestHook>,
-    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-    force_stalled_write_after_readiness_frame: bool,
-    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-    subscribe_flush_test_hook: Option<SubscribeFlushTestHook>,
-    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-    close_flush_test_hook: Option<CloseFlushTestHook>,
-}
-
-impl RawWebSocket {
-    #[must_use]
-    pub const fn config(&self) -> &WsConfig {
-        &self.config
-    }
-
-    pub fn start_application_heartbeat(&mut self, interval: Duration) {
-        self.application_heartbeat_interval = interval;
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        if let Some(hook) = &self.heartbeat_test_hook {
-            hook.started.notify_one();
-            return;
-        }
-        self.next_application_ping = tokio::time::Instant::now().checked_add(interval);
-    }
-
-    #[must_use]
-    pub const fn application_heartbeat_started(&self) -> bool {
-        self.next_application_ping.is_some()
-    }
-
-    fn application_heartbeat_enabled(&self) -> bool {
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        if self.heartbeat_test_hook.is_some() {
-            return true;
-        }
-        self.next_application_ping.is_some()
-    }
-
-    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-    pub fn force_application_heartbeat_due_for_test(&mut self) {
-        assert!(
-            self.application_heartbeat_started(),
-            "heartbeat must be enabled first"
-        );
-        self.next_application_ping = Some(tokio::time::Instant::now());
-    }
-    async fn read_readiness(&mut self) -> ReadinessInput {
-        let inactivity_deadline = self.last_data_message + self.config.message_inactivity_timeout;
-        futures_util::future::poll_fn(|cx| {
-            self.readiness_drain_yielded = false;
-            let io = self.poll_io(cx, inactivity_deadline, false, true);
-            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            if self.readiness_drain_yielded
-                && let Some(hook) = self.readiness_drain_budget_test_hook.take()
-            {
-                hook.observed.notify_one();
-                let waker = cx.waker().clone();
-                tokio::spawn(async move {
-                    hook.release.notified().await;
-                    waker.wake();
-                });
-                return Poll::Pending;
-            }
-            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            if let Some(hook) = &self.readiness_decoded_ack_test_hook
-                && self
-                    .decoded
-                    .iter()
-                    .any(|frame| matches!(frame, DecodedFrame::SubscribeAccepted))
-            {
-                hook.observed.notify_one();
-                let release = Arc::clone(&hook.release);
-                let waker = cx.waker().clone();
-                self.readiness_decoded_ack_test_hook = None;
-                tokio::spawn(async move {
-                    release.notified().await;
-                    waker.wake();
-                });
-                return Poll::Pending;
-            }
-            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-            if self.force_stalled_write_after_readiness_frame && !self.decoded.is_empty() {
-                self.force_stalled_write_after_readiness_frame = false;
-                self.stalled_write_error = Some(ProviderError::Timeout {
-                    context: self.context.clone(),
-                    kind: TimeoutKind::StalledWrite,
-                });
-            }
-            if !self.readiness_drain_yielded
-                || has_actionable_readiness(
-                    &self.decoded,
-                    self.pending_terminal_error.as_ref(),
-                    self.stalled_write_error.as_ref(),
-                )
-            {
-                if let Some(input) = take_prioritized_readiness(
-                    &mut self.decoded,
-                    self.pending_terminal_error.take(),
-                    self.stalled_write_error.clone(),
-                ) {
-                    return Poll::Ready(input);
-                }
-            }
-            if self.readiness_drain_yielded {
-                return Poll::Pending;
-            }
-            match io {
-                Poll::Ready(Err(error)) => Poll::Ready(ReadinessInput::Error(error)),
-                Poll::Ready(Ok(())) | Poll::Pending => Poll::Pending,
-            }
-        })
-        .await
-    }
-
-    fn inactivity_deadline(&self) -> tokio::time::Instant {
-        self.last_data_message + self.config.message_inactivity_timeout
-    }
-
-    pub async fn read(&mut self) -> Result<DecodedFrame, ProviderError> {
-        loop {
-            if self.stalled_write_error.is_some() {
-                if let Some(outcome) = self.decoded.pop_front() {
-                    return Ok(outcome);
-                }
-            } else if !self.flush_pending
-                && self.outbound.is_empty()
-                && let Some(outcome) = self.decoded.pop_front()
-            {
-                return Ok(outcome);
-            }
-            if let Some(error) = self.pending_terminal_error.take() {
-                return Err(error);
-            }
-            self.pump(false).await?;
-        }
-    }
-
-    pub async fn send(&mut self, message: Message) -> Result<(), ProviderError> {
-        self.reject_terminal_write()?;
-        self.outbound.push_back(message);
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        if let Some(hook) = self.subscribe_flush_test_hook.take() {
-            hook.blocked.notify_one();
-            hook.release.notified().await;
-        }
-        self.ensure_write_stall_deadline();
-        while !self.outbound.is_empty() || self.flush_pending {
-            self.pump(true).await?;
-        }
-        Ok(())
-    }
-
-    pub async fn flush(&mut self) -> Result<(), ProviderError> {
-        self.reject_terminal_write()?;
-        if self.flush_pending || !self.outbound.is_empty() {
-            self.ensure_write_stall_deadline();
-        }
-        while !self.outbound.is_empty() || self.flush_pending {
-            self.pump(true).await?;
-        }
-        Ok(())
-    }
-
-    fn reject_terminal_write(&self) -> Result<(), ProviderError> {
-        if let Some(error) = &self.stalled_write_error {
-            return Err(error.clone());
-        }
-        if !self.terminal_io {
-            return Ok(());
-        }
-        Err(self
-            .pending_terminal_error
-            .clone()
-            .unwrap_or_else(|| ProviderError::Transport {
-                context: self.context.clone(),
-                cause: SanitizedCause::Closed,
-            }))
-    }
-
-    fn enter_stalled_write_drain(&mut self, error: ProviderError) {
-        self.outbound.clear();
-        self.flush_pending = false;
-        self.write_stall_deadline = None;
-        if self.stalled_write_error.is_none() {
-            self.stalled_write_error = Some(error);
-        }
-    }
-
-    fn ensure_write_stall_deadline(&mut self) {
-        if self.write_stall_deadline.is_none() {
-            self.write_stall_deadline = Some(
-                tokio::time::Instant::now()
-                    .checked_add(self.config.stalled_write_timeout)
-                    .unwrap_or(tokio::time::Instant::now()),
-            );
-        }
-    }
-
-    fn finish_terminal_io(&mut self) {
-        self.terminal_io = true;
-        self.outbound.clear();
-        self.flush_pending = false;
-        self.write_stall_deadline = None;
-    }
-
-    fn finish_or_defer_terminal_error(
-        &mut self,
-        error: ProviderError,
-        report_to_writer: bool,
-    ) -> Result<(), ProviderError> {
-        let error = self.stalled_write_error.clone().unwrap_or(error);
-        self.peer_close_received = false;
-        self.finish_terminal_io();
-        if !self.decoded.is_empty() {
-            if self.pending_terminal_error.is_none() {
-                self.pending_terminal_error = Some(error.clone());
-            }
-            if report_to_writer {
-                return Err(error);
-            }
-            Ok(())
-        } else {
-            Err(error)
-        }
-    }
-
-    fn fail_write_and_drain(&mut self, error: ProviderError) -> Result<(), ProviderError> {
-        self.enter_stalled_write_drain(error.clone());
-        Err(error)
-    }
-
-    async fn pump(&mut self, writing: bool) -> Result<(), ProviderError> {
-        if self.terminal_io {
-            if writing {
-                return self.reject_terminal_write();
-            }
-            if !self.decoded.is_empty() {
-                return Ok(());
-            }
-            if let Some(error) = self.pending_terminal_error.take() {
-                return Err(error);
-            }
-            return Err(ProviderError::Transport {
-                context: self.context.clone(),
-                cause: SanitizedCause::Closed,
-            });
-        }
-        if self.stalled_write_error.is_none()
-            && (writing || self.flush_pending || !self.outbound.is_empty())
-        {
-            self.ensure_write_stall_deadline();
-        }
-        let inactivity_deadline = self.last_data_message + self.config.message_inactivity_timeout;
-        let heartbeat_deadline = self.next_application_ping;
-        let heartbeat_enabled = self.application_heartbeat_enabled();
-        let write_stall_deadline = self.write_stall_deadline;
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        let heartbeat_test_due = self
-            .heartbeat_test_hook
-            .as_ref()
-            .map(|hook| Arc::clone(&hook.due));
-        if write_stall_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            let error = ProviderError::Timeout {
-                context: self.context.clone(),
-                kind: TimeoutKind::StalledWrite,
-            };
-            return self.fail_write_and_drain(error);
-        }
-        let stall_sleep_deadline = write_stall_deadline.unwrap_or(inactivity_deadline);
-        let inactivity_context = self.context.clone();
-        let stalled_write_context = self.context.clone();
-        tokio::select! {
-            biased;
-            result = futures_util::future::poll_fn(|cx| self.poll_io(cx, inactivity_deadline, writing, false)) => result,
-            () = tokio::time::sleep_until(inactivity_deadline) => {
-                let error = ProviderError::Timeout {
-                    context: inactivity_context,
-                    kind: TimeoutKind::WebSocketInactivity,
-                };
-                self.finish_or_defer_terminal_error(error, writing)
-            },
-            () = tokio::time::sleep_until(stall_sleep_deadline), if write_stall_deadline.is_some() => {
-                let error = ProviderError::Timeout {
-                    context: stalled_write_context,
-                    kind: TimeoutKind::StalledWrite,
-                };
-                self.fail_write_and_drain(error)
-            },
-            () = async move {
-                #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-                if let Some(due) = heartbeat_test_due {
-                    due.notified().await;
-                    return;
-                }
-                tokio::time::sleep_until(heartbeat_deadline.unwrap_or(inactivity_deadline)).await;
-            }, if heartbeat_enabled => {
-                self.outbound.push_back(Message::Text(r#"{"method":"ping"}"#.into()));
-                self.next_application_ping = tokio::time::Instant::now().checked_add(self.application_heartbeat_interval);
-                self.ensure_write_stall_deadline();
-                Ok(())
-            },
-        }
-    }
-
-    fn poll_io(
-        &mut self,
-        cx: &mut Context<'_>,
-        inactivity_deadline: tokio::time::Instant,
-        writing: bool,
-        readiness: bool,
-    ) -> Poll<Result<(), ProviderError>> {
-        if self
-            .write_stall_deadline
-            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-        {
-            let error = ProviderError::Timeout {
-                context: self.context.clone(),
-                kind: TimeoutKind::StalledWrite,
-            };
-            return Poll::Ready(self.fail_write_and_drain(error));
-        }
-        let mut made_progress = false;
-        let mut readiness_frames = 0;
-        loop {
-            if readiness && readiness_frames == READINESS_DRAIN_POLL_BUDGET {
-                self.readiness_drain_yielded = true;
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            if !readiness && self.decoded.len() > 62 {
-                break;
-            }
-            match Stream::poll_next(Pin::new(&mut self.stream), cx) {
-                Poll::Ready(Some(Ok(message))) => {
-                    let is_data = matches!(message, Message::Text(_) | Message::Binary(_));
-                    if is_data {
-                        self.last_data_message = tokio::time::Instant::now();
-                    } else if tokio::time::Instant::now() >= inactivity_deadline {
-                        let error = ProviderError::Timeout {
-                            context: self.context.clone(),
-                            kind: TimeoutKind::WebSocketInactivity,
-                        };
-                        return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
-                    }
-                    self.flush_pending = true;
-                    if self.stalled_write_error.is_none() {
-                        self.ensure_write_stall_deadline();
-                    }
-                    decode_ws_frame(
-                        &mut self.codec,
-                        message,
-                        &self.instrument,
-                        self.timeframe,
-                        &self.config,
-                        &mut self.decoded,
-                    );
-                    if self
-                        .decoded
-                        .iter()
-                        .any(|decoded| matches!(decoded, DecodedFrame::Close(_)))
-                    {
-                        self.outbound.clear();
-                        self.peer_close_received = true;
-                    }
-                    made_progress = true;
-                    if readiness {
-                        coalesce_readiness_outcomes(&mut self.decoded);
-                        readiness_frames += 1;
-                    }
-                }
-                Poll::Ready(Some(Err(error))) => {
-                    let error = map_websocket_error(error, &self.context);
-                    return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
-                }
-                Poll::Ready(None) => {
-                    let error = ProviderError::Transport {
-                        context: self.context.clone(),
-                        cause: SanitizedCause::Closed,
-                    };
-                    return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
-                }
-                Poll::Pending => break,
-            }
-        }
-        if self.decoded.is_empty() && tokio::time::Instant::now() >= inactivity_deadline {
-            let error = ProviderError::Timeout {
-                context: self.context.clone(),
-                kind: TimeoutKind::WebSocketInactivity,
-            };
-            return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
-        }
-        if self.stalled_write_error.is_none()
-            && !self.peer_close_received
-            && let Some(message) = self.outbound.pop_front()
-        {
-            let mut stream = Pin::new(&mut self.stream);
-            match Sink::<Message>::poll_ready(stream.as_mut(), cx) {
-                Poll::Ready(Ok(())) => match Sink::<Message>::start_send(stream, message) {
-                    Ok(()) => {
-                        self.flush_pending = true;
-                        if self.stalled_write_error.is_none() {
-                            self.ensure_write_stall_deadline();
-                        }
-                        made_progress = true;
-                    }
-                    Err(error) => {
-                        let error = map_websocket_error(error, &self.context);
-                        return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
-                    }
-                },
-                Poll::Ready(Err(error)) => {
-                    let error = map_websocket_error(error, &self.context);
-                    return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
-                }
-                Poll::Pending => self.outbound.push_front(message),
-            }
-        }
-
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        if self.peer_close_received
-            && let Some(hook) = self.close_flush_test_hook.take()
-        {
-            hook.blocked.notify_one();
-            let waker = cx.waker().clone();
-            tokio::spawn(async move {
-                hook.release.notified().await;
-                waker.wake();
-            });
-            return Poll::Pending;
-        }
-
-        match Sink::<Message>::poll_flush(Pin::new(&mut self.stream), cx) {
-            Poll::Ready(Ok(())) => {
-                self.flush_pending = false;
-                if self.peer_close_received {
-                    self.peer_close_received = false;
-                    let error = ProviderError::Transport {
-                        context: self.context.clone(),
-                        cause: SanitizedCause::Closed,
-                    };
-                    return Poll::Ready(self.finish_or_defer_terminal_error(error, writing));
-                }
-                if self.outbound.is_empty() {
-                    self.write_stall_deadline = None;
-                }
-                if made_progress || !self.decoded.is_empty() {
-                    Poll::Ready(Ok(()))
-                } else {
-                    Poll::Pending
-                }
-            }
-            Poll::Ready(Err(error)) => {
-                let error = map_websocket_error(error, &self.context);
-                Poll::Ready(self.finish_or_defer_terminal_error(error, writing))
-            }
-            Poll::Pending if made_progress => Poll::Ready(Ok(())),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
+pub type RawWebSocket = crate::provider::runtime::websocket::RawWebSocket<HyperliquidWsCodec>;
 
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
 pub async fn connect_websocket(
@@ -1138,7 +483,15 @@ pub async fn connect_websocket(
     config: WsConfig,
 ) -> Result<RawWebSocket, ProviderError> {
     let url = websocket_url(instrument, timeframe)?;
-    connect_websocket_url(&url, instrument, timeframe, config).await
+    connect_websocket_url(
+        &url,
+        instrument,
+        timeframe,
+        config,
+        HyperliquidWsCodec::new(),
+        Some(Message::Text(r#"{"method":"ping"}"#.into())),
+    )
+    .await
 }
 
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -1149,213 +502,15 @@ pub async fn connect_test_websocket(
     config: WsConfig,
 ) -> Result<RawWebSocket, ProviderError> {
     let url = test_websocket_url(base_url, instrument, timeframe)?;
-    connect_websocket_url(&url, instrument, timeframe, config).await
-}
-
-async fn connect_websocket_url(
-    url: &Url,
-    instrument: &Instrument,
-    timeframe: Timeframe,
-    config: WsConfig,
-) -> Result<RawWebSocket, ProviderError> {
-    let context =
-        ErrorContext::operation(ErrorOperation::WebSocket).with_market(instrument, timeframe);
-    let config = config
-        .validate()
-        .map_err(|error| contextualize_websocket_configuration(error, instrument, timeframe))?;
-    let tungstenite = config
-        .tungstenite()
-        .map_err(|error| contextualize_websocket_configuration(error, instrument, timeframe))?;
-    let stream = connect_async_with_config(url.as_str(), Some(tungstenite), false)
-        .await
-        .map(|(socket, _)| socket)
-        .map_err(|error| map_websocket_error(error, &context))?;
-    Ok(RawWebSocket {
-        stream,
-        config,
-        context,
-        instrument: instrument.clone(),
+    connect_websocket_url(
+        &url,
+        instrument,
         timeframe,
-        codec: HyperliquidWsCodec::new(),
-        decoded: VecDeque::new(),
-        outbound: VecDeque::new(),
-        flush_pending: false,
-        write_stall_deadline: None,
-        last_data_message: tokio::time::Instant::now(),
-        terminal_io: false,
-        application_heartbeat_interval: APPLICATION_HEARTBEAT_INTERVAL,
-        readiness_drain_yielded: false,
-        pending_terminal_error: None,
-        stalled_write_error: None,
-        next_application_ping: None,
-        peer_close_received: false,
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        heartbeat_test_hook: None,
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        subscribe_flush_test_hook: None,
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        close_flush_test_hook: None,
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        readiness_inactivity_test_hook: None,
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        readiness_decoded_ack_test_hook: None,
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        readiness_drain_budget_test_hook: None,
-        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
-        force_stalled_write_after_readiness_frame: false,
-    })
-}
-fn coalesce_readiness_outcomes(decoded: &mut VecDeque<DecodedFrame>) {
-    let mut best: Option<DecodedFrame> = None;
-    while let Some(frame) = decoded.pop_front() {
-        if best
-            .as_ref()
-            .is_none_or(|retained| readiness_priority(&frame) < readiness_priority(retained))
-        {
-            best = Some(frame);
-        }
-    }
-    if let Some(frame) = best {
-        decoded.push_back(frame);
-    }
-}
-
-fn has_actionable_readiness(
-    decoded: &VecDeque<DecodedFrame>,
-    terminal_error: Option<&ProviderError>,
-    stalled_write_error: Option<&ProviderError>,
-) -> bool {
-    terminal_error.is_some()
-        || stalled_write_error.is_some()
-        || decoded
-            .iter()
-            .any(|frame| readiness_priority(frame) < readiness_priority(&DecodedFrame::Ignored))
-}
-
-fn readiness_priority(frame: &DecodedFrame) -> u8 {
-    match frame {
-        DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => 0,
-        DecodedFrame::ProviderError(_) | DecodedFrame::Candle(_) => 1,
-        DecodedFrame::SubscribeAccepted => 2,
-        DecodedFrame::Ignored | DecodedFrame::ApplicationPong => 3,
-    }
-}
-
-pub async fn read_raw_websocket(socket: &mut RawWebSocket) -> Result<DecodedFrame, ProviderError> {
-    socket.read().await
-}
-
-pub async fn send_raw_websocket(
-    socket: &mut RawWebSocket,
-    message: Message,
-) -> Result<(), ProviderError> {
-    socket.send(message).await
-}
-
-pub async fn flush_raw_websocket(socket: &mut RawWebSocket) -> Result<(), ProviderError> {
-    socket.flush().await
-}
-
-fn map_websocket_error(error: WebSocketError, context: &ErrorContext) -> ProviderError {
-    match error {
-        WebSocketError::Capacity(CapacityError::MessageTooLong { max_size, .. }) => payload(
-            context,
-            PayloadError::OverBudget {
-                limit_bytes: max_size,
-            },
-        ),
-        WebSocketError::Protocol(_) => ProviderError::Protocol {
-            context: context.clone(),
-            detail: "invalid WebSocket framing",
-        },
-        WebSocketError::Utf8(_) => ProviderError::Protocol {
-            context: context.clone(),
-            detail: "invalid WebSocket UTF-8",
-        },
-        WebSocketError::AttackAttempt => ProviderError::Protocol {
-            context: context.clone(),
-            detail: "WebSocket attack attempt rejected",
-        },
-        WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed => {
-            ProviderError::Transport {
-                context: context.clone(),
-                cause: SanitizedCause::Closed,
-            }
-        }
-        WebSocketError::Tls(_) => ProviderError::Transport {
-            context: context.clone(),
-            cause: SanitizedCause::Tls,
-        },
-        WebSocketError::Io(_) => ProviderError::Transport {
-            context: context.clone(),
-            cause: SanitizedCause::Io,
-        },
-        WebSocketError::Url(_) | WebSocketError::Http(_) | WebSocketError::HttpFormat(_) => {
-            ProviderError::Transport {
-                context: context.clone(),
-                cause: SanitizedCause::Connection,
-            }
-        }
-        WebSocketError::Capacity(_) | WebSocketError::WriteBufferFull(_) => {
-            ProviderError::Protocol {
-                context: context.clone(),
-                detail: "WebSocket capacity invariant failed",
-            }
-        }
-    }
-}
-
-fn contextualize_websocket_configuration(
-    error: ProviderError,
-    instrument: &Instrument,
-    timeframe: Timeframe,
-) -> ProviderError {
-    match error {
-        ProviderError::Configuration(detail) => ProviderError::WebSocketConfiguration {
-            context: ErrorContext::operation(ErrorOperation::WebSocket)
-                .with_market(instrument, timeframe),
-            detail,
-        },
-        other => other,
-    }
-}
-
-fn take_prioritized_readiness(
-    decoded: &mut VecDeque<DecodedFrame>,
-    terminal_error: Option<ProviderError>,
-    stalled_write_error: Option<ProviderError>,
-) -> Option<ReadinessInput> {
-    if let Some(index) = decoded
-        .iter()
-        .position(|frame| matches!(frame, DecodedFrame::Close(_) | DecodedFrame::ServerShutdown))
-    {
-        return Some(ReadinessInput::Frame(
-            decoded
-                .remove(index)
-                .expect("readiness terminal frame index"),
-        ));
-    }
-    if let Some(error) = stalled_write_error.or(terminal_error) {
-        return Some(ReadinessInput::Error(error));
-    }
-    let index = decoded
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, frame)| match frame {
-            DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => 0,
-            DecodedFrame::ProviderError(_) | DecodedFrame::Candle(_) => 1,
-            DecodedFrame::SubscribeAccepted => 2,
-            DecodedFrame::Ignored | DecodedFrame::ApplicationPong => 3,
-        })
-        .map(|(index, _)| index)?;
-    Some(ReadinessInput::Frame(
-        decoded.remove(index).expect("readiness frame index"),
-    ))
-}
-
-enum ReadinessInput {
-    Frame(DecodedFrame),
-    Error(ProviderError),
+        config,
+        HyperliquidWsCodec::new(),
+        Some(Message::Text(r#"{"method":"ping"}"#.into())),
+    )
+    .await
 }
 
 #[derive(Clone)]
@@ -1925,7 +1080,7 @@ impl HyperliquidProvider {
                             return Ok(GenerationOutcome::Reconnect(Self::subscribe_ack_timeout(request)));
                         }
                     }
-                    ReadinessInput::Frame(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))),
+                    ReadinessInput::Frame(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))),
                     ReadinessInput::Frame(DecodedFrame::ProviderError(error)) => return Ok(GenerationOutcome::Reconnect(error)),
                     ReadinessInput::Frame(DecodedFrame::Candle(_)) => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "Hyperliquid candle arrived before subscribe acknowledgement"))),
                 },
@@ -1987,7 +1142,7 @@ impl HyperliquidProvider {
                             }
                         }
                         DecodedFrame::SubscribeAccepted => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))),
-                        DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => return Ok(GenerationOutcome::Reconnect(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" })),
+                        DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested => return Ok(GenerationOutcome::Reconnect(ProviderError::Protocol { context: ErrorContext::operation(ErrorOperation::WebSocket).with_market(&request.instrument, request.timeframe), detail: "WebSocket peer requested reconnect" })),
                         DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
                         DecodedFrame::ProviderError(error) => return Ok(GenerationOutcome::Reconnect(error)),
                     },
@@ -2135,7 +1290,7 @@ impl HyperliquidProvider {
                                         "duplicate Hyperliquid subscribe acknowledgement",
                                     )));
                                 }
-                                Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => {
+                                Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => {
                                     return Ok(GenerationOutcome::Reconnect(live_protocol_error(
                                         request,
                                         "WebSocket peer requested reconnect",
@@ -2199,7 +1354,7 @@ impl HyperliquidProvider {
                                         },
                                         Ok(DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => Ok((None, false)),
                                         Ok(DecodedFrame::SubscribeAccepted) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))), false)),
-                                        Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))), false)),
+                                        Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))), false)),
                                         Ok(DecodedFrame::ProviderError(error)) | Err(error) if is_terminal_live_error(&error) => Err(error),
                                         Ok(DecodedFrame::ProviderError(error)) | Err(error) => Ok((Some(GenerationOutcome::Reconnect(error)), false)),
                                     },
@@ -2235,7 +1390,7 @@ impl HyperliquidProvider {
                                             },
                                             Ok(DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => Ok(None),
                                             Ok(DecodedFrame::SubscribeAccepted) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement")))),
-                                            Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect")))),
+                                            Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect")))),
                                             Ok(DecodedFrame::ProviderError(error)) | Err(error) if is_terminal_live_error(&error) => Err(error),
                                             Ok(DecodedFrame::ProviderError(error)) | Err(error) => Ok(Some(GenerationOutcome::Reconnect(error))),
                                         },
@@ -2387,7 +1542,7 @@ impl HyperliquidProvider {
                             }
                         }
                         DecodedFrame::SubscribeAccepted => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))),
-                        DecodedFrame::Close(_) | DecodedFrame::ServerShutdown => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))),
+                        DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested => return Ok(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))),
                         DecodedFrame::ProviderError(error) if is_terminal_live_error(&error) => return Err(error),
                         DecodedFrame::ProviderError(error) => deferred_reconnect = Some(error),
                     },
@@ -2475,7 +1630,7 @@ impl HyperliquidProvider {
                             let error = live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement");
                             return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
                         }
-                        Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => {
+                        Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => {
                             let error = live_protocol_error(request, "WebSocket peer requested reconnect");
                             return Ok(if connected_queued { GenerationOutcome::AcknowledgedReconnect(error) } else { GenerationOutcome::Reconnect(error) });
                         }
@@ -2690,372 +1845,6 @@ enum GenerationOutcome {
     Cancelled,
     AcknowledgedReconnect(ProviderError),
     Reconnect(ProviderError),
-}
-
-type StatusKey = (Option<GapGeneration>, ConnectionStatus);
-
-struct EventEnvelope {
-    item: Option<Result<MarketEvent, ProviderError>>,
-    generation: Option<GapGeneration>,
-    purge_on_invalidate: bool,
-    connected_delivered: Arc<AtomicU64>,
-    control_key: Option<StatusKey>,
-    pending_controls: Arc<Mutex<Vec<StatusKey>>>,
-    _regular_permit: Option<OwnedSemaphorePermit>,
-    _control_permit: Option<OwnedSemaphorePermit>,
-    emergency_slot: Option<u8>,
-    emergency_barrier: Option<Arc<EmergencyBarrier>>,
-}
-
-impl EventEnvelope {
-    fn into_item(mut self) -> Result<MarketEvent, ProviderError> {
-        let item = self.item.take().expect("event envelope contains an item");
-        if let Ok(MarketEvent::Status {
-            generation: Some(generation),
-            status: ConnectionStatus::Connected,
-        }) = &item
-        {
-            self.connected_delivered
-                .fetch_max(generation.0, Ordering::AcqRel);
-        }
-        item
-    }
-
-    fn is_stopped(&self) -> bool {
-        matches!(
-            self.item.as_ref(),
-            Some(Ok(MarketEvent::Status {
-                generation: None,
-                status: ConnectionStatus::Stopped,
-            }))
-        )
-    }
-}
-
-impl Drop for EventEnvelope {
-    fn drop(&mut self) {
-        if let Some(key) = self.control_key {
-            let mut pending = self
-                .pending_controls
-                .lock()
-                .expect("control mutex poisoned");
-            if let Some(index) = pending.iter().position(|pending_key| *pending_key == key) {
-                pending.swap_remove(index);
-            }
-        }
-        if let (Some(slot), Some(barrier)) = (self.emergency_slot, &self.emergency_barrier) {
-            barrier.dequeued(slot);
-        }
-    }
-}
-
-struct EmergencyBarrier {
-    pending: AtomicU8,
-    suppressed: AtomicU8,
-    notify: Notify,
-}
-
-impl EmergencyBarrier {
-    const fn new() -> Self {
-        Self {
-            pending: AtomicU8::new(0),
-            suppressed: AtomicU8::new(0),
-            notify: Notify::const_new(),
-        }
-    }
-
-    fn begin_pair(&self) -> Result<(), ProviderError> {
-        self.suppressed.store(0, Ordering::Release);
-        self.pending
-            .compare_exchange(0, 0b11, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| ())
-            .map_err(|_| ProviderError::Invariant("emergency barrier already active"))
-    }
-
-    fn dequeued(&self, slot: u8) {
-        self.pending.fetch_and(!(1 << slot), Ordering::AcqRel);
-        self.notify.notify_one();
-    }
-
-    fn suppress_pending(&self) {
-        self.suppressed
-            .fetch_or(self.pending.load(Ordering::Acquire), Ordering::AcqRel);
-    }
-
-    fn begin_shutdown(&self) {
-        self.suppressed.store(0, Ordering::Release);
-        self.pending.store(0b01, Ordering::Release);
-    }
-
-    fn is_suppressed(&self, slot: u8) -> bool {
-        self.suppressed.load(Ordering::Acquire) & (1 << slot) != 0
-    }
-
-    fn is_dequeued(&self) -> bool {
-        self.pending.load(Ordering::Acquire) == 0
-    }
-
-    async fn wait_dequeued(&self) {
-        while !self.is_dequeued() {
-            let notified = self.notify.notified();
-            if self.is_dequeued() {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
-
-#[derive(Clone)]
-struct EventEmitter {
-    sender: mpsc::Sender<EventEnvelope>,
-    regular_permits: Arc<Semaphore>,
-    control_permits: Arc<Semaphore>,
-    invalidated_through: Arc<AtomicU64>,
-    connected_delivered: Arc<AtomicU64>,
-    pending_controls: Arc<Mutex<Vec<StatusKey>>>,
-    emergency_barrier: Arc<EmergencyBarrier>,
-    shutdown: Arc<AtomicBool>,
-}
-
-impl EventEmitter {
-    fn new(
-        sender: mpsc::Sender<EventEnvelope>,
-        regular_capacity: usize,
-        control_capacity: usize,
-    ) -> Self {
-        Self {
-            sender,
-            regular_permits: Arc::new(Semaphore::new(regular_capacity)),
-            control_permits: Arc::new(Semaphore::new(control_capacity)),
-            invalidated_through: Arc::new(AtomicU64::new(0)),
-            connected_delivered: Arc::new(AtomicU64::new(0)),
-            pending_controls: Arc::new(Mutex::new(Vec::new())),
-            emergency_barrier: Arc::new(EmergencyBarrier::new()),
-            shutdown: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    async fn reserve_regular(&self) -> Result<OwnedSemaphorePermit, ProviderError> {
-        if self.shutdown.load(Ordering::Acquire) {
-            return Err(live_channel_closed());
-        }
-        Arc::clone(&self.regular_permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| live_channel_closed())
-    }
-
-    fn send_reserved(
-        &self,
-        permit: OwnedSemaphorePermit,
-        event: MarketEvent,
-    ) -> Result<(), ProviderError> {
-        if self.shutdown.load(Ordering::Acquire) {
-            return Err(live_channel_closed());
-        }
-        let generation = event_generation(&event);
-        let purge_on_invalidate = event_purges_with_generation(&event);
-        self.sender
-            .try_send(EventEnvelope {
-                item: Some(Ok(event)),
-                generation,
-                purge_on_invalidate,
-                connected_delivered: Arc::clone(&self.connected_delivered),
-                control_key: None,
-                pending_controls: Arc::clone(&self.pending_controls),
-                _regular_permit: Some(permit),
-                _control_permit: None,
-                emergency_slot: None,
-                emergency_barrier: None,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Closed(_) => live_channel_closed(),
-                mpsc::error::TrySendError::Full(_) => {
-                    ProviderError::Invariant("reserved market event channel capacity exhausted")
-                }
-            })
-    }
-
-    async fn wait_closed(&self) {
-        self.sender.closed().await;
-    }
-
-    async fn send_regular(&self, event: MarketEvent) -> Result<(), ProviderError> {
-        let control_key = status_key(&event);
-        if control_key.is_some_and(|key| {
-            self.pending_controls
-                .lock()
-                .expect("control mutex poisoned")
-                .contains(&key)
-        }) {
-            return Ok(());
-        }
-        let control_permit = if is_control_event(&event) {
-            Some(
-                Arc::clone(&self.control_permits)
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| live_channel_closed())?,
-            )
-        } else {
-            None
-        };
-        let permit = self.reserve_regular().await?;
-        if self.shutdown.load(Ordering::Acquire) {
-            return Err(live_channel_closed());
-        }
-        if let Some(key) = control_key {
-            self.pending_controls
-                .lock()
-                .expect("control mutex poisoned")
-                .push(key);
-        }
-        let generation = event_generation(&event);
-        let purge_on_invalidate = event_purges_with_generation(&event);
-        self.sender
-            .try_send(EventEnvelope {
-                item: Some(Ok(event)),
-                generation,
-                purge_on_invalidate,
-                connected_delivered: Arc::clone(&self.connected_delivered),
-                control_key,
-                pending_controls: Arc::clone(&self.pending_controls),
-                _regular_permit: Some(permit),
-                _control_permit: control_permit,
-                emergency_slot: None,
-                emergency_barrier: None,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Closed(_) => live_channel_closed(),
-                mpsc::error::TrySendError::Full(_) => {
-                    ProviderError::Invariant("reserved market event channel capacity exhausted")
-                }
-            })
-    }
-
-    fn connected_delivered(&self, generation: GapGeneration) -> bool {
-        self.connected_delivered.load(Ordering::Acquire) >= generation.0
-    }
-
-    fn invalidate_generation(&self, generation: GapGeneration) {
-        self.invalidated_through
-            .fetch_max(generation.0, Ordering::AcqRel);
-    }
-
-    fn queue_emergency_pair(
-        &self,
-        first: MarketEvent,
-        second: MarketEvent,
-    ) -> Result<Arc<EmergencyBarrier>, ProviderError> {
-        self.emergency_barrier.begin_pair()?;
-        for (slot, event) in [first, second].into_iter().enumerate() {
-            self.sender
-                .try_send(EventEnvelope {
-                    item: Some(Ok(event)),
-                    generation: None,
-                    purge_on_invalidate: false,
-                    connected_delivered: Arc::clone(&self.connected_delivered),
-                    control_key: None,
-                    pending_controls: Arc::clone(&self.pending_controls),
-                    _regular_permit: None,
-                    _control_permit: None,
-                    emergency_slot: Some(slot as u8),
-                    emergency_barrier: Some(Arc::clone(&self.emergency_barrier)),
-                })
-                .map_err(|error| match error {
-                    mpsc::error::TrySendError::Closed(_) => live_channel_closed(),
-                    mpsc::error::TrySendError::Full(_) => {
-                        ProviderError::Invariant("emergency market event reservation exhausted")
-                    }
-                })?;
-        }
-        Ok(Arc::clone(&self.emergency_barrier))
-    }
-
-    async fn queue_terminal_pair(
-        &self,
-        first: MarketEvent,
-        second: MarketEvent,
-    ) -> Result<(), ProviderError> {
-        self.emergency_barrier.suppress_pending();
-        self.emergency_barrier.wait_dequeued().await;
-        let _ = self.queue_emergency_pair(first, second)?;
-        Ok(())
-    }
-
-    async fn shutdown(&self) {
-        if self.shutdown.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.invalidated_through.store(u64::MAX, Ordering::Release);
-        self.emergency_barrier.suppress_pending();
-        // Cancellation makes the stream discard every non-Stopped envelope. Wait until any
-        // reserved saturation pair has actually left the bounded channel before reusing its
-        // reservation for the sole terminal event. Receiver drop also drops the queued
-        // envelopes and releases this barrier, so shutdown cannot deadlock on a closed stream.
-        self.emergency_barrier.wait_dequeued().await;
-        self.emergency_barrier.begin_shutdown();
-        let envelope = EventEnvelope {
-            item: Some(Ok(MarketEvent::Status {
-                generation: None,
-                status: ConnectionStatus::Stopped,
-            })),
-            generation: None,
-            purge_on_invalidate: false,
-            connected_delivered: Arc::clone(&self.connected_delivered),
-            control_key: None,
-            pending_controls: Arc::clone(&self.pending_controls),
-            _regular_permit: None,
-            _control_permit: None,
-            emergency_slot: Some(0),
-            emergency_barrier: Some(Arc::clone(&self.emergency_barrier)),
-        };
-        let _ = self.sender.try_send(envelope);
-    }
-}
-
-fn event_generation(event: &MarketEvent) -> Option<GapGeneration> {
-    match event {
-        MarketEvent::Status { generation, .. }
-        | MarketEvent::RecoverableError { generation, .. } => *generation,
-        MarketEvent::ReconcileBatch { generation, .. } | MarketEvent::Candle { generation, .. } => {
-            Some(*generation)
-        }
-        MarketEvent::TerminalError(_) => None,
-    }
-}
-fn is_control_event(event: &MarketEvent) -> bool {
-    !matches!(
-        event,
-        MarketEvent::Candle { .. } | MarketEvent::ReconcileBatch { .. }
-    )
-}
-
-fn event_purges_with_generation(event: &MarketEvent) -> bool {
-    matches!(
-        event,
-        MarketEvent::Candle { .. }
-            | MarketEvent::ReconcileBatch { .. }
-            | MarketEvent::Status {
-                generation: Some(_),
-                status: ConnectionStatus::Connecting
-                    | ConnectionStatus::GapSync
-                    | ConnectionStatus::Connected,
-            }
-    )
-}
-fn status_key(event: &MarketEvent) -> Option<(Option<GapGeneration>, ConnectionStatus)> {
-    match event {
-        MarketEvent::Status { generation, status } => Some((*generation, *status)),
-        _ => None,
-    }
-}
-
-fn live_channel_closed() -> ProviderError {
-    ProviderError::ChannelClosed {
-        context: ErrorContext::operation(ErrorOperation::LiveFeed),
-    }
 }
 
 async fn send_market(
@@ -3305,7 +2094,7 @@ pub fn classify_live_input_for_test(
         Ok(DecodedFrame::Candle(_) | DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => {
             return LiveInputClassification::Continue;
         }
-        Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => ProviderError::Protocol {
+        Ok(DecodedFrame::Close(_) | DecodedFrame::ReconnectRequested) => ProviderError::Protocol {
             context: ErrorContext::operation(ErrorOperation::WebSocket)
                 .with_market(instrument, timeframe),
             detail: "WebSocket peer requested reconnect",

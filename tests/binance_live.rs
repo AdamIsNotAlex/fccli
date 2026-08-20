@@ -13,13 +13,13 @@ use fccli::{
         MarketEvent, MonoInstant, ProviderId, RateGateState, ReplayRevision, Timeframe,
     },
     provider::binance::{
-        BinanceProvider, BinanceTestConfig, CONTROL_CAPACITY, DecodedFrame,
-        EMERGENCY_CONTROL_CAPACITY, FIRST_KLINE_HANDSHAKE_TIMEOUT, KEYED_CANDLE_CAPACITY,
-        LiveCompletionDisposition, LiveErrorDisposition, LiveInBandEventDisposition,
-        LiveInputClassification, LiveSupervisorConfig, MARKET_EVENT_CHANNEL_CAPACITY,
-        MAX_CONNECTION_AGE, RECONCILE_ACK_TIMEOUT, classify_live_error_for_test,
-        classify_live_input_for_test,
+        BinanceProvider, BinanceTestConfig, CONTROL_CAPACITY, EMERGENCY_CONTROL_CAPACITY,
+        FIRST_KLINE_HANDSHAKE_TIMEOUT, KEYED_CANDLE_CAPACITY, LiveCompletionDisposition,
+        LiveErrorDisposition, LiveInBandEventDisposition, LiveInputClassification,
+        LiveSupervisorConfig, MARKET_EVENT_CHANNEL_CAPACITY, MAX_CONNECTION_AGE,
+        RECONCILE_ACK_TIMEOUT, classify_live_error_for_test, classify_live_input_for_test,
     },
+    provider::runtime::websocket::DecodedFrame,
     provider::{
         CancellationToken, LiveRequest, MarketDataProvider, ProducerCompletion, ProviderRegistry,
         ReconcileAck, ReconcileAckPublishError, accepted_watermark_channel, reconcile_ack_channel,
@@ -3419,7 +3419,7 @@ fn supervisor_classifies_all_remaining_decoded_outcomes_and_errors() {
 
     for (name, input) in [
         ("close", Ok(DecodedFrame::Close(None))),
-        ("serverShutdown", Ok(DecodedFrame::ServerShutdown)),
+        ("serverShutdown", Ok(DecodedFrame::ReconnectRequested)),
     ] {
         let LiveInputClassification::Error { error, policy } =
             classify_live_input_for_test(input, &market, Timeframe::Minute1)

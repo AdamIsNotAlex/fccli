@@ -98,23 +98,24 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 
 ### R03 — Extract shared WebSocket transport and EventEmitter
 
-**Status:** [ ]  
+**Status:** [x]  
 **Depends on:** R02  
-**Owned files:** `src/provider/runtime/mod.rs` (new), `src/provider/runtime/websocket.rs` (new), `src/provider/runtime/emitter.rs` (new), `src/provider/binance.rs`, `src/provider/hyperliquid.rs`, `tests/binance_ws_codec.rs`, `tests/hyperliquid_ws_codec.rs`  
+**Owned files:** `src/provider/runtime/mod.rs` (new), `src/provider/runtime/websocket.rs` (new), `src/provider/runtime/emitter.rs` (new), `src/provider/binance.rs`, `src/provider/hyperliquid.rs`, `tests/binance_ws_codec.rs`, `tests/hyperliquid_ws_codec.rs`, `tests/binance_live.rs`, `tests/hyperliquid_live.rs`  
 **Parallel safety:** Sequential; both large provider files and both codec suites overlap. No concurrent provider refactor chunk.  
 **Commit boundary:** `refactor(provider): share websocket transport and emitter`
 
-- [ ] Declare the internal runtime module without broadening the public API.
-- [ ] Move `WsConfig`, `RawWebSocket`, read/write/flush pump, control-frame flush, stalled-write and inactivity deadlines, decoded queue, error mapping, loopback URL safety, and connect-config validation into `runtime/websocket.rs`.
-- [ ] Define the mutable codec/outcome contract with provider-neutral `ReconnectRequested`; keep Binance `serverShutdown` mapping inside its codec.
-- [ ] Move shared `EventEmitter`/queue-emission mechanics into `runtime/emitter.rs`, preserving keyed candle capacity, emergency control pair, saturation behavior, and cancellation precedence.
-- [ ] Adapt Binance and Hyperliquid codecs/connection setup to the shared transport while keeping provider subscription and heartbeat policies separate.
-- [ ] Mechanically migrate both codec suites' imports and calls from provider-local `WsConfig`, `DecodedFrame`, connector/raw-socket, and decoder test exports to the shared runtime API or provider-owned codec harness. Keep all existing test cases in place in this commit; R04 owns semantic relocation.
-- [ ] Remove duplicated transport/emitter definitions and obsolete provider-local test-only exports only after both codec suites compile against their new owners; migrate all callers in the same commit.
-- [ ] Verify: `cargo test --locked --test binance_ws_codec --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test hyperliquid_ws_codec --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport`.
-- [ ] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport`.
+- [x] Declare the internal runtime module without broadening the public provider trait/capability API.
+- [x] Move `WsConfig`, `RawWebSocket`, read/write/flush pump, control-frame flush, stalled-write and inactivity deadlines, decoded queue, error mapping, loopback URL safety, and connect-config validation into `runtime/websocket.rs`.
+- [x] Define the mutable codec/outcome contract with provider-neutral `ReconnectRequested`; keep Binance `serverShutdown` mapping inside its codec.
+- [x] Move shared `EventEmitter`/queue-emission mechanics into `runtime/emitter.rs`, preserving keyed candle capacity, emergency control pair, saturation behavior, and cancellation precedence.
+- [x] Adapt Binance and Hyperliquid codecs/connection setup to the shared transport while keeping provider subscription and heartbeat policies separate.
+- [x] Mechanically migrate both codec suites' imports and calls from provider-local `WsConfig`, `DecodedFrame`, connector/raw-socket, and decoder test exports to the shared runtime API or provider-owned codec harness. Keep all existing test cases in place in this commit; R04 owns semantic relocation.
+- [x] Remove duplicated transport/emitter definitions and obsolete provider-local test-only exports only after both codec suites compile against their new owners; migrate all callers in the same commit.
+- Implementation and verification note: `provider::runtime` now owns WebSocket configuration, the generic `RawWebSocket` read/write/flush and control-frame pump, provider-neutral decoded outcomes and mutable codec contract, URL/config/error helpers, and the shared `EventEmitter`/emergency-queue mechanics. Both providers construct the shared transport with provider-owned codecs and retain separate subscription/heartbeat policy; Binance maps wire `serverShutdown` to `ReconnectRequested`. Both codec suites import shared runtime contracts. The clean-cutover compile discovered `tests/binance_live.rs` as an omitted R03 caller and its obsolete `DecodedFrame::ServerShutdown` expectation was migrated to `ReconnectRequested` without relocating the wire-mapping case reserved for R04. Cleanup also discovered `tests/hyperliquid_live.rs` as an omitted R03 caller; it now imports shared `WsConfig`, `DecodedFrame`, `read_raw_websocket`, and runtime test hooks directly, while retaining provider-owned connection/codec semantics in place for R04. Inspection confirmed the shared runtime is the sole owner of transport/emitter definitions and no obsolete provider-local test-only WebSocket compatibility exports or callers remain. Formatted exact gates passed: `binance_ws_codec` 23/23, `hyperliquid_ws_codec` 11/11, `binance_live` 42/42, and `hyperliquid_live` 25/25.
+- [x] Verify: `cargo test --locked --test binance_ws_codec --no-default-features --features test-transport` (23 passed).
+- [x] Verify: `cargo test --locked --test hyperliquid_ws_codec --no-default-features --features test-transport` (11 passed).
+- [x] Verify: `cargo test --locked --test binance_live --no-default-features --features test-transport` (42 passed).
+- [x] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport` (25 passed).
 
 ### R04 — Establish shared WebSocket/EventEmitter contract tests
 
@@ -308,8 +309,8 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 |---|---|---|---|---|
 | R01 | [x] | — | no | Complete; formatted codec gate 11/11 and live gate 25/25, including `Month1` exact-limit, overflow, and unrepresentable-endpoint coverage |
 | R02 | [x] | R01 | no | Complete; formatted exact gates passed: `hyperliquid_rest` 17/17, `binance_rest` 23/23, and `binance_live` 42/42; temporal/window/order validation and exact rate-gate deadlines covered |
-| R03 | [ ] | R02 | yes | Dependency satisfied |
-| R04 | [ ] | R03 | no | — |
+| R03 | [x] | R02 | no | Complete; shared runtime is the sole transport/emitter owner, provider-local test compatibility paths are removed, and formatted exact gates passed: `binance_ws_codec` 23/23, `hyperliquid_ws_codec` 11/11, `binance_live` 42/42, `hyperliquid_live` 25/25 |
+| R04 | [ ] | R03 | yes | — |
 | R05 | [ ] | R04 | no | — |
 | R06 | [ ] | R05 | no | — |
 | R07 | [ ] | R06 | no | — |
@@ -318,4 +319,4 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 | R10 | [ ] | R09 | no | — |
 | R11 | [ ] | R10 | no | — |
 
-**Next dependency-ready unchecked chunk:** R03 — extract shared WebSocket transport and EventEmitter.
+**Next dependency-ready unchecked chunk:** R04 — establish shared WebSocket/EventEmitter contract tests.

@@ -2,6 +2,8 @@
 
 pub mod binance;
 pub mod hyperliquid;
+#[doc(hidden)]
+pub mod runtime;
 
 use futures_util::Stream;
 use std::{
@@ -88,9 +90,13 @@ impl ProviderRegistry {
         }
         match id.as_str() {
             "binance" => Ok(self.binance.clone()),
-            "hyperliquid" => self.hyperliquid.clone().map(|provider| provider as _).ok_or(
-                ProviderError::Configuration("unsupported market-data provider"),
-            ),
+            "hyperliquid" => self
+                .hyperliquid
+                .clone()
+                .map(|provider| provider as _)
+                .ok_or(ProviderError::Configuration(
+                    "unsupported market-data provider",
+                )),
             _ => Err(ProviderError::Configuration(
                 "unsupported market-data provider",
             )),

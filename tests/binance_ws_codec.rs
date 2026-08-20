@@ -5,10 +5,13 @@ use std::time::Duration;
 use fccli::{
     error::{PayloadError, ProviderError, SanitizedCause, SanitizedMessage, TimeoutKind},
     model::{FinalityAuthority, Instrument, Market, ProviderId, Timeframe},
-    provider::binance::{
-        DecodedFrame, WS_FRAME_SIZE, WS_MAX_WRITE_BUFFER_SIZE, WS_MESSAGE_INACTIVITY_TIMEOUT,
-        WS_MESSAGE_SIZE, WS_READ_BUFFER_SIZE, WS_STALLED_WRITE_TIMEOUT, WS_WRITE_BUFFER_SIZE,
-        WsConfig, decode_ws_frame, read_raw_websocket, test_websocket_url,
+    provider::{
+        binance::{decode_ws_frame, test_websocket_url},
+        runtime::websocket::{
+            DecodedFrame, WS_FRAME_SIZE, WS_MAX_WRITE_BUFFER_SIZE, WS_MESSAGE_INACTIVITY_TIMEOUT,
+            WS_MESSAGE_SIZE, WS_READ_BUFFER_SIZE, WS_STALLED_WRITE_TIMEOUT, WS_WRITE_BUFFER_SIZE,
+            WsConfig, read_raw_websocket, send_raw_websocket,
+        },
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -379,7 +382,7 @@ fn malformed_oversized_mismatched_and_provider_frames_are_typed() {
             Timeframe::Minute1,
             &config
         ),
-        DecodedFrame::ServerShutdown
+        DecodedFrame::ReconnectRequested
     );
     assert_eq!(
         decode_ws_frame(
@@ -622,10 +625,7 @@ async fn decoded_queue_at_capacity_recovers_after_temporary_write_backpressure()
 
     timeout(
         Duration::from_secs(3),
-        fccli::provider::binance::send_raw_websocket(
-            &mut socket,
-            Message::Binary(vec![0; LARGE_WRITE].into()),
-        ),
+        send_raw_websocket(&mut socket, Message::Binary(vec![0; LARGE_WRITE].into())),
     )
     .await
     .expect("write must resume after peer starts draining")
@@ -675,11 +675,8 @@ async fn raw_socket_reports_stalled_application_write() {
 
     let outcome = timeout(Duration::from_secs(2), async {
         loop {
-            if let Err(error) = fccli::provider::binance::send_raw_websocket(
-                &mut socket,
-                Message::Binary(vec![0; 64 * 1024].into()),
-            )
-            .await
+            if let Err(error) =
+                send_raw_websocket(&mut socket, Message::Binary(vec![0; 64 * 1024].into())).await
             {
                 break error;
             }
@@ -823,11 +820,8 @@ async fn stalled_write_still_flushes_one_pong_and_retains_data_and_close() {
 
     let error = timeout(Duration::from_secs(2), async {
         loop {
-            if let Err(error) = fccli::provider::binance::send_raw_websocket(
-                &mut socket,
-                Message::Binary(vec![0; 64 * 1024].into()),
-            )
-            .await
+            if let Err(error) =
+                send_raw_websocket(&mut socket, Message::Binary(vec![0; 64 * 1024].into())).await
             {
                 break error;
             }
@@ -1037,11 +1031,8 @@ async fn continuous_inbound_data_cannot_extend_a_stalled_write_deadline_or_lose_
 
     let error = timeout(Duration::from_secs(2), async {
         loop {
-            if let Err(error) = fccli::provider::binance::send_raw_websocket(
-                &mut socket,
-                Message::Binary(vec![0; 64 * 1024].into()),
-            )
-            .await
+            if let Err(error) =
+                send_raw_websocket(&mut socket, Message::Binary(vec![0; 64 * 1024].into())).await
             {
                 break error;
             }
@@ -1168,14 +1159,10 @@ async fn deferred_terminal_error_rejects_subsequent_send_without_consuming_read_
     .await
     .expect("client handshake");
     tokio::time::sleep(Duration::from_millis(20)).await;
-    let _ = fccli::provider::binance::send_raw_websocket(
-        &mut socket,
-        Message::Text("application-write".into()),
-    )
-    .await;
+    let _ = send_raw_websocket(&mut socket, Message::Text("application-write".into())).await;
     let subsequent_send = timeout(
         Duration::from_secs(1),
-        fccli::provider::binance::send_raw_websocket(
+        send_raw_websocket(
             &mut socket,
             Message::Text("subsequent-application-write".into()),
         ),
@@ -1252,10 +1239,7 @@ async fn peer_close_racing_ordinary_outbound_replies_before_termination_and_is_d
 
     timeout(
         Duration::from_secs(1),
-        fccli::provider::binance::send_raw_websocket(
-            &mut socket,
-            Message::Text("ordinary-outbound".into()),
-        ),
+        send_raw_websocket(&mut socket, Message::Text("ordinary-outbound".into())),
     )
     .await
     .expect("outbound racing peer Close must terminate promptly")
@@ -1328,11 +1312,8 @@ async fn stalled_drain_flushes_automatic_close_reply_before_close_outcome_and_er
 
     let stalled = timeout(Duration::from_secs(2), async {
         loop {
-            if let Err(error) = fccli::provider::binance::send_raw_websocket(
-                &mut socket,
-                Message::Binary(vec![0; LARGE_WRITE].into()),
-            )
-            .await
+            if let Err(error) =
+                send_raw_websocket(&mut socket, Message::Binary(vec![0; LARGE_WRITE].into())).await
             {
                 break error;
             }

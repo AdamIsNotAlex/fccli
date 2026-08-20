@@ -5,9 +5,12 @@ use std::collections::VecDeque;
 use fccli::{
     error::{PayloadError, ProviderError},
     model::{FinalityAuthority, Instrument, Market, ProviderId, Timeframe},
-    provider::hyperliquid::{
-        DecodedFrame, HyperliquidWsCodec, WsConfig, decode_ws_frame,
-        gap_target_within_generation_span_for_test, test_websocket_url,
+    provider::{
+        hyperliquid::{
+            HyperliquidWsCodec, decode_ws_frame, gap_target_within_generation_span_for_test,
+            test_websocket_url,
+        },
+        runtime::websocket::{DecodedFrame, WsConfig},
     },
 };
 use serde_json::{Value, json};

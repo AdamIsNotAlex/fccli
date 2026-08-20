@@ -11,13 +11,16 @@ use fccli::{
     provider::{
         LiveRequest, MarketDataProvider, accepted_watermark_channel,
         hyperliquid::{
-            APPLICATION_HEARTBEAT_INTERVAL, CloseFlushTestHook, HeartbeatTestHook,
-            HyperliquidProvider, HyperliquidTestConfig, LiveSupervisorConfig,
-            ReadinessDecodedAckTestHook, ReadinessDrainBudgetTestHook, SubscribeFlushTestHook,
-            WsConfig, connect_test_websocket, gap_target_within_generation_span_for_test,
+            APPLICATION_HEARTBEAT_INTERVAL, HyperliquidProvider, HyperliquidTestConfig,
+            LiveSupervisorConfig, connect_test_websocket,
+            gap_target_within_generation_span_for_test,
             reconciliation_distinct_key_allowed_for_test, reconciliation_page_guard_for_test,
         },
         reconcile_ack_channel,
+        runtime::websocket::{
+            CloseFlushTestHook, DecodedFrame, HeartbeatTestHook, ReadinessDecodedAckTestHook,
+            ReadinessDrainBudgetTestHook, SubscribeFlushTestHook, WsConfig, read_raw_websocket,
+        },
     },
 };
 use futures_util::{FutureExt, SinkExt, StreamExt};
@@ -1319,18 +1322,15 @@ async fn hyperliquid_json_heartbeat_is_not_a_binance_default() {
         &binance_uri,
         &binance_instrument,
         Timeframe::Minute1,
-        fccli::provider::binance::WsConfig::production(),
+        WsConfig::production(),
     )
     .await
     .expect("Binance socket");
     assert!(matches!(
-        timeout(
-            Duration::from_secs(1),
-            fccli::provider::binance::read_raw_websocket(&mut binance)
-        )
-        .await
-        .expect("transport Ping read"),
-        Ok(fccli::provider::binance::DecodedFrame::Ignored)
+        timeout(Duration::from_secs(1), read_raw_websocket(&mut binance))
+            .await
+            .expect("transport Ping read"),
+        Ok(DecodedFrame::Ignored)
     ));
     await_server(binance_server).await;
 }
@@ -1364,7 +1364,7 @@ async fn transport_control_frames_do_not_reset_hyperliquid_inactivity() {
     let error = timeout(Duration::from_secs(1), async {
         loop {
             match socket.read().await {
-                Ok(fccli::provider::hyperliquid::DecodedFrame::Ignored) => {}
+                Ok(DecodedFrame::Ignored) => {}
                 Ok(other) => panic!("unexpected frame before inactivity: {other:?}"),
                 Err(error) => break error,
             }
