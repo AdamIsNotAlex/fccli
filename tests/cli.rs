@@ -783,6 +783,9 @@ fn hyperliquid_hip3_without_perp_suffix_is_rejected() {
     assert_eq!(error.kind(), ErrorKind::ValueValidation);
     let rendered = error.to_string();
     assert!(rendered.contains("perpetual-only"), "{rendered}");
-    assert!(rendered.contains("hyperliquid:<dex>:<coin>.p"), "{rendered}");
+    assert!(
+        rendered.contains("hyperliquid:<dex>:<coin>.p"),
+        "{rendered}"
+    );
     assert!(!rendered.contains("XYZ100"), "{rendered}");
 }
