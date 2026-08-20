@@ -58,9 +58,8 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 - [x] Replace the old “subscription response is ignored” expectation with matching subscribe-ack acceptance and mismatched `method`/`type`/`coin`/`interval` rejection cases.
 - [x] Add `TimeoutKind::SubscribeAck`. Hyperliquid connection policy owns `subscribe_ack_timeout`, defaults it to 10 seconds, validates it in the same `1ms..=60s` range as live protocol deadlines, and measures it with the injected monotonic `Clock` from the successful subscribe-message flush. Expiry returns `ProviderError::Timeout { kind: TimeoutKind::SubscribeAck, context: ErrorOperation::WebSocket + market/timeframe }`; it is a recoverable setup failure and must never be reported as `FirstKline`.
 - [x] While readiness is pending, use this deterministic precedence: cancellation wins over every simultaneous event; then a received Close or transport/read/write error; then malformed/mismatched subscribe ack; then subscribe-ack deadline; then WebSocket inactivity. Transport Ping/Pong remains serviced, but the 50-second application heartbeat does not start until the matching ack is accepted. If ack and its deadline become observable in the same poll, accept the already-received matching ack. Add focused tests for every boundary and tie.
-  - Verified by focused live tests covering cancellation, peer Close, abrupt EOF/read failure, stalled transport write, malformed ack, matching ack at its deadline, subscribe-ack expiry, and the subscribe-ack/WebSocket-inactivity tie.
+  - Verified by orchestrator after the review fixes: client-queued pairwise arbitration, non-starvable absolute ack expiry, deadline/inactivity ordering without timeout-kind rewriting, ack-gated heartbeat scheduling, and existing transport-control regressions all pass the focused live gate.
 - [x] Make connection readiness mean subscribe sent, successfully flushed, and matching `subscriptionResponse` validated before `GapSync`; only after readiness start application JSON ping every 50 seconds and matching pong handling/tests, without weakening transport Ping/Pong/Close behavior or inactivity enforcement. Assert Binance-style JSON ping is not a shared default.
-  - Verified by ack-gated `GapSync`, pre/post-ack heartbeat, Hyperliquid-vs-Binance heartbeat ownership, and transport-control-frame inactivity tests.
 - [x] Make the Hyperliquid codec stateful and implement this exact successor-finality transition table:
 
   | Input relative to retained current candle `T` | Emitted outcomes, in order | Retained state after input | Error/drop rule |
@@ -72,13 +71,13 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
   | skipped successor `U > T + interval` | retained latest `T` payload as `WsAuthoritativeClosed`, then `U` as `WsAuthoritativeOpen` | retain `U`; synthesize no missing candles | none; gap reconciliation owns the missing interval(s) |
   | regressive/out-of-order `U < T` | none | retain `T` unchanged | drop as stale, not a protocol error and not a reconnect request |
 
-- [x] Do not use local wall clock as finality evidence. Cover first/current open, changed same-time update, exact duplicate, immediate successor, skipped successor, regressive input, and the two-outcome close-then-open order.
+- [x] Do not use local wall clock as finality evidence. Cover first/current open, changed same-time update, exact duplicate, immediate successor, skipped successor, regressive input, retained state after duplicate/regressive input, and the two-outcome close-then-open order.
 - [x] Preserve the existing wire coin, unsupported-timeframe, symbol/interval echo, malformed payload, and transport control-frame contracts.
-  - Verified by the subscribe wire-coin assertion, unsupported-timeframe live rejection, codec market-echo/malformed-payload regression, ignored transport Ping/Pong coverage, and live Close/readiness coverage.
-- [x] Verify: `cargo test --locked --test hyperliquid_ws_codec --no-default-features --features test-transport` — orchestrator passed, 7/7 tests passed.
-- [x] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport` — orchestrator passed, 14/14 tests passed.
+  - Verified by orchestrator after the review fixes in the focused codec and live regression gates.
+- [x] Verify: `cargo test --locked --test hyperliquid_ws_codec --no-default-features --features test-transport` — passed, 7/7 tests.
+- [x] Verify: `cargo test --locked --test hyperliquid_live --no-default-features --features test-transport` — passed, 10/10 tests.
 
-**Implementation/verification notes:** R01 implements full subscribe-response validation, a configurable 10-second `SubscribeAck` deadline measured with the injected clock after subscribe send/flush, deterministic readiness precedence, ack-gated `GapSync`, post-ack Hyperliquid-only 50-second JSON heartbeat, preserved transport/inactivity and payload contracts, and stateful successor-evidenced finality with caller-owned close-then-open outcomes. The two exact R01 gates passed after formatting: codec 7/7 and live 14/14.
+**Implementation/verification notes:** R01 is complete after formatting and focused orchestrator verification. Review found six coverage/precedence defects, all fixed before the gates passed: readiness now arbitrates queued Close/transport/stalled-write outcomes ahead of malformed acknowledgements; ignored/application-pong floods cannot starve the absolute acknowledgement deadline; deadline versus inactivity is tested without rewriting timeout kinds; received-frame/deadline ties use deterministic client-side queued-input arbitration; heartbeat scheduling is exercised end-to-end across acknowledgement readiness; successor-finality tests prove retained state after duplicate and regressive rows; and timeout tests assert the 10-second default plus exact WebSocket market/timeframe context.
 
 ### R02 — Implement bounded Hyperliquid REST and provider rate-limit contracts
 
@@ -307,8 +306,8 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 
 | ID | Status | Depends on | Ready now | Evidence / blocker |
 |---|---|---|---|---|
-| R01 | [x] | — | complete | Every R01 checkbox is implemented and evidenced; exact gates passed after formatting: `hyperliquid_ws_codec` 7/7 and `hyperliquid_live` 14/14 |
-| R02 | [ ] | R01 | no | — |
+| R01 | [x] | — | no | Complete after review fixes; formatted focused gates passed: `hyperliquid_ws_codec` 7/7 and `hyperliquid_live` 10/10 |
+| R02 | [ ] | R01 | yes | — |
 | R03 | [ ] | R02 | no | — |
 | R04 | [ ] | R03 | no | — |
 | R05 | [ ] | R04 | no | — |
@@ -319,4 +318,4 @@ Revisit when: <concrete architecture/protocol change, or "never for this refacto
 | R10 | [ ] | R09 | no | — |
 | R11 | [ ] | R10 | no | — |
 
-**Next dependency-ready unchecked chunk:** R02 — Implement bounded Hyperliquid REST and provider rate-limit contracts.
+**Next dependency-ready unchecked chunk:** R02 — implement bounded Hyperliquid REST and provider rate-limit contracts.

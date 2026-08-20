@@ -159,8 +159,21 @@ fn successor_finality_state_machine_is_exact() {
         panic!("expected skipped successor close then open: {skipped:?}");
     };
     assert_eq!(closed.open_time(), 1_704_067_260_000);
+    assert_eq!(closed.authority(), FinalityAuthority::WsAuthoritativeClosed);
     assert_eq!(open.open_time(), 1_704_067_380_000);
+    assert_eq!(open.authority(), FinalityAuthority::WsAuthoritativeOpen);
     assert!(decode(&mut codec, candle(1_704_067_320_000, "42095.00")).is_empty());
+
+    let after_regression = decode(&mut codec, candle(1_704_067_440_000, "42110.00"));
+    let [DecodedFrame::Candle(closed), DecodedFrame::Candle(open)] = after_regression.as_slice()
+    else {
+        panic!("expected retained close then successor: {after_regression:?}");
+    };
+    assert_eq!(closed.open_time(), 1_704_067_380_000);
+    assert_eq!(closed.close(), 42_100.0);
+    assert_eq!(closed.authority(), FinalityAuthority::WsAuthoritativeClosed);
+    assert_eq!(open.open_time(), 1_704_067_440_000);
+    assert_eq!(open.authority(), FinalityAuthority::WsAuthoritativeOpen);
 }
 
 #[test]
