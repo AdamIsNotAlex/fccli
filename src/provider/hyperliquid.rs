@@ -108,9 +108,13 @@ pub struct LiveSupervisorConfig {
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub readiness_decoded_ack_test_hook: Option<ReadinessDecodedAckTestHook>,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    pub readiness_drain_budget_test_hook: Option<ReadinessDrainBudgetTestHook>,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub subscribe_flush_test_hook: Option<SubscribeFlushTestHook>,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     pub force_stalled_write_after_readiness_frame: bool,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    pub max_gap_reconciliation_candles_for_test: usize,
 }
 
 impl Default for LiveSupervisorConfig {
@@ -135,9 +139,13 @@ impl Default for LiveSupervisorConfig {
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             readiness_decoded_ack_test_hook: None,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            readiness_drain_budget_test_hook: None,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             subscribe_flush_test_hook: None,
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
             force_stalled_write_after_readiness_frame: false,
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            max_gap_reconciliation_candles_for_test: MAX_GAP_RECONCILIATION_CANDLES,
         }
     }
 }
@@ -159,6 +167,14 @@ impl LiveSupervisorConfig {
         if self.stalled_write_probe_frames > MAX_SUPERVISOR_CAPACITY {
             return Err(ProviderError::Configuration(
                 "live supervisor stalled-write probe is outside 0..=65536",
+            ));
+        }
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        if !(1..=MAX_GAP_RECONCILIATION_CANDLES)
+            .contains(&self.max_gap_reconciliation_candles_for_test)
+        {
+            return Err(ProviderError::Configuration(
+                "live reconciliation candle bound is outside 1..=64000",
             ));
         }
         for timeout in [
@@ -334,6 +350,13 @@ pub struct HyperliquidWsCodec {
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[derive(Clone, Debug)]
 pub struct ReadinessDecodedAckTestHook {
+    pub observed: Arc<Notify>,
+    pub release: Arc<Notify>,
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+#[derive(Clone, Debug)]
+pub struct ReadinessDrainBudgetTestHook {
     pub observed: Arc<Notify>,
     pub release: Arc<Notify>,
 }
@@ -600,7 +623,8 @@ fn decode_candle_payload(
     outcomes.push_back(DecodedFrame::Candle(closed));
     outcomes.push_back(DecodedFrame::Candle(candidate));
 }
-// Yield after this many continuously-ready frames so cancellation and deadline branches are polled.
+// Stop draining after this many continuously-ready frames; actionable retained outcomes still
+// arbitrate before cancellation and deadline branches receive their fairness poll.
 const READINESS_DRAIN_POLL_BUDGET: usize = 256;
 
 pub struct RawWebSocket {
@@ -628,6 +652,8 @@ pub struct RawWebSocket {
     readiness_inactivity_test_hook: Option<Arc<Notify>>,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     readiness_decoded_ack_test_hook: Option<ReadinessDecodedAckTestHook>,
+    #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+    readiness_drain_budget_test_hook: Option<ReadinessDrainBudgetTestHook>,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
     force_stalled_write_after_readiness_frame: bool,
     #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -676,7 +702,16 @@ impl RawWebSocket {
         futures_util::future::poll_fn(|cx| {
             self.readiness_drain_yielded = false;
             let io = self.poll_io(cx, inactivity_deadline, false, true);
-            if self.readiness_drain_yielded {
+            #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+            if self.readiness_drain_yielded
+                && let Some(hook) = self.readiness_drain_budget_test_hook.take()
+            {
+                hook.observed.notify_one();
+                let waker = cx.waker().clone();
+                tokio::spawn(async move {
+                    hook.release.notified().await;
+                    waker.wake();
+                });
                 return Poll::Pending;
             }
             #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
@@ -704,12 +739,23 @@ impl RawWebSocket {
                     kind: TimeoutKind::StalledWrite,
                 });
             }
-            if let Some(input) = take_prioritized_readiness(
-                &mut self.decoded,
-                self.pending_terminal_error.take(),
-                self.stalled_write_error.clone(),
-            ) {
-                return Poll::Ready(input);
+            if !self.readiness_drain_yielded
+                || has_actionable_readiness(
+                    &self.decoded,
+                    self.pending_terminal_error.as_ref(),
+                    self.stalled_write_error.as_ref(),
+                )
+            {
+                if let Some(input) = take_prioritized_readiness(
+                    &mut self.decoded,
+                    self.pending_terminal_error.take(),
+                    self.stalled_write_error.clone(),
+                ) {
+                    return Poll::Ready(input);
+                }
+            }
+            if self.readiness_drain_yielded {
+                return Poll::Pending;
             }
             match io {
                 Poll::Ready(Err(error)) => Poll::Ready(ReadinessInput::Error(error)),
@@ -932,6 +978,10 @@ impl RawWebSocket {
         let mut readiness_frames = 0;
         loop {
             if readiness && readiness_frames == READINESS_DRAIN_POLL_BUDGET {
+                if let Some(close) = self.peer_close_outcome.take() {
+                    self.decoded.push_back(close);
+                    coalesce_readiness_outcomes(&mut self.decoded);
+                }
                 self.readiness_drain_yielded = true;
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
@@ -1122,6 +1172,8 @@ async fn connect_websocket_url(
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         readiness_decoded_ack_test_hook: None,
         #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        readiness_drain_budget_test_hook: None,
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
         force_stalled_write_after_readiness_frame: false,
     })
 }
@@ -1138,6 +1190,18 @@ fn coalesce_readiness_outcomes(decoded: &mut VecDeque<DecodedFrame>) {
     if let Some(frame) = best {
         decoded.push_back(frame);
     }
+}
+
+fn has_actionable_readiness(
+    decoded: &VecDeque<DecodedFrame>,
+    terminal_error: Option<&ProviderError>,
+    stalled_write_error: Option<&ProviderError>,
+) -> bool {
+    terminal_error.is_some()
+        || stalled_write_error.is_some()
+        || decoded
+            .iter()
+            .any(|frame| readiness_priority(frame) < readiness_priority(&DecodedFrame::Ignored))
 }
 
 fn readiness_priority(frame: &DecodedFrame) -> u8 {
@@ -1828,6 +1892,8 @@ impl HyperliquidProvider {
                 self.live.readiness_inactivity_test_hook.clone();
             socket.readiness_decoded_ack_test_hook =
                 self.live.readiness_decoded_ack_test_hook.clone();
+            socket.readiness_drain_budget_test_hook =
+                self.live.readiness_drain_budget_test_hook.clone();
             socket.force_stalled_write_after_readiness_frame =
                 self.live.force_stalled_write_after_readiness_frame;
         }
@@ -1936,6 +2002,10 @@ impl HyperliquidProvider {
         let mut deferred_reconnect: Option<ProviderError> = None;
         let mut rest_synced_through = None;
         let mut reconciliation_pages = 0_usize;
+        #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+        let max_reconciliation_successors = self.live.max_gap_reconciliation_candles_for_test;
+        #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+        let max_reconciliation_successors = MAX_GAP_RECONCILIATION_CANDLES;
 
         loop {
             let mut cursor = match rest_synced_through {
@@ -1945,9 +2015,9 @@ impl HyperliquidProvider {
             while cursor <= target_open_time {
                 if !gap_target_within_generation_span(
                     request.timeframe,
-                    cursor,
+                    start,
                     target_open_time,
-                    MAX_GAP_RECONCILIATION_CANDLES,
+                    max_reconciliation_successors,
                 ) {
                     return Ok(GenerationOutcome::Reconnect(live_protocol_error(
                         request,
@@ -2023,12 +2093,17 @@ impl HyperliquidProvider {
                             }
                             ReconcileWake::Socket(frame) => match frame {
                                 Ok(DecodedFrame::Candle(candle)) => {
-                                    apply_reconciliation_candle(
+                                    if let Err(error) = apply_reconciliation_candle(
                                         &mut buffered,
                                         candle,
                                         &mut revision,
                                         &mut target_open_time,
-                                    )?;
+                                        start,
+                                        request.timeframe,
+                                        max_reconciliation_successors,
+                                    ) {
+                                        return Ok(GenerationOutcome::Reconnect(error));
+                                    }
                                 }
                                 Ok(DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => {}
                                 Ok(DecodedFrame::SubscribeAccepted) => {
@@ -2079,10 +2154,18 @@ impl HyperliquidProvider {
                                         Err(_) => Err(ProviderError::Invariant("rate gate closed")),
                                     },
                                     frame = socket.read() => match frame {
-                                        Ok(DecodedFrame::Candle(candle)) => {
-                                            apply_reconciliation_candle(&mut buffered, candle, &mut revision, &mut target_open_time)?;
-                                            Ok((None, false))
-                                        }
+                                        Ok(DecodedFrame::Candle(candle)) => match apply_reconciliation_candle(
+                                            &mut buffered,
+                                            candle,
+                                            &mut revision,
+                                            &mut target_open_time,
+                                            start,
+                                            request.timeframe,
+                                            max_reconciliation_successors,
+                                        ) {
+                                            Ok(()) => Ok((None, false)),
+                                            Err(error) => Ok((Some(GenerationOutcome::Reconnect(error)), false)),
+                                        },
                                         Ok(DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => Ok((None, false)),
                                         Ok(DecodedFrame::SubscribeAccepted) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement"))), false)),
                                         Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => Ok((Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect"))), false)),
@@ -2107,10 +2190,18 @@ impl HyperliquidProvider {
                                         biased;
                                         () = request.cancellation.cancelled() => Ok(Some(GenerationOutcome::Cancelled)),
                                         frame = socket.read() => match frame {
-                                            Ok(DecodedFrame::Candle(candle)) => {
-                                                apply_reconciliation_candle(&mut buffered, candle, &mut revision, &mut target_open_time)?;
-                                                Ok(None)
-                                            }
+                                            Ok(DecodedFrame::Candle(candle)) => match apply_reconciliation_candle(
+                                                &mut buffered,
+                                                candle,
+                                                &mut revision,
+                                                &mut target_open_time,
+                                                start,
+                                                request.timeframe,
+                                                max_reconciliation_successors,
+                                            ) {
+                                                Ok(()) => Ok(None),
+                                                Err(error) => Ok(Some(GenerationOutcome::Reconnect(error))),
+                                            },
                                             Ok(DecodedFrame::Ignored | DecodedFrame::ApplicationPong) => Ok(None),
                                             Ok(DecodedFrame::SubscribeAccepted) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "duplicate Hyperliquid subscribe acknowledgement")))),
                                             Ok(DecodedFrame::Close(_) | DecodedFrame::ServerShutdown) => Ok(Some(GenerationOutcome::Reconnect(live_protocol_error(request, "WebSocket peer requested reconnect")))),
@@ -2230,7 +2321,17 @@ impl HyperliquidProvider {
                     changed = gate.changed() => if matches!(changed.map_err(|_| ProviderError::Invariant("rate gate closed"))?, RateGateState::ProcessBlocked(_)) { return Err(ProviderError::InvalidBanExpiry); },
                     frame = socket.read(), if deferred_reconnect.is_none() => match frame? {
                         DecodedFrame::Candle(candle) => {
-                            apply_reconciliation_candle(&mut buffered, candle, &mut revision, &mut target_open_time)?;
+                            if let Err(error) = apply_reconciliation_candle(
+                                &mut buffered,
+                                candle,
+                                &mut revision,
+                                &mut target_open_time,
+                                start,
+                                request.timeframe,
+                                max_reconciliation_successors,
+                            ) {
+                                return Ok(GenerationOutcome::Reconnect(error));
+                            }
                             break;
                         }
                         DecodedFrame::Ignored | DecodedFrame::ApplicationPong => {
@@ -2953,14 +3054,35 @@ fn apply_reconciliation_candle(
     candidate: Candle,
     revision: &mut ReplayRevision,
     target_open_time: &mut i64,
+    generation_start: i64,
+    timeframe: Timeframe,
+    maximum_successors: usize,
 ) -> Result<(), ProviderError> {
     let open_time = candidate.open_time();
+    let candidate_target = (*target_open_time).max(open_time);
+    let distinct_key_limit = maximum_successors
+        .checked_add(1)
+        .ok_or(ProviderError::Invariant(
+            "reconciliation buffer bound overflow",
+        ))?;
+    if !gap_target_within_generation_span(
+        timeframe,
+        generation_start,
+        candidate_target,
+        maximum_successors,
+    ) || (!pending.contains_key(&open_time) && pending.len() >= distinct_key_limit)
+    {
+        return Err(ProviderError::Protocol {
+            context: ErrorContext::operation(ErrorOperation::Reconciliation),
+            detail: "Hyperliquid gap reconciliation target exceeds the per-generation span limit",
+        });
+    }
     let _ = coalesce_candle(pending, candidate);
     revision.0 = revision
         .0
         .checked_add(1)
         .ok_or(ProviderError::Invariant("replay revision overflow"))?;
-    *target_open_time = (*target_open_time).max(open_time);
+    *target_open_time = candidate_target;
     Ok(())
 }
 

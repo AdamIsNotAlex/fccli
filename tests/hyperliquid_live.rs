@@ -13,7 +13,7 @@ use fccli::{
         hyperliquid::{
             APPLICATION_HEARTBEAT_INTERVAL, HeartbeatTestHook, HyperliquidProvider,
             HyperliquidTestConfig, LiveSupervisorConfig, ReadinessDecodedAckTestHook,
-            SubscribeFlushTestHook, WsConfig, connect_test_websocket,
+            ReadinessDrainBudgetTestHook, SubscribeFlushTestHook, WsConfig, connect_test_websocket,
         },
         reconcile_ack_channel,
     },
@@ -70,6 +70,17 @@ fn provider(
 ) -> HyperliquidProvider {
     let mut config =
         HyperliquidTestConfig::loopback("http://127.0.0.1:9").with_websocket_base(ws_uri);
+    config.live = live;
+    HyperliquidProvider::new_test_live(config, clock).expect("provider")
+}
+
+fn provider_with_http(
+    http_uri: &str,
+    ws_uri: &str,
+    clock: Arc<ManualClock>,
+    live: LiveSupervisorConfig,
+) -> HyperliquidProvider {
+    let mut config = HyperliquidTestConfig::loopback(http_uri).with_websocket_base(ws_uri);
     config.live = live;
     HyperliquidProvider::new_test_live(config, clock).expect("provider")
 }
@@ -409,6 +420,207 @@ async fn buffered_eof_or_read_error_wins_after_more_than_readiness_retention_lim
     ));
 }
 
+#[derive(Clone, Copy)]
+enum ReadinessBoundaryOutcome {
+    Close,
+    MalformedAck,
+    MatchingAck,
+}
+
+async fn readiness_budget_boundary_event(outcome: ReadinessBoundaryOutcome) -> MarketEvent {
+    let (listener, ws_uri) = websocket_listener().await;
+    let (frames_sent_tx, frames_sent_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut websocket = accept_async(stream).await.expect("upgrade");
+        assert!(matches!(websocket.next().await, Some(Ok(Message::Text(_)))));
+        for value in 0..255_u16 {
+            websocket
+                .feed(Message::Pong(value.to_be_bytes().to_vec().into()))
+                .await
+                .expect("lower-priority frame");
+        }
+        match outcome {
+            ReadinessBoundaryOutcome::Close => {
+                websocket.feed(Message::Close(None)).await.expect("close")
+            }
+            ReadinessBoundaryOutcome::MalformedAck => websocket
+                .feed(Message::Text(malformed_subscribe_ack().into()))
+                .await
+                .expect("malformed ack"),
+            ReadinessBoundaryOutcome::MatchingAck => websocket
+                .feed(Message::Text(subscribe_ack().into()))
+                .await
+                .expect("matching ack"),
+        }
+        websocket.flush().await.expect("readiness frame batch");
+        frames_sent_tx.send(()).expect("frames sent");
+        std::future::pending::<()>().await;
+    });
+    let observed = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let subscribe_blocked = Arc::new(tokio::sync::Notify::new());
+    let subscribe_release = Arc::new(tokio::sync::Notify::new());
+    let manual = clock();
+    let live = LiveSupervisorConfig {
+        subscribe_ack_timeout: Duration::from_millis(1),
+        readiness_drain_budget_test_hook: Some(ReadinessDrainBudgetTestHook {
+            observed: Arc::clone(&observed),
+            release: Arc::clone(&release),
+        }),
+        subscribe_flush_test_hook: Some(SubscribeFlushTestHook {
+            blocked: Arc::clone(&subscribe_blocked),
+            release: Arc::clone(&subscribe_release),
+        }),
+        ..LiveSupervisorConfig::default()
+    };
+    let provider = provider(&ws_uri, Arc::clone(&manual), live);
+    let cancellation = CancellationToken::new();
+    let mut feed = provider
+        .open_live(request(cancellation.clone()))
+        .await
+        .expect("feed");
+    let _ = next_event(&mut feed).await;
+    timeout(Duration::from_secs(2), subscribe_blocked.notified())
+        .await
+        .expect("subscribe flush blocked");
+    subscribe_release.notify_one();
+    await_signal(frames_sent_rx, "buffered readiness frames").await;
+    timeout(Duration::from_secs(2), observed.notified())
+        .await
+        .expect("readiness budget reached");
+    manual
+        .advance_by(Duration::from_millis(1))
+        .expect("simultaneous deadline");
+    release.notify_one();
+    let event = next_event(&mut feed).await;
+    cancellation.cancel();
+    server.abort();
+    event
+}
+
+#[tokio::test]
+async fn close_on_readiness_budget_boundary_wins_simultaneous_ack_deadline() {
+    assert!(matches!(
+        readiness_budget_boundary_event(ReadinessBoundaryOutcome::Close).await,
+        MarketEvent::RecoverableError {
+            error: ProviderError::Protocol {
+                detail: "WebSocket peer requested reconnect",
+                ..
+            },
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn malformed_ack_on_readiness_budget_boundary_wins_simultaneous_ack_deadline() {
+    assert!(matches!(
+        readiness_budget_boundary_event(ReadinessBoundaryOutcome::MalformedAck).await,
+        MarketEvent::RecoverableError {
+            error: ProviderError::Protocol { .. } | ProviderError::Payload { .. },
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn matching_ack_on_readiness_budget_boundary_wins_simultaneous_ack_deadline() {
+    assert!(matches!(
+        readiness_budget_boundary_event(ReadinessBoundaryOutcome::MatchingAck).await,
+        MarketEvent::Status {
+            status: ConnectionStatus::GapSync,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn reconciliation_span_bound_reconnects_while_rest_page_is_pending() {
+    let (http_listener, http_ws_uri) = websocket_listener().await;
+    let http_uri = http_ws_uri.replacen("ws://", "http://", 1);
+    let (ws_listener, ws_uri) = websocket_listener().await;
+    let (history_started_tx, history_started_rx) = oneshot::channel();
+    let http_server = tokio::spawn(async move {
+        let (stream, _) = http_listener.accept().await.expect("HTTP accept");
+        let mut request = [0_u8; 2048];
+        stream.readable().await.expect("HTTP request readiness");
+        let bytes = stream.try_read(&mut request).expect("HTTP request");
+        assert!(bytes > 0, "history request must reach the pending server");
+        history_started_tx.send(()).expect("history started");
+        std::future::pending::<()>().await;
+    });
+    let ws_server = tokio::spawn(async move {
+        let (stream, _) = ws_listener.accept().await.expect("WebSocket accept");
+        let mut websocket = accept_async(stream).await.expect("upgrade");
+        let _ = websocket
+            .next()
+            .await
+            .expect("subscribe")
+            .expect("subscribe");
+        websocket
+            .send(Message::Text(subscribe_ack().into()))
+            .await
+            .expect("ack");
+        const START: i64 = 1_699_999_980_000;
+        websocket
+            .send(Message::Text(candle_message(START).into()))
+            .await
+            .expect("first candle");
+        await_signal(history_started_rx, "pending history request").await;
+        for successor in 1..=4_i64 {
+            websocket
+                .send(Message::Text(
+                    candle_message(START + successor * 60_000).into(),
+                ))
+                .await
+                .expect("reconciliation successor");
+        }
+        std::future::pending::<()>().await;
+    });
+    let live = LiveSupervisorConfig {
+        max_gap_reconciliation_candles_for_test: 3,
+        ..LiveSupervisorConfig::default()
+    };
+    assert_eq!(
+        LiveSupervisorConfig::default().max_gap_reconciliation_candles_for_test,
+        64_000,
+        "the test override must default to the production generation bound"
+    );
+    let provider = provider_with_http(&http_uri, &ws_uri, clock(), live);
+    let cancellation = CancellationToken::new();
+    let mut feed = provider
+        .open_live(request(cancellation.clone()))
+        .await
+        .expect("feed");
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::Status {
+            status: ConnectionStatus::Connecting,
+            ..
+        }
+    ));
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::Status {
+            status: ConnectionStatus::GapSync,
+            ..
+        }
+    ));
+    assert!(matches!(
+        next_event(&mut feed).await,
+        MarketEvent::RecoverableError {
+            error: ProviderError::Protocol {
+                detail: "Hyperliquid gap reconciliation target exceeds the per-generation span limit",
+                ..
+            },
+            ..
+        }
+    ));
+    cancellation.cancel();
+    http_server.abort();
+    ws_server.abort();
+}
 #[tokio::test]
 async fn decoded_ack_wins_deterministic_deadline_tie_before_arbitration() {
     let (listener, ws_uri) = websocket_listener().await;
