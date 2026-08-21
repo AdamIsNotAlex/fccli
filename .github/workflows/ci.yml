@@ -167,6 +167,7 @@ jobs:
 
           cargo check --locked --all-targets --no-default-features --features production-transport
           cargo clippy --locked --all-targets --no-default-features --features production-transport -- -D warnings
+          cargo test --locked --all-targets --no-default-features --features production-transport
           cargo test --locked --test terminal_lifecycle --no-default-features --features test-transport linux_openpty_restores_kernel_state -- --exact
           cargo test --locked --test feature_selection default_is_production_only -- --exact
 
