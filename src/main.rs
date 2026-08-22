@@ -11,7 +11,10 @@ use fccli::{
     app::{CrosstermTerminalInput, RunDependencies, run_with_dependencies},
     chart::{detect_render_policy, no_color_present},
     clock::{Clock, SystemClock},
-    provider::{ProviderRegistry, binance::BinanceProvider, hyperliquid::HyperliquidProvider},
+    provider::{
+        ProviderRegistry, binance::BinanceProvider, hyperliquid::HyperliquidProvider,
+        okx::OkxProvider,
+    },
     terminal::CrosstermTerminalDriver,
 };
 #[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
@@ -86,9 +89,17 @@ fn run_valid(args: Vec<OsString>) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        let okx = match OkxProvider::new(Arc::clone(&clock)) {
+            Ok(provider) => Arc::new(provider),
+            Err(error) => {
+                eprintln!("fccli: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
         let providers = match ProviderRegistry::new([
             provider as Arc<dyn fccli::provider::MarketDataProvider>,
             hyperliquid as Arc<dyn fccli::provider::MarketDataProvider>,
+            okx as Arc<dyn fccli::provider::MarketDataProvider>,
         ]) {
             Ok(providers) => providers,
             Err(error) => {

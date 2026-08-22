@@ -67,6 +67,7 @@ fn toml_string(path: &Path) -> String {
 fn assert_constructor_is_compiled_out(
     fixture_name: &str,
     dependency_feature: &str,
+    provider_type: &str,
     forbidden_constructor: &str,
     source: &str,
 ) {
@@ -78,6 +79,7 @@ fn assert_constructor_is_compiled_out(
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let provider_diagnostic = format!("for struct `{provider_type}`");
     let named_constructor = format!("`{forbidden_constructor}`");
     let matching_diagnostic = stderr.match_indices("error[E0599]").any(|(start, _)| {
         let diagnostic_tail = &stderr[start..];
@@ -94,17 +96,18 @@ fn assert_constructor_is_compiled_out(
         (diagnostic.contains("no function or associated item named")
             || diagnostic.contains("no associated function or constant named"))
             && diagnostic.contains(&named_constructor)
-            && diagnostic.contains("for struct `BinanceProvider`")
+            && diagnostic.contains(&provider_diagnostic)
     });
     assert!(
         matching_diagnostic,
-        "fixture failed for a reason other than the missing {forbidden_constructor} constructor on BinanceProvider:\n{stderr}"
+        "fixture failed for a reason other than the missing {forbidden_constructor} constructor on {provider_type}:\n{stderr}"
     );
 }
 
 fn assert_function_is_compiled_out(
     fixture_name: &str,
     dependency_feature: &str,
+    provider_module: &str,
     forbidden_function: &str,
     source: &str,
 ) {
@@ -116,6 +119,7 @@ fn assert_function_is_compiled_out(
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let provider_diagnostic = format!("in module `fccli::provider::{provider_module}`");
     let named_function = format!("`{forbidden_function}`");
     let matching_diagnostic = stderr.match_indices("error[E0425]").any(|(start, _)| {
         let diagnostic_tail = &stderr[start..];
@@ -131,11 +135,11 @@ fn assert_function_is_compiled_out(
 
         diagnostic.contains("cannot find function")
             && diagnostic.contains(&named_function)
-            && diagnostic.contains("in module `fccli::provider::binance`")
+            && diagnostic.contains(&provider_diagnostic)
     });
     assert!(
         matching_diagnostic,
-        "fixture failed for a reason other than the missing {forbidden_function} function in fccli::provider::binance:\n{stderr}"
+        "fixture failed for a reason other than the missing {forbidden_function} function in fccli::provider::{provider_module}:\n{stderr}"
     );
 }
 fn assert_combined_provider_boundaries_are_compiled_out(
@@ -200,6 +204,7 @@ fn test_transport_cannot_construct_the_production_rest_client() {
     assert_constructor_is_compiled_out(
         "test-cannot-use-production-rest",
         "test-transport",
+        "BinanceProvider",
         "new",
         r#"
 use std::sync::Arc;
@@ -219,6 +224,7 @@ fn test_transport_cannot_connect_the_production_websocket() {
     assert_function_is_compiled_out(
         "test-cannot-use-production-websocket",
         "test-transport",
+        "binance",
         "connect_websocket",
         r#"
 fn main() {
@@ -227,13 +233,35 @@ fn main() {
 "#,
     );
 }
-
+#[cfg(feature = "test-transport")]
+#[test]
+fn test_transport_cannot_construct_or_connect_okx_production_transport() {
+    assert_constructor_is_compiled_out(
+        "test-cannot-use-okx-production-rest",
+        "test-transport",
+        "OkxProvider",
+        "new",
+        r#"
+use std::sync::Arc;
+use fccli::{clock::SystemClock, provider::okx::OkxProvider};
+fn main() { let _ = OkxProvider::new(Arc::new(SystemClock)); }
+"#,
+    );
+    assert_function_is_compiled_out(
+        "test-cannot-use-okx-production-websocket",
+        "test-transport",
+        "okx",
+        "connect_websocket",
+        r#"fn main() { let _ = fccli::provider::okx::connect_websocket(); }"#,
+    );
+}
 #[cfg(feature = "production-transport")]
 #[test]
 fn production_transport_cannot_use_the_loopback_test_constructor() {
     assert_constructor_is_compiled_out(
         "production-cannot-use-loopback-rest",
         "production-transport",
+        "BinanceProvider",
         "new_test",
         r#"
 use std::sync::Arc;
@@ -253,6 +281,7 @@ fn production_transport_cannot_connect_the_loopback_test_websocket() {
     assert_function_is_compiled_out(
         "production-cannot-use-loopback-websocket",
         "production-transport",
+        "binance",
         "connect_test_websocket",
         r#"
 fn main() {
@@ -261,7 +290,28 @@ fn main() {
 "#,
     );
 }
-
+#[cfg(feature = "production-transport")]
+#[test]
+fn production_transport_cannot_construct_or_connect_okx_test_transport() {
+    assert_constructor_is_compiled_out(
+        "production-cannot-use-okx-test-rest",
+        "production-transport",
+        "OkxProvider",
+        "new_test",
+        r#"
+use std::sync::Arc;
+use fccli::{clock::SystemClock, provider::okx::OkxProvider};
+fn main() { let _ = OkxProvider::new_test("http://127.0.0.1:1", Arc::new(SystemClock)); }
+"#,
+    );
+    assert_function_is_compiled_out(
+        "production-cannot-use-okx-test-websocket",
+        "production-transport",
+        "okx",
+        "connect_test_websocket",
+        r#"fn main() { let _ = fccli::provider::okx::connect_test_websocket(); }"#,
+    );
+}
 fn assert_registry_associated_function_is_absent(
     fixture_name: &str,
     forbidden_function: &str,

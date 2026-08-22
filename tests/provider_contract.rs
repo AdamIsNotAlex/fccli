@@ -20,7 +20,8 @@ use fccli::{
         ProviderFuture, ProviderRegistry, RateGateSnapshot, RateGateState, ReconcileAck,
         ReconcileAckPublishError, ReconcileAckUpdate, ReconcileExpectation,
         ReconcileExpectationError, WatermarkUpdate, accepted_watermark_channel,
-        binance::BinanceProvider, hyperliquid::HyperliquidProvider, reconcile_ack_channel,
+        binance::BinanceProvider, hyperliquid::HyperliquidProvider, okx::OkxProvider,
+        reconcile_ack_channel,
     },
 };
 use futures_util::{StreamExt, stream};
@@ -69,6 +70,16 @@ fn hyperliquid_provider(clock: Arc<dyn Clock>) -> Result<HyperliquidProvider, Pr
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 fn hyperliquid_provider(clock: Arc<dyn Clock>) -> Result<HyperliquidProvider, ProviderError> {
     HyperliquidProvider::new_test("http://127.0.0.1:1", clock)
+}
+
+#[cfg(all(feature = "production-transport", not(feature = "test-transport")))]
+fn okx_provider(clock: Arc<dyn Clock>) -> Result<OkxProvider, ProviderError> {
+    OkxProvider::new(clock)
+}
+
+#[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
+fn okx_provider(clock: Arc<dyn Clock>) -> Result<OkxProvider, ProviderError> {
+    OkxProvider::new_test("http://127.0.0.1:1", clock)
 }
 
 #[derive(Clone)]
@@ -190,27 +201,41 @@ fn real_provider_capabilities_match_public_support_contract() {
     ] {
         assert!(hyperliquid.timeframes.contains(&supported));
     }
+    let okx = okx_provider(Arc::new(ManualClock::new(MonoInstant::ZERO))).expect("OKX provider");
+    let okx = okx.capabilities();
+    assert_eq!(okx.history_page_limit, 300);
+    assert!(okx.timeframes.contains(&Timeframe::Second1));
+    assert!(okx.timeframes.contains(&Timeframe::Hour6));
+    assert!(!okx.timeframes.contains(&Timeframe::Hour8));
 }
 
 #[test]
-fn registry_registers_two_providers_and_supports_borrowed_lookup() {
+fn registry_registers_three_providers_and_supports_borrowed_lookup() {
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
     let binance: Arc<dyn MarketDataProvider> =
         Arc::new(binance_provider(Arc::clone(&clock)).expect("Binance provider"));
     let hyperliquid: Arc<dyn MarketDataProvider> =
-        Arc::new(hyperliquid_provider(clock).expect("Hyperliquid provider"));
-    let registry = ProviderRegistry::new([Arc::clone(&binance), Arc::clone(&hyperliquid)])
-        .expect("unique providers");
-
-    let binance_id = ProviderId::new("binance").expect("provider id");
-    let selected = registry.get(&binance_id).expect("registered Binance");
-    assert!(Arc::ptr_eq(&selected, &binance));
-    let hyperliquid_id = ProviderId::new("hyperliquid").expect("provider id");
+        Arc::new(hyperliquid_provider(Arc::clone(&clock)).expect("Hyperliquid provider"));
+    let okx: Arc<dyn MarketDataProvider> = Arc::new(okx_provider(clock).expect("OKX provider"));
+    let registry = ProviderRegistry::new([
+        Arc::clone(&binance),
+        Arc::clone(&hyperliquid),
+        Arc::clone(&okx),
+    ])
+    .expect("unique providers");
+    assert!(Arc::ptr_eq(
+        &registry.get(&ProviderId::new("binance").unwrap()).unwrap(),
+        &binance
+    ));
     assert!(Arc::ptr_eq(
         &registry
-            .get(&hyperliquid_id)
-            .expect("registered Hyperliquid"),
-        &hyperliquid,
+            .get(&ProviderId::new("hyperliquid").unwrap())
+            .unwrap(),
+        &hyperliquid
+    ));
+    assert!(Arc::ptr_eq(
+        &registry.get(&ProviderId::new("okx").unwrap()).unwrap(),
+        &okx
     ));
 }
 
@@ -247,23 +272,16 @@ fn registry_rejects_duplicate_ids_and_accepts_an_ordinary_test_provider() {
 }
 
 #[test]
-fn canonicalization_metadata_does_not_register_a_transport() {
+fn canonicalization_metadata_does_not_register_an_unimplemented_transport() {
     let registry = ProviderRegistry::new(std::iter::empty::<Arc<dyn MarketDataProvider>>())
         .expect("empty registry");
-    let okx_id = ProviderId::new("okx").expect("provider id");
-    let specification = InstrumentSpec::new(okx_id.clone(), "btc", None::<String>)
+    let bybit_id = ProviderId::new("bybit").expect("provider id");
+    let specification = InstrumentSpec::new(bybit_id.clone(), "btc", None::<String>)
         .expect("known provider specification");
     let instrument = canonicalize_instrument(&specification).expect("metadata canonicalization");
     assert_eq!(instrument.quote(), "USDT");
     assert!(matches!(
-        registry.get(&okx_id),
-        Err(ProviderError::Configuration(
-            "unsupported market-data provider"
-        ))
-    ));
-    let unknown_id = ProviderId::new("unknown").expect("provider id");
-    assert!(matches!(
-        registry.get(&unknown_id),
+        registry.get(&bybit_id),
         Err(ProviderError::Configuration(
             "unsupported market-data provider"
         ))

@@ -1,6 +1,6 @@
 # fccli
 
-Terminal candlestick charts for Binance and Hyperliquid Spot and Perpetual markets.
+Terminal candlestick charts for Binance, Hyperliquid, and OKX Spot and Perpetual markets.
 
 _Example: `fccli btc 1h`_
 
@@ -34,9 +34,11 @@ fccli BTCUSDT.p M --interactive
 fccli hyperliquid:btc.p 1h
 fccli hyperliquid:hype
 fccli hyperliquid:xyz:XYZ100.p 15m
+fccli okx:btc 1h
+fccli okx:btc.p 15m
 ```
 
-An instrument may be an asset (`btc`, quoted in the selected provider's default), pair (`btc/usdc` or `btc-usdt`), concatenated symbol (`BTCUSDT`), or provider-prefixed pair (`binance:btc/usdc`). Append `.p` (or `.P`) to select perpetual instead of Spot: `btc.p`, `btc/usdt.p`, and `BTCUSDT.p` all resolve to perpetual. On Hyperliquid, `hyperliquid:btc` is remapped UBTC/USDC spot and `hyperliquid:btc.p` is the BTC perpetual; HIP-3 builder DEX perps use `hyperliquid:<dex>:<coin>.p`. Bare assets default to `USDT` on Binance, OKX, and Bybit; `USD` on Coinbase and Kraken; and `USDC` on Hyperliquid. The startup provider remains Binance. Hyperliquid rejects `1s` and `6h`. For example, `fccli h` selects the instrument `h` at the default `1h`; a single positional is never interpreted as a timeframe.
+An instrument may be an asset (`btc`, quoted in the selected provider's default), pair (`btc/usdc` or `btc-usdt`), concatenated symbol (`BTCUSDT`), or provider-prefixed pair (`binance:btc/usdc`). Append `.p` (or `.P`) to select perpetual instead of Spot. OKX uses native `BASE-QUOTE` Spot identifiers and `BASE-QUOTE-SWAP` perpetual identifiers. On Hyperliquid, `hyperliquid:btc` is remapped UBTC/USDC spot and `hyperliquid:btc.p` is the BTC perpetual; HIP-3 builder DEX perps use `hyperliquid:<dex>:<coin>.p`. Bare assets default to `USDT` on Binance, OKX, and Bybit; `USD` on Coinbase and Kraken; and `USDC` on Hyperliquid. The startup provider remains Binance. Hyperliquid rejects `1s` and `6h`; OKX rejects `8h`.
 
 Supported canonical timeframes: `1s`, `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, `1M`. The unit-only aliases `s`, `m`, `h`, `d`, `w`, and `M` mean one unit. Timeframes are case-sensitive: `m` is one minute and `M` is one month.
 

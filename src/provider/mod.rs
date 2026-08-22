@@ -2,6 +2,7 @@
 
 pub mod binance;
 pub mod hyperliquid;
+pub mod okx;
 pub(crate) mod runtime;
 #[cfg(all(feature = "test-transport", not(feature = "production-transport")))]
 #[doc(hidden)]

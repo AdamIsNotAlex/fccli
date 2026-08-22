@@ -93,11 +93,11 @@ pub struct Cli {
 #[command(
     name = "fccli",
     version,
-    about = "Render Binance and Hyperliquid Spot and Perpetual candlestick charts",
-    after_help = "Examples:\n  fccli\n  fccli eth\n  fccli btc h\n  fccli btc.p\n  fccli binance:btc/usdc 1h\n  fccli hyperliquid:btc.p 1h\n  fccli BTCUSDT.p M --interactive"
+    about = "Render Binance, Hyperliquid, and OKX Spot and Perpetual candlestick charts",
+    after_help = "Examples:\n  fccli\n  fccli eth\n  fccli btc h\n  fccli btc.p\n  fccli binance:btc/usdc 1h\n  fccli hyperliquid:btc.p 1h\n  fccli okx:btc 1h\n  fccli okx:btc.p 15m\n  fccli BTCUSDT.p M --interactive"
 )]
 struct RawCli {
-    /// Instrument as ASSET, BASE/QUOTE, BASE-QUOTE, PROVIDER:INSTRUMENT, or hyperliquid:<dex>:<coin>.p; trailing .p selects perpetual (default: binance:btc)
+    /// Instrument as ASSET, BASE/QUOTE, BASE-QUOTE, PROVIDER:INSTRUMENT, or hyperliquid:<dex>:<coin>.p; trailing .p selects perpetual (default: binance:btc). Providers: binance, hyperliquid, okx
     #[arg(value_name = "INSTRUMENT")]
     instrument: Option<String>,
 

@@ -624,6 +624,7 @@ impl Drop for AbortObservedInput {
 }
 
 struct FakeProvider {
+    provider_id: ProviderId,
     history_pages: Mutex<VecDeque<Result<Vec<Candle>, ProviderError>>>,
     events: Mutex<Option<Vec<Result<MarketEvent, ProviderError>>>>,
     requests: Arc<Mutex<Vec<HistoryRequest>>>,
@@ -660,6 +661,7 @@ impl FakeProvider {
     ) -> Self {
         let (gate_tx, gate) = rate_gate_channel(RateGateState::Open);
         Self {
+            provider_id: ProviderId::new("binance").unwrap(),
             history_pages: Mutex::new(VecDeque::from([Ok(initial)])),
             events: Mutex::new(Some(events)),
             requests: Arc::new(Mutex::new(Vec::new())),
@@ -695,6 +697,11 @@ impl FakeProvider {
 
     fn with_capabilities(mut self, capabilities: fccli::provider::ProviderCapabilities) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    fn with_provider_id(mut self, provider: &str) -> Self {
+        self.provider_id = ProviderId::new(provider).expect("test provider id");
         self
     }
     fn with_switch_capabilities(
@@ -779,7 +786,7 @@ impl FakeProvider {
 
 impl MarketDataProvider for FakeProvider {
     fn id(&self) -> ProviderId {
-        ProviderId::new("binance").unwrap()
+        self.provider_id.clone()
     }
     fn capabilities(&self) -> fccli::provider::ProviderCapabilities {
         if self.requests.acquire().is_empty() {
@@ -2292,7 +2299,7 @@ async fn direct_dispatch_known_unregistered_provider_fails_at_registry() {
     deps.stdin_is_tty = true;
     deps.stdout_is_tty = true;
 
-    let error = run_with_dependencies(["fccli", "okx:btc", "1m"], deps)
+    let error = run_with_dependencies(["fccli", "bybit:btc", "1m"], deps)
         .await
         .expect_err("known unimplemented providers fail at registry");
 
@@ -4178,6 +4185,59 @@ async fn known_unregistered_switch_shows_registry_error_and_preserves_old_chart(
             .iter()
             .all(|observation| observation.snapshot.instrument.provider_symbol() == "BTCUSDT")
     );
+}
+
+#[tokio::test]
+async fn ordinary_registry_switch_to_okx_is_accepted_and_commits() {
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(MonoInstant::ZERO));
+    let binance = Arc::new(FakeProvider::new(
+        vec![candle(0, 59_999)],
+        vec![],
+        Arc::clone(&clock),
+    ));
+    let okx = Arc::new(
+        FakeProvider::new(
+            vec![candle(60_000, 119_999)],
+            Vec::new(),
+            Arc::clone(&clock),
+        )
+        .with_provider_id("okx"),
+    );
+    let observations = Arc::new(Mutex::new(Vec::<EpochObservation>::new()));
+    let terminal = Arc::new(TerminalLog::default());
+    let output = SharedWriter::default();
+    let providers = ProviderRegistry::new([
+        Arc::clone(&binance) as Arc<dyn MarketDataProvider>,
+        Arc::clone(&okx) as Arc<dyn MarketDataProvider>,
+    ])
+    .expect("ordinary registry with OKX");
+    let captured = Arc::clone(&observations);
+    let dependencies = RunDependencies {
+        providers,
+        clock,
+        terminal,
+        input: switch_then_quit_input(&["okx:btc 1m"]),
+        stdout: Box::new(output),
+        stderr: Box::new(SharedWriter::default()),
+        stdin_is_tty: true,
+        stdout_is_tty: true,
+        render_policy: fccli::chart::RenderPolicy::StyleFree,
+        epoch_observer: Some(Arc::new(move |observation| {
+            captured.acquire().push(observation)
+        })),
+    };
+    assert_eq!(
+        run_with_dependencies(["fccli", "btc", "1m", "--interactive"], dependencies)
+            .await
+            .unwrap(),
+        ExitCode::SUCCESS
+    );
+    let observations = observations.acquire();
+    assert!(observations.iter().any(|observation| {
+        observation.snapshot.instrument.provider().as_str() == "okx"
+            && observation.snapshot.instrument.provider_symbol() == "BTCUSDT"
+    }));
+    assert_eq!(okx.open_live_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
