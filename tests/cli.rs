@@ -613,7 +613,7 @@ fn help_version_and_command_rendering_are_library_only_and_stable() {
     assert_eq!(help.kind(), ErrorKind::DisplayHelp);
     let help = help.to_string();
     for expected in [
-        "Render Binance and Hyperliquid Spot and Perpetual candlestick charts",
+        "Render Binance, Hyperliquid, and OKX Spot and Perpetual candlestick charts",
         "Usage: fccli [OPTIONS] [INSTRUMENT] [TIMEFRAME]",
         "-i, --interactive",
         "default: binance:btc",
@@ -788,4 +788,12 @@ fn hyperliquid_hip3_without_perp_suffix_is_rejected() {
         "{rendered}"
     );
     assert!(!rendered.contains("XYZ100"), "{rendered}");
+}
+
+#[test]
+fn help_lists_okx_spot_and_perpetual_examples() {
+    let rendered = Cli::command().render_long_help().to_string();
+    assert!(rendered.contains("OKX"), "{rendered}");
+    assert!(rendered.contains("okx:btc 1h"), "{rendered}");
+    assert!(rendered.contains("okx:btc.p 15m"), "{rendered}");
 }

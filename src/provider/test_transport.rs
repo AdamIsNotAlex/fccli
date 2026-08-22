@@ -20,7 +20,7 @@ pub use super::runtime::websocket::{
     WS_MESSAGE_INACTIVITY_TIMEOUT, WS_MESSAGE_SIZE, WS_READ_BUFFER_SIZE, WS_STALLED_WRITE_TIMEOUT,
     WS_WRITE_BUFFER_SIZE, WsConfig, flush_raw_websocket, read_raw_websocket, send_raw_websocket,
 };
-pub use super::{binance::BinanceDecoded, hyperliquid::HyperliquidDecoded};
+pub use super::{binance::BinanceDecoded, hyperliquid::HyperliquidDecoded, okx::OkxDecoded};
 
 pub fn validate_loopback_websocket_base(
     base_url: &str,
